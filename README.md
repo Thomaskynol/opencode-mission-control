@@ -411,6 +411,9 @@ Remove finished job worktrees and metadata.
 
 ### Monitoring & Reporting
 
+> Operator manual for the autonomous loop (coordinator, serve-mode instances,
+> human TUI, integration/credentials policy, final report): [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md).
+
 #### `mc_overview`
 
 Get a complete dashboard overview of all Mission Control activity — running jobs, recent completions, failures, active plans, alerts, and suggested next actions. This is the best starting point when checking in on your jobs.
@@ -431,6 +434,17 @@ Reports are used by the monitoring system to:
 - Trigger notifications (e.g., when an agent reports `blocked` or `needs_review`)
 - Signal explicit completion (a `completed` report immediately marks the job as done)
 - Provide progress visibility via `mc_status` and `mc_overview`
+
+#### `mc_report_final`
+
+Assemble the standardized final mission report from the active plan, jobs, and milestone reports. Verified only ever contains `merged`/`completed` jobs; everything else lands under Gaps (Unmet / Unverified) — never invented.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `notes` | `string` | No | — | Extra operator notes appended under Real Evidence |
+| `includeAttachments` | `boolean` | No | `true` | Attach full per-job report messages as annexes (truncated at 12000 chars) |
+
+Writes `reports/final-<planId>.md` and returns `Verified / Unmet / Unverified` counts. See [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) for the full operator flow.
 
 ---
 
