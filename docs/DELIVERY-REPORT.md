@@ -273,3 +273,75 @@ git -C <REPO> commit --allow-empty -m "chore: initial"
 - **Commits desta lane** (locais, ver `git log`): o pendente (fix
   auto-complete + `docs/single-demo.md`) e este fechamento (matrix §21 +
   este §12 + apêndice public-demo). Nada publicado; perfil global intocado.
+
+## 13. Mission close (2026-10-25, esta lane — sole writer, fechamento integral)
+
+Consolidação final dos §§1–12. `src/` intocado; só docs de fechamento +
+1 commit local. Modelo: `muse-spark-1.3-contributor (opencode-go)`.
+
+- **Caminho / base / branch**: `/home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control`,
+  branch `feat/autonomous-orchestrator-v2` (sem upstream), base `6db667e`
+  (`merge-base` exato), HEAD `8795430`, 24 commits locais + 1 deste
+  fechamento (lista cheia em `matrix-final.md` §22.4; âncoras `cec1a78`,
+  `4eb2ffb`, `404cd6e`, `8795430` confirmadas).
+- **Arquitetura / decisões**: one-tool-per-file + `src/lib` compartilhada,
+  sem deps novas; locks O_EXCL + sidecar `runtime-state.json`; instâncias
+  serve 2.1.4 via surface `/api` verificada (triplo pinado, sem fallback —
+  pausa com pergunta); coordenador juiz único, teto clamp 4–8; reviewer
+  fail-closed + merge-train serializado com rollback; pausa/retoma/cancela
+  sem perda de código; relatório Verified-vs-Gaps; sem push sem `humanAuth`.
+- **Como usar (copiável, da raiz do produto)**:
+
+```sh
+cd /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control
+bun install
+bun run build        # exit 0 — Bundled 222 modules, index.js 1.37 MB
+bun test             # ver tabela abaixo (6 fails tmux pré-existentes, prova via isolamento)
+bun test tests/lib/tmux.test.ts tests/lib/tmux-isPaneRunning.test.ts  # exit 0 — 23 pass
+
+# Caminho autônomo público
+bun src/orchestrator-cli/index.ts start --repo <REPO-ABSOLUTO> --branch <DESTINO> --request "<PEDIDO-NL>" --max-parallel 2
+bun src/orchestrator-cli/index.ts follow        # alias: progress
+bun src/orchestrator-cli/index.ts questions
+bun src/orchestrator-cli/index.ts order
+bun src/orchestrator-cli/index.ts task <job>    # ou: log <job> | session <job>
+bun src/orchestrator-cli/index.ts complement --intake <INTAKE-ID> "<FOLLOW-UP>"
+bun src/orchestrator-cli/index.ts resume --intake <INTAKE-ID>
+bun src/orchestrator-cli/index.ts close
+```
+
+- **Matriz ligada**: `docs/matrix-final.md` §§1–22 — todos os IDs do Anexo A
+  (INT/COR/EST/INS/TETO/REV/FIX/MER/PRC/PER/REL/MOD/SEG/OBS) + E2E A–E +
+  aceitação + REC-1…REC-9, cada um com Implementado / Verificado (teste) /
+  Validado (real) / Pendente e evidência própria. Nenhum upgrade de nível
+  nesta lane (sem `src/`, sem live novo).
+- **Checks + execuções reais A–E + gaps + single + autocomplete**:
+  build exit 0; full **1044 pass / 6 fail tmux** (1050 testes / 67 arquivos,
+  `/tmp/opencode/mission-close-test.log`; isolado tmux 23/0; árvore limpa =
+  baseline, stash vazio). Histórico: 953 → 963 → 997 → 1003 → 1008 → 1017 →
+  1027/6 → 1043/7 → **1044/6** (variação entre lanes sem mudança de `src/` =
+  flake). E2E-A…D validados (`live-proof.md` + adendo gaps G1/G2/G3);
+  single-4 com plano/workers/completions validados e merges pendentes
+  (bloqueio monitor, depois corrigido); prove-autocomplete com ciclo
+  single-job completo (monitor/idle-threshold → merge `913f305` → relatório
+  + resume sem duplicar). E2E-E (roteiro fase a fase) segue **Pendente**.
+- **Instâncias simultâneas + modelo/perfil**: pico de 3 workers reais
+  (2 frentes + probe, tmux `mc-live-*`); modelo
+  **muse-spark-1.3-contributor (opencode-go)** o tempo todo (banners TUI +
+  `session.get` triplo + agent + location + projectID). Esta lane rodou só
+  `bun` sequencial (sem tmux/worktrees/serve criados aqui).
+- **Problemas / limitações / pendências**: 6 fails tmux ambientais
+  (pré-existentes, isolados verdes); PUBLISH_HINT barra `deploy` em negação;
+  `mc_report` ausente nos workers (idle-threshold ~5 min, `log` vazio);
+  `resume` de `pre_pr` loga transição inválida warn-only; intake slot único;
+  retomada do *intake* pós-crash pendente; INS-5 sem teste dedicado;
+  metering de modelo dos workers desconhecido.
+- **Estado de alterações**: ao abrir a lane a árvore estava limpa (nada
+  pendente de lanes anteriores — tudo já commitado até `8795430`); esta
+  lane só acrescenta docs de fechamento (matrix §22 + este §13 + apêndice
+  public-demo). `git stash` vazio; sem fixtures apagadas; `/tmp/opencode/`
+  preservado (logs `mission-close-*` + evidências anteriores).
+- **Confirmação — nada publicado**: nenhum `push`, PR, tag, `npm publish`
+  ou mutação remota; branch sem upstream; `origin`/`upstream` intocados;
+  perfil global OpenCode intocado; sem segredos (grep pré-commit só acha
+  `ask-user` como string de política).

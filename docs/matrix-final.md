@@ -359,3 +359,81 @@ Branch `feat/autonomous-orchestrator-v2` sobre base `6db667e`. Esta lane
 commita o pendente (fix §21.2 + `docs/single-demo.md` do lane anterior) e em
 seguida este fechamento (matrix §21 + DELIVERY §12 + public-demo apêndice).
 Nada publicado; perfil global intocado; sem segredos.
+
+## 22. Adendo mission-close (fechamento integral, 2026-10-25)
+
+Escopo: inventário, checks frescos com isolamento de falhas, reconciliação
+honesta sem upgrades, consolidação do DELIVERY §§1–12, commit local.
+`src/` intocado (sem regressão real comprovada, nada a corrigir).
+Modelo autorizado: `muse-spark-1.3-contributor (opencode-go)`.
+
+### 22.1 Inventário (estado real)
+
+- Branch `feat/autonomous-orchestrator-v2`, HEAD `8795430`, base `6db667e`
+  (`merge-base HEAD 6db667e` = `6db667e`, corte exato).
+- 24 commits locais sobre a base (`0b90745`…`8795430`; lista cheia em §22.4).
+  SHAs-âncora confirmados: `cec1a78` fix(prompt), `4eb2ffb`
+  fix(auto-complete), `404cd6e` docs(final-verify2), `8795430`
+  test(prove-autocomplete).
+- `git status` limpo, `git stash` vazio, sem untracked (`git ls-files
+  --others` vazio). Remotes: `origin git@github.com:Thomaskynol/…` (fetch+push),
+  `upstream https://github.com/nigel-dev/…` (fetch, `no_push`).
+- Novos `src/lib` na branch: `auto-plan.ts`, `coordinator.ts`,
+  `durable-state.ts`, `file-lock.ts`, `instance-manager.ts`, `reviewer.ts`;
+  novos `src/orchestrator-cli/`: `auto-commands.ts`, `commands.ts`,
+  `coordinator-client.ts`, `forms.ts`, `index.ts`; testes novos cobrindo cada um.
+
+### 22.2 Checks frescos (log integral, exit capturado sem pipe)
+
+| # | Comando | Resultado | Evidência |
+| --- | --- | --- | --- |
+| A | `bun run build` | **exit 0** — `Bundled 222 modules`, `index.js 1.37 MB` | `/tmp/opencode/mission-close-build.log` |
+| B | `bun test` (full) | **exit 1** — **1044 pass, 6 fail**, 2458 expects, 1050 testes / 67 arquivos | `/tmp/opencode/mission-close-test.log` |
+| C | `bun test tests/lib/tmux.test.ts tests/lib/tmux-isPaneRunning.test.ts` (isolado) | **exit 0** — **23 pass, 0 fail** | `/tmp/opencode/mission-close-tmux-isolated.log` |
+
+Os 6 fails de B (todos em `tests/lib/tmux*.test.ts`: 4×
+`isPaneRunning`, 1× `capturePane` inválido, 1× `tmux.test.ts
+isPaneRunning`) são **pré-existentes e ambientais**: árvore limpa no HEAD
+commitado = o próprio baseline (nada a `stash` — `git stash list` vazio,
+`git status` limpo, `src/` idêntico ao commitado); C verde isolado repete o
+padrão das lanes anteriores (flake sob paralelismo da suíte cheia, tmux
+server compartilhado). Variação 7→6 fails entre lanes sem nenhuma mudança
+de `src/` confirma flake, não regressão. Nenhum fail fora do domínio tmux.
+
+### 22.3 Histórico real de contagens (esta árvore)
+
+| Lane / log | pass | skip/fail | testes / arquivos | exit |
+| --- | --- | --- | --- | --- |
+| final-close (`final-close-test.log`) | 953 | 16 / 0 | 969 / 62 | 0 |
+| guards (`guards-test.log`, §18: +10) | 963 | 16 / 0 | 979 / 62 | 0 |
+| final-reconcile (`final-reconcile-test.log`) | 997 | 16 / 0 | 1013 / 65 | 0 |
+| single-demo cedo (`single-evidence/00b`) | 1003 | 16 / 0 | — | 0 |
+| single-demo meio (`single-evidence/00b`) | 1008 | 16 / 0 | — | 0 |
+| single-4 (`single-evidence-4/00b-test.log`) | 1017 | 16 / 0 | 1033 / 66 | 0 |
+| final-verify2 (`final-verify2-test.log`, stash-provado) | 1027 | — / 6 tmux | 1033 / 66 | 1 |
+| prove-autocomplete (`53-full-test2.log`, +17 novos) | 1043 | — / 7 | 1050 / 67 | 1 |
+| **mission-close, esta lane (`mission-close-test.log`)** | **1044** | — / 6 tmux | 1050 / 67 | 1 |
+
+### 22.4 Commits finais (locais, sem push/PR)
+
+Sobre base `6db667e` (`origin/main`): `0b90745` `82fb7f2` `e7764e7`
+`d42dad0` `0a1eb3d` `ef73f78` `83d28be` `a8373f5` `0281b85` `2f4e762`
+`fd86c39` `cc08140` `5fe245e` `841e9f1` `40dfca0` `8df7cab` `017cfc5`
+`8b37e6c` `4065d91` `97a25e8` `cec1a78` `4eb2ffb` `404cd6e` `8795430`.
+Esta lane adiciona 1 commit (matrix §22 + DELIVERY §13 + apêndice
+public-demo). Nada publicado; perfil global intocado; sem segredos
+(grep só acha `ask-user` como string de política).
+
+### 22.5 Reconciliação — níveis finais honestos (sem upgrades nesta lane)
+
+Nenhum `src/` alterado + nenhum ciclo live novo ⇒ nenhum ID sobe de nível
+aqui. Reafirmado: INT-1…4 / COR-1…4 / EST-1…5 / INS-1…4 / TETO-1…3 /
+REV-1…5 / FIX-1…4 / MER-1…5 / PRC-1…4 / PER-1…5 / REL-1…5 / MOD-1…2 /
+SEG-1…3 / OBS-1…3 / E2E-A…D / ACE-1…2 / REC-1…9 mantêm os níveis das §§1–21
+(Verificado/Validado conforme cada evidência citada). Pendentes reais que
+seguem Pendentes: **E2E-E** (roteiro fase a fase não executado), **REC-4**
+retomada do *intake* pós-crash (só testada em unidade), **PUBLISH_HINT** em
+negação (2 starts `hello.txt` fail-closed), **`mc_report` ausente** nos
+workers (conclusão por idle-threshold, `log` vazio — honesto no relatório),
+**INS-5** sem teste dedicado, **E2E-B→E2E-E** lacunas menores já listadas.
+Nada declarado completo que siga manual.

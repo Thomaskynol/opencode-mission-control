@@ -410,3 +410,15 @@ Branches: `main`, `prove/auto-1`, `mc/integration-472e71ec-…`,
    creating_pr` (warn-only, sem efeito; pré-existente).
 4. Intake slot único (`saveAutoIntake` sobrescreve); trilha dos intakes
    falhos `36fdc41b-…`/`ea545321-…` resta em `10/11-*.log`.
+
+### Apêndice mission-close (2026-10-25, sem live novo)
+
+Fechamento integral sobre o HEAD `8795430` (árvore limpa, `src/` intocado):
+`bun run build` exit 0 (`Bundled 222 modules`, `index.js 1.37 MB`,
+`/tmp/opencode/mission-close-build.log`); `bun test` full exit 1 —
+**1044 pass / 6 fail** (1050 testes / 67 arquivos,
+`/tmp/opencode/mission-close-test.log`), os 6 todos em
+`tests/lib/tmux*.test.ts` (pré-existentes ambientais; isolado
+`tmux`+`tmux-isPaneRunning` exit 0 — 23 pass; árvore limpa = baseline).
+Nível desta demo inalterado: ciclo single-job segue **Validado** pelos
+artefatos acima; limitações 1–4 seguem abertas. Nada publicado.
