@@ -122,7 +122,7 @@ describe('plugin initialization', () => {
   });
 
   describe('command center context', () => {
-    it('tool object has all 19 tools', async () => {
+    it('tool object has all 21 tools', async () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
@@ -131,7 +131,7 @@ describe('plugin initialization', () => {
       const plugin = await MissionControl({ client: mockClient } as any);
       
       const toolKeys = Object.keys(plugin.tool || {});
-      expect(toolKeys).toHaveLength(18);
+      expect(toolKeys).toHaveLength(21);
       expect(toolKeys).toContain('mc_launch');
       expect(toolKeys).toContain('mc_jobs');
       expect(toolKeys).toContain('mc_status');
@@ -148,8 +148,11 @@ describe('plugin initialization', () => {
       expect(toolKeys).toContain('mc_plan_cancel');
       expect(toolKeys).toContain('mc_plan_approve');
       expect(toolKeys).toContain('mc_report');
+      expect(toolKeys).toContain('mc_report_final');
       expect(toolKeys).toContain('mc_overview');
       expect(toolKeys).toContain('mc_answer');
+      expect(toolKeys).toContain('mc_job_pause');
+      expect(toolKeys).toContain('mc_job_resume');
     });
 
     it('monitor.start() is called', async () => {

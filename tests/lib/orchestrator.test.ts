@@ -1828,3 +1828,57 @@ describe('orchestrator dynamic replanning', () => {
     });
   });
 });
+
+describe('orchestrator coordinator model pin (review fix)', () => {
+  const monitor = new FakeMonitor();
+  const config = {
+    defaultPlacement: 'session' as const,
+    pollInterval: 10000,
+    idleThreshold: 300000,
+    worktreeBasePath: '/tmp',
+    omo: { enabled: false, defaultMode: 'vanilla' },
+    maxParallel: 3,
+  } as any;
+
+  it('preserves the variant from a triple snapshot (pin triplo)', async () => {
+    const { parseModelRef, modelRefToCliString } = await import('../../src/lib/orchestrator');
+    const orchestrator = new Orchestrator(monitor as any, config);
+    (orchestrator as any).setPlanModelSnapshot({ providerID: 'acme', id: 'model-x', variant: 'max' });
+    expect((orchestrator as any).resolveCoordinatorModel()).toEqual({
+      providerID: 'acme',
+      id: 'model-x',
+      variant: 'max',
+    });
+    expect(parseModelRef('acme/model-x')).toEqual({ providerID: 'acme', id: 'model-x' });
+    expect(parseModelRef('  ')).toBeUndefined();
+    expect(modelRefToCliString({ providerID: 'acme', id: 'model-x', variant: 'max' })).toBe(
+      'acme/model-x',
+    );
+  });
+
+  it('parses string snapshots without inventing a variant', () => {
+    const orchestrator = new Orchestrator(monitor as any, config);
+    (orchestrator as any).setPlanModelSnapshot('acme/model-x');
+    expect((orchestrator as any).resolveCoordinatorModel()).toEqual({
+      providerID: 'acme',
+      id: 'model-x',
+    });
+  });
+
+  it('clamps the compensated running count so the budget never exceeds the 4-8 cap', async () => {
+    const jobs = Array.from({ length: 10 }, (_, i) => makeJob(`cap-job-${i}`));
+    const plan = makePlan({ status: 'running', jobs });
+    const orchestrator = new Orchestrator(monitor as any, config);
+    const launchSpy = spyOn(orchestrator as any, 'launchJob').mockResolvedValue(undefined);
+    try {
+      const byName = new Map(plan.jobs.map((j) => [j.name, { ...j }]));
+      // maxParallel 10 is above the cap: raw compensation (8-10) goes
+      // negative, which unclamped inflates the budget to 10.
+      const dispatched = await (orchestrator as any).runCoordinatorPass(plan, byName, 0, 10);
+      expect(dispatched).toHaveLength(8);
+      expect(launchSpy).toHaveBeenCalledTimes(8);
+    } finally {
+      launchSpy.mockRestore();
+    }
+  });
+});

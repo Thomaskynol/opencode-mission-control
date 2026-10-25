@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { getDataDir } from './paths';
 
-export type ReportStatus = 'working' | 'blocked' | 'needs_review' | 'completed' | 'progress';
+export type ReportStatus = 'working' | 'blocked' | 'needs_review' | 'completed' | 'progress' | 'paused';
 
 export interface AgentReport {
   jobId: string;
@@ -100,4 +100,341 @@ export async function removeReport(jobId: string): Promise<void> {
     }
     throw error;
   }
+}
+
+/** Max length for one-line report summaries shown in the human TUI. */
+export const REPORT_LINE_MAX = 140;
+
+function truncateLine(text: string, maxLength: number = REPORT_LINE_MAX): string {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Short one-liner for a report (milestones, alerts, TUI rows).
+ * The percentage suffix appears ONLY when the worker explicitly sent
+ * `progress` — never invented here.
+ */
+export function formatReportLine(report: AgentReport): string {
+  const suffix =
+    report.progress !== undefined ? ` (${report.progress}%)` : '';
+  return truncateLine(`• ${report.jobName} [${report.status}]: ${report.message}${suffix}`);
+}
+
+export interface MilestoneOptions {
+  /** Explicit completion percentage from the worker. Omit when unknown. */
+  progress?: number;
+  status?: ReportStatus;
+}
+
+/**
+ * Short milestone report. `progress` is recorded only when the caller
+ * passes it explicitly — the coordinator never fabricates percentages.
+ */
+export async function writeMilestoneReport(
+  jobId: string,
+  jobName: string,
+  message: string,
+  opts: MilestoneOptions = {},
+): Promise<void> {
+  if (
+    opts.progress !== undefined &&
+    (!Number.isFinite(opts.progress) || opts.progress < 0 || opts.progress > 100)
+  ) {
+    throw new Error(`Invalid progress ${opts.progress}: expected 0-100 or omitted.`);
+  }
+  await writeReport({
+    jobId,
+    jobName,
+    status: opts.status ?? (opts.progress !== undefined ? 'progress' : 'working'),
+    message,
+    ...(opts.progress !== undefined ? { progress: opts.progress } : {}),
+    timestamp: new Date().toISOString(),
+  });
+}
+
+/**
+ * Immediate blockade/failure notice. Surfaces in the overview Alerts
+ * section and the human TUI; independent fronts keep running.
+ */
+export async function writeAlertReport(
+  jobId: string,
+  jobName: string,
+  message: string,
+): Promise<void> {
+  await writeReport({
+    jobId,
+    jobName,
+    status: 'blocked',
+    message,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// M5/M7: standardized final report (readable body + annexes/references).
+// The body separates verified facts from gaps (unmet/unverified); long logs
+// always go to annexes, never inline.
+// ---------------------------------------------------------------------------
+
+export interface FinalReportTask {
+  name: string;
+  status: string;
+  detail?: string;
+}
+
+export interface FinalReportContribution {
+  instance: string;
+  job: string;
+  summary: string;
+}
+
+export interface FinalReportTest {
+  command: string;
+  result: string;
+  output?: string;
+}
+
+export interface FinalReportProblem {
+  problem: string;
+  solution: string;
+}
+
+export interface FinalReportAttachment {
+  name: string;
+  content: string;
+}
+
+export interface FinalReportPreservation {
+  preserved?: string[];
+  closed?: string[];
+  cleanup?: string[];
+}
+
+export interface FinalReportInput {
+  title: string;
+  request?: string;
+  scope?: string[];
+  architecture?: string[];
+  decisions?: string[];
+  tasks?: FinalReportTask[];
+  contributions?: FinalReportContribution[];
+  files?: string[];
+  branches?: string[];
+  integration?: {
+    branch?: string;
+    strategy?: string;
+    merged?: string[];
+    conflicts?: string[];
+    note?: string;
+  };
+  installUsage?: string[];
+  tests?: FinalReportTest[];
+  evidences?: string[];
+  problems?: FinalReportProblem[];
+  verified?: string[];
+  unmet?: string[];
+  unverified?: string[];
+  limitations?: string[];
+  nextSteps?: string[];
+  preservation?: FinalReportPreservation;
+  attachments?: FinalReportAttachment[];
+}
+
+/** Annex cap: long logs are truncated with an explicit marker, never dropped silently. */
+export const FINAL_REPORT_ATTACHMENT_MAX = 12000;
+
+function finalReportLines(items: string[] | undefined, emptyNote: string): string[] {
+  if (!items || items.length === 0) {
+    return [`- ${emptyNote}`];
+  }
+  return items.map((item) => `- ${item}`);
+}
+
+/**
+ * Pure builder for the standardized final report. Every required section is
+ * always emitted (with an explicit placeholder when empty) so readers can
+ * tell "not reported" apart from "reported empty". Verified facts and gaps
+ * live in separate sections by construction.
+ */
+export function buildFinalReportMarkdown(input: FinalReportInput): string {
+  const lines: string[] = [
+    `# Final Report: ${input.title}`,
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    '',
+    '## Request & Scope',
+    '',
+    input.request?.trim() ? input.request.trim() : '- Not reported',
+    '',
+    ...finalReportLines(input.scope, 'No scope items reported'),
+    '',
+    '## Architecture & Decisions',
+    '',
+    ...finalReportLines(input.architecture, 'No architecture notes reported'),
+    '',
+    ...finalReportLines(
+      (input.decisions ?? []).map((decision) => `Decision: ${decision}`),
+      'No decisions recorded',
+    ),
+    '',
+    '## Plan & Tasks',
+    '',
+    ...((input.tasks ?? []).length > 0
+      ? input.tasks!.map((task) =>
+        task.detail?.trim()
+          ? `- [${task.status}] ${task.name} — ${task.detail.trim()}`
+          : `- [${task.status}] ${task.name}`,
+      )
+      : ['- No tasks reported']),
+    '',
+    '## Per-Instance Contributions',
+    '',
+    ...((input.contributions ?? []).length > 0
+      ? input.contributions!.map((c) => `- ${c.instance} / ${c.job}: ${c.summary}`)
+      : ['- No per-instance contributions reported']),
+    '',
+    '## Files & Branches',
+    '',
+    ...finalReportLines(
+      (input.files ?? []).map((file) => `File: ${file}`),
+      'No files reported',
+    ),
+    '',
+    ...finalReportLines(
+      (input.branches ?? []).map((branch) => `Branch: ${branch}`),
+      'No branches reported',
+    ),
+    '',
+    '## Integration',
+    '',
+    `- Branch: ${input.integration?.branch?.trim() || 'Not reported'}`,
+    `- Strategy: ${input.integration?.strategy?.trim() || 'Not reported'}`,
+    ...finalReportLines(
+      (input.integration?.merged ?? []).map((name) => `Merged: ${name}`),
+      'No merges reported',
+    ),
+    ...finalReportLines(
+      (input.integration?.conflicts ?? []).map((name) => `Conflict: ${name}`),
+      'No conflicts reported',
+    ),
+  ];
+  if (input.integration?.note?.trim()) {
+    lines.push('', `- Note: ${input.integration.note.trim()}`);
+  }
+  lines.push(
+    '',
+    '## Install & Usage',
+    '',
+    ...finalReportLines(input.installUsage, 'No install/usage notes reported'),
+    '',
+    '## Tests (Commands & Results)',
+    '',
+    ...((input.tests ?? []).length > 0
+      ? input.tests!.flatMap((test) => {
+        const header = `- \`${test.command}\` → ${test.result}`;
+        if (!test.output?.trim()) return [header];
+        const snippet = test.output.trim().slice(0, 500);
+        return [header, `  Output: ${snippet}`];
+      })
+      : ['- No tests reported']),
+    '',
+    '## Real Evidence',
+    '',
+    ...finalReportLines(input.evidences, 'No real evidence attached yet'),
+    '',
+    '## Problems & Solutions',
+    '',
+    ...((input.problems ?? []).length > 0
+      ? input.problems!.map((entry) => `- Problem: ${entry.problem} | Solution: ${entry.solution}`)
+      : ['- No problems reported']),
+    '',
+    '## Verified',
+    '',
+    ...finalReportLines(input.verified, 'Nothing verified yet'),
+    '',
+    '## Gaps (Unmet / Unverified)',
+    '',
+    ...finalReportLines(
+      (input.unmet ?? []).map((item) => `Unmet: ${item}`),
+      'No unmet items reported',
+    ),
+    '',
+    ...finalReportLines(
+      (input.unverified ?? []).map((item) => `Unverified: ${item}`),
+      'No unverified items reported',
+    ),
+    '',
+    '## Limitations & Next Steps',
+    '',
+    ...finalReportLines(
+      (input.limitations ?? []).map((item) => `Limitation: ${item}`),
+      'No limitations reported',
+    ),
+    '',
+    ...finalReportLines(
+      (input.nextSteps ?? []).map((item) => `Next: ${item}`),
+      'No next steps reported',
+    ),
+    '',
+    '## Preservation (Preserved vs Closed vs Cleanup)',
+    '',
+    ...finalReportLines(
+      (input.preservation?.preserved ?? []).map((item) => `Preserved (work kept): ${item}`),
+      'Nothing flagged as preserved',
+    ),
+    '',
+    ...finalReportLines(
+      (input.preservation?.closed ?? []).map((item) => `Closed (finished): ${item}`),
+      'Nothing flagged as closed',
+    ),
+    '',
+    ...finalReportLines(
+      (input.preservation?.cleanup ?? []).map((item) => `Cleanup (explicit removal only): ${item}`),
+      'Nothing flagged for cleanup',
+    ),
+    '',
+    '## Annexes (Logs & References)',
+    '',
+    ...((input.attachments ?? []).length > 0
+      ? input.attachments!.flatMap((attachment, index) => {
+        const content = attachment.content ?? '';
+        const truncated = content.length > FINAL_REPORT_ATTACHMENT_MAX;
+        const body = truncated
+          ? `${content.slice(0, FINAL_REPORT_ATTACHMENT_MAX)}\n…[truncated ${content.length - FINAL_REPORT_ATTACHMENT_MAX} chars, see source]`
+          : content;
+        return [
+          `### Annex ${String.fromCharCode(65 + index)}: ${attachment.name}`,
+          '',
+          '```',
+          body || '(empty)',
+          '```',
+          '',
+        ];
+      })
+      : ['- No annexes (long logs belong here, never inline above)']),
+  );
+  return lines.join('\n');
+}
+
+function getFinalReportFilePath(reportsDir: string, planId: string): string {
+  return join(reportsDir, `final-${planId}.md`);
+}
+
+/** Persist a rendered final report next to the per-job reports. */
+export async function writeFinalReport(planId: string, markdown: string): Promise<string> {
+  const reportsDir = await getReportsDir();
+  const filePath = getFinalReportFilePath(reportsDir, planId);
+  await Bun.write(filePath, markdown);
+  return filePath;
+}
+
+/** Read a persisted final report, if any. */
+export async function readFinalReport(planId: string): Promise<string | null> {
+  const reportsDir = await getReportsDir();
+  const file = Bun.file(getFinalReportFilePath(reportsDir, planId));
+  if (!(await file.exists())) {
+    return null;
+  }
+  return file.text();
 }

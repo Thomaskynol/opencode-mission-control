@@ -3,7 +3,8 @@ import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
 import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth } from './plan-state';
 import { getDefaultBranch } from './git';
-import { createIntegrationBranch, deleteIntegrationBranch } from './integration';
+import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
+import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, type MergeTestReport, validateTouchSet } from './merge-train';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
@@ -27,7 +28,28 @@ import {
   setPaneDiedHook,
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
-import { forkJobSession, waitForServer } from './sdk-client';
+import { forkJobSession, waitForServer, type V2ModelRef } from './sdk-client';
+
+/**
+ * Parse a "provider/model" snapshot string into a model ref.
+ * The variant is never present in the string form (model-tracker stores
+ * provider/modelID only), so it stays unset — but a V2ModelRef snapshot
+ * set programmatically keeps its variant untouched (pin triple).
+ */
+export function parseModelRef(raw: string): V2ModelRef | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const slash = trimmed.indexOf('/');
+  if (slash > 0) {
+    return { providerID: trimmed.slice(0, slash), id: trimmed.slice(slash + 1) };
+  }
+  return { providerID: 'unknown', id: trimmed };
+}
+
+/** Format a model ref for the `opencode -m` CLI flag (variant has no CLI form). */
+export function modelRefToCliString(ref: V2ModelRef): string {
+  return `${ref.providerID}/${ref.id}`;
+}
 
 type PlanSpecWithAuth = PlanSpec & { ghAuthenticated?: boolean };
 
@@ -166,7 +188,7 @@ export class Orchestrator {
   private isReconciling = false;
   private reconcilePending = false;
   private activePlanId: string | null = null;
-  private planModelSnapshot: string | undefined;
+  private planModelSnapshot: V2ModelRef | undefined;
   private planLaunchSessionID: string | undefined;
   private planPlacement: 'session' | 'window' | null = null;
   private subscriptionsActive = false;
@@ -176,6 +198,11 @@ export class Orchestrator {
   private jobsLaunchedCount = 0;
   private approvedForMerge = new Set<string>();
   private firstJobCompleted = false;
+  /**
+   * M5/M7 wiring: coordinator dispatches tracked per plan run so a
+   * retry/crash never launches the same job twice. Key: `${planId}:${jobName}`.
+   */
+  private coordinatedJobs = new Set<string>();
   private jobComms: JobComms = new JobComms();
   private pendingReplanActions: Map<string, () => Promise<void>> = new Map();
 
@@ -204,6 +231,101 @@ export class Orchestrator {
     };
   }
 
+  private isQueued(name: string): boolean {
+    const train = this.mergeTrain as (MergeTrain & { has?: (name: string) => boolean }) | null;
+    if (!train) return false;
+    // Duck-typed: test fakes expose getQueue() without has().
+    if (typeof train.has === 'function') return train.has(name);
+    return train.getQueue().some((job) => job.name === name);
+  }
+
+  private resolveCoordinatorModel(): V2ModelRef {
+    // The stored snapshot is already a full triple — return it untouched so a
+    // pinned variant survives (pin triplo). String snapshots never carry a
+    // variant (model-tracker stores provider/modelID only).
+    return (
+      this.planModelSnapshot ??
+      parseModelRef(getCurrentModel() ?? '') ?? { providerID: 'unknown', id: 'unknown' }
+    );
+  }
+
+  /**
+   * M5/M7 wiring: run the M3 coordinator pass inside the reconcile loop.
+   * - Dispatch goes through the existing launchJob path (no second launcher).
+   * - Gate returns false so the coordinator never enqueues into the merge
+   *   train directly; the merge section below stays the single integrator
+   *   (serialized per integrationBranch under file-lock, idempotent enqueue).
+   * - Budget is preserved against the orchestrator's configured maxParallel:
+   *   coordinateOnce clamps to 4–8, so the observed running count is shifted
+   *   by (clamp - configured) to keep the same dispatch budget.
+   * Returns the names dispatched by this pass (usually empty when the manual
+   * loop already filled the budget — that is the no-duplicate guarantee).
+   */
+  private async runCoordinatorPass(
+    plan: PlanSpec,
+    byName: Map<string, JobSpec>,
+    runningCount: number,
+    maxParallel: number,
+  ): Promise<string[]> {
+    const model = this.resolveCoordinatorModel();
+    const dispatchedThisPass = new Set<string>();
+    try {
+      return await coordinateOnce({
+        maxParallel,
+        observe: async () => ({
+          jobs: plan.jobs.map((job) => ({
+            name: job.name,
+            status: byName.get(job.name)?.status ?? job.status,
+            dependsOn: job.dependsOn,
+            mergeOrder: job.mergeOrder,
+            priority: job.priority,
+          })),
+          // Preserve the orchestrator's configured budget under the 4–8 clamp.
+          // Clamped at 0: with maxParallel above the cap the raw compensation
+          // goes negative, which would otherwise inflate the budget past the cap.
+          runningCount: Math.max(
+            0,
+            runningCount + (clampMaxParallel(maxParallel) - maxParallel),
+          ),
+          model,
+          baseRef: plan.integrationBranch ?? plan.baseCommit,
+        }),
+        dispatch: async (req) => {
+          const current = byName.get(req.job.name);
+          if (!current || (current.status !== 'queued' && current.status !== 'waiting_deps')) {
+            return { sessionID: '' };
+          }
+          const key = `${plan.id}:${req.job.name}`;
+          if (dispatchedThisPass.has(key) || (this.coordinatedJobs.has(key) && current.status === 'running')) {
+            return { sessionID: '' };
+          }
+          dispatchedThisPass.add(key);
+          await this.launchJob(current);
+          current.status = 'running';
+          this.coordinatedJobs.add(key);
+          return { sessionID: `coord-${plan.id.slice(0, 8)}-${req.job.name}` };
+        },
+        // Reviewer gate lives in the merge-train path (M4); the coordinator
+        // must not reintegrate here.
+        gate: async () => false,
+        enqueue: async () => {},
+        promptFor: (job, baseRef) => {
+          const full = byName.get(job.name);
+          return {
+            request: full?.prompt ?? `Run job "${job.name}"`,
+            constraints: full?.touchSet?.length ? [`Stay inside: ${full.touchSet.join(', ')}`] : [],
+            decisions: [],
+            baseRef,
+            acceptance: [`Job "${job.name}" completes and reports via mc_report`],
+          };
+        },
+      });
+    } catch (error) {
+      console.warn('[MC] coordinator pass skipped:', error instanceof Error ? error.message : error);
+      return [];
+    }
+  }
+
   constructor(monitor: JobMonitor, config: MCConfig, callbacks?: ToastCallback | { toast?: ToastCallback; notify?: NotifyCallback }) {
     this.monitor = monitor;
     this.config = config;
@@ -216,8 +338,12 @@ export class Orchestrator {
     }
   }
 
-  setPlanModelSnapshot(model: string | undefined): void {
-    this.planModelSnapshot = model;
+  setPlanModelSnapshot(model: string | V2ModelRef | undefined): void {
+    if (model === undefined) {
+      this.planModelSnapshot = undefined;
+      return;
+    }
+    this.planModelSnapshot = typeof model === 'string' ? parseModelRef(model) : { ...model };
   }
 
   private showToast(title: string, message: string, variant: ToastVariant): void {
@@ -363,6 +489,7 @@ export class Orchestrator {
     await savePlan(plan);
 
     this.activePlanId = plan.id;
+    this.coordinatedJobs.clear();
     this.planPlacement = spec.placement ?? null;
     this.planLaunchSessionID = spec.launchSessionID;
     this.mergeTrain = new MergeTrain(plan.integrationWorktree, this.getMergeTrainConfig());
@@ -527,6 +654,22 @@ export class Orchestrator {
         this.notify(`🚀 Launched ${launchedThisCycle} job(s): ${launched.join(', ')}. (${this.jobsLaunchedCount}/${mergeOrder.length} total launched)`);
       }
 
+      // M5/M7 wiring: coordinator pass inside reconcile. It dispatches only
+      // through launchJob with the same in-memory statuses above, so jobs the
+      // manual loop just launched are skipped (no duplicates); gate=false so
+      // it never reintegrates (single integrator stays below).
+      const coordDispatched = await this.runCoordinatorPass(plan, byName, runningCount, maxParallel);
+      if (coordDispatched.length > 0) {
+        runningCount += coordDispatched.length;
+        this.jobsLaunchedCount += coordDispatched.length;
+        this.showToast(
+          'Mission Control',
+          `Coordinator dispatched ${coordDispatched.length} job(s) (${this.jobsLaunchedCount} total).`,
+          'info',
+        );
+        this.notify(`🚀 Coordinator dispatched ${coordDispatched.length} job(s): ${coordDispatched.join(', ')}.`);
+      }
+
       for (const job of mergeOrder) {
         if (job.status === 'completed') {
           if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
@@ -604,10 +747,24 @@ export class Orchestrator {
         }
 
         this.mergeTrain ??= new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
-        this.mergeTrain.enqueue(job);
-        await updatePlanJob(plan.id, job.name, { status: 'merging' });
-        job.status = 'merging';
-        this.approvedForMerge.delete(job.name);
+        // M5/M7: single queue with identifiers — enqueue is idempotent
+        // (MergeTrain.enqueue dedupes) and a retry/crash that left a job in
+        // 'merging' with an empty in-memory queue re-enqueues it (no lost merge,
+        // no duplicate merge).
+        if (job.status === 'ready_to_merge' && !this.isQueued(job.name)) {
+          this.mergeTrain.enqueue(job);
+          await updatePlanJob(plan.id, job.name, { status: 'merging' });
+          job.status = 'merging';
+          this.approvedForMerge.delete(job.name);
+        }
+      }
+
+      // Crash recovery: jobs stuck in 'merging' (queue lost on restart) rejoin
+      // the single queue once — has() keeps it idempotent.
+      for (const job of mergeOrder) {
+        if (job.status === 'merging' && this.mergeTrain && !this.isQueued(job.name)) {
+          this.mergeTrain.enqueue(job);
+        }
       }
 
       if (this.mergeTrain && this.mergeTrain.getQueue().length > 0) {
@@ -705,6 +862,19 @@ export class Orchestrator {
           this.showToast('Mission Control', `Plan completed! PR: ${prUrl}`, 'success');
           this.notify(`🎉 Plan "${latestPlan.name}" completed! PR created: ${prUrl}`);
         } catch (prError) {
+          const errMsg = prError instanceof Error ? prError.message : String(prError);
+          // M5/M7: refusing to push without explicit human auth preserves
+          // partial work (pause at pre_pr) instead of failing the plan.
+          // Approve with mc_plan_approve(checkpoint: "pre_pr") to continue.
+          if (/explicit human authorization/i.test(errMsg)) {
+            this.showToast('Mission Control', 'All jobs merged. PR needs explicit human authorization.', 'warning');
+            this.notify(
+              `⏸️ All ${latestPlan.jobs.length} jobs merged. PR creation needs explicit human authorization — ` +
+              `no push was made. Approve with mc_plan_approve(checkpoint: "pre_pr").`,
+            );
+            await this.setCheckpoint('pre_pr', latestPlan);
+            return;
+          }
           const completedAt = new Date().toISOString();
           await updatePlanFields(latestPlan.id, {
             status: 'failed',
@@ -712,7 +882,6 @@ export class Orchestrator {
           });
           this.stopReconciler();
           this.unsubscribeFromMonitorEvents();
-          const errMsg = prError instanceof Error ? prError.message : String(prError);
           this.showToast('Mission Control', `PR creation failed: ${errMsg}`, 'error');
           this.notify(`❌ Plan "${latestPlan.name}" failed: ${errMsg}`);
         }
@@ -820,7 +989,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         jobPrompt = `/ulw-loop ${jobPrompt}`;
       }
       promptFilePath = await writePromptFile(worktreePath, jobPrompt);
-      const model = this.planModelSnapshot ?? getCurrentModel();
+      const model = this.planModelSnapshot ? modelRefToCliString(this.planModelSnapshot) : getCurrentModel();
       const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
 
       const initialCommand = `bash '${launcherPath}'`;
@@ -1010,7 +1179,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     try {
       promptFilePath = await writePromptFile(worktreePath, fullPrompt);
-      const model = this.planModelSnapshot ?? getCurrentModel();
+      const model = this.planModelSnapshot ? modelRefToCliString(this.planModelSnapshot) : getCurrentModel();
       const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
 
       const initialCommand = `bash '${launcherPath}'`;
@@ -1161,6 +1330,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
   async cancelPlan(): Promise<void> {
     this.stopReconciler();
+    this.coordinatedJobs.clear();
 
     const plan = await loadPlan();
     if (!plan) {
@@ -1270,16 +1440,22 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     if (options?.forkFrom) {
       const sourceJob = plan.jobs.find((j) => j.name === options.forkFrom);
-      if (sourceJob?.port && sourceJob?.launchSessionID) {
+      // Fork from the REMOTE worker session when known; launchSessionID is
+      // the local control-center session and forking it resumes the wrong
+      // context. Propagate the remote session so fix-before-rollback and
+      // future forks can reach the worker.
+      const sourceSession = sourceJob?.remoteSessionID ?? sourceJob?.launchSessionID;
+      if (sourceJob?.port && sourceSession) {
         try {
           const client = await waitForServer(sourceJob.port, { timeoutMs: 10000 });
-          await forkJobSession(client, sourceJob.launchSessionID, {
+          await forkJobSession(client, sourceSession, {
             sourceJobName: sourceJob.name,
             newJobName: newJob.name,
             additionalPrompt: newJob.prompt,
           });
           newJob.port = sourceJob.port;
           newJob.launchSessionID = sourceJob.launchSessionID;
+          newJob.remoteSessionID = sourceJob.remoteSessionID;
         } catch {
         }
       }
@@ -1461,7 +1637,11 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     this.startReconciler();
   }
 
-  private async createPR(): Promise<string> {
+  private async createPR(opts?: PublishAuthOptions): Promise<string> {
+    // M5/M7 (pending M1): no push/PR without explicit human authorization.
+    // The human opts in per call — absence of the flag is a refusal.
+    requireHumanAuth('git push', opts);
+    requireHumanAuth('gh pr create', opts);
     const plan = await loadPlan();
     if (!plan) {
       throw new Error('No active plan found');

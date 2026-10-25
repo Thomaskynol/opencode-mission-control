@@ -1,5 +1,6 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { getDefaultBranch } from '../lib/git';
+import { requireHumanAuth, type PublishAuthOptions } from '../lib/integration';
 import { getJobByName, type Job } from '../lib/job-state';
 
 export async function executeGhCommand(args: string[]): Promise<string> {
@@ -80,6 +81,10 @@ export const mc_pr: ToolDefinition = tool({
       .string()
       .optional()
       .describe('Target branch for the PR (defaults to the job\'s base branch, or the repo default branch)'),
+    humanAuth: tool.schema
+      .boolean()
+      .optional()
+      .describe('Explicit human authorization to push and create the PR (required, no default push)'),
   },
   async execute(args) {
     // 1. Get job by name
@@ -87,6 +92,11 @@ export const mc_pr: ToolDefinition = tool({
     if (!job) {
       throw new Error(`Job "${args.name}" not found`);
     }
+    // M5/M7 (pending M1): no push/PR without explicit human authorization.
+    // Checked after the lookup so unknown jobs still report "not found".
+    const auth: PublishAuthOptions = { humanAuth: (args as { humanAuth?: boolean }).humanAuth };
+    requireHumanAuth('git push', auth);
+    requireHumanAuth('gh pr create', auth);
 
     // 2. Push branch to remote before creating PR
     const pushProc = Bun.spawn(['git', 'push', 'origin', job.branch], {
