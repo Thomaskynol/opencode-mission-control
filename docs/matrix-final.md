@@ -152,9 +152,15 @@ silenciosa nos dois casos.
 ## 15. Pendentes honestos (não marcam nenhuma seção como "done")
 
 1. `MANUAL_TEST_PLAN.md` fases 1–18 não executadas passo a passo (E2E-E). Roteiro intacto; cenário live equivalente validado.
-2. Ask-user `permission escalation` sem push ao operador (visível no TUI do serve/log de política; worker segue via auto-resposta). Documentado, não bloqueia o ciclo (`docs/live-proof.md` adendo, fim).
-3. `PUSH_PATTERN` não parseia `git -c`/`--git-dir=` scoped flags (raro). Aceito (`docs/fixes-static.md` §6).
-4. `updatePlanJob` ainda warn-and-apply (recuperação força estados terminais; unificar quebraria `launchJob`). Documentado, não "corrigido" (`docs/fixes-static.md` §6).
+2. ~~Ask-user `permission escalation` sem push ao operador~~ → **corrigido
+   nesta rodada**: `perm:<id>` visível em `mc_overview`/dashboard/TUI
+   (`docs/guards-proof.md` §3; testes `question-relay`).
+3. ~~`PUSH_PATTERN` não parseia `git -c`/`--git-dir=`~~ → **corrigido**:
+   `isGitPushArgs`/`isGitPushText` cobrem `-C/-c`, `--git-dir`,
+   `--work-tree`, espaços/aspas; barreira real documentada
+   (`docs/guards-proof.md` §2).
+4. ~~`updatePlanJob` warn-and-apply~~ → **corrigido**: fail-closed, só
+   recuperação força com flag explícita (`docs/guards-proof.md` §1).
 5. `coordinator-client.ts` só lê memória + sidecar (correto após persistência do monitor; sem mudança).
 6. Senders legados não-`/api` restantes fora do caminho crítico foram migrados nesta branch (job-comms, fork, relay, monitor SSE, answer); herança restante: nenhuma conhecida — item de `review-fixes.md` §legado considerado encerrado pelos testes `monitor-v2` + `human-controls`.
 7. INS-5 sem teste dedicado (revisão por leitura). Menor; candidato a 1 teste de contrato futuro.
@@ -187,3 +193,15 @@ Branch `feat/autonomous-orchestrator-v2` sobre base `6db667e` (`origin/main`):
 - (+ commit deste fechamento: `docs(matrix-final)` + `DELIVERY-REPORT` atualizado)
 
 Sem perfil global modificado, sem segredos, sem push/PR, sem fixtures úteis apagadas.
+
+## 18. Adendo guards-docs (esta rodada)
+
+| ID | Correção | Evidência |
+| --- | --- | --- |
+| GUA-1 | `updatePlanJob` fail-closed (rejeita sem aplicar; `force` só na recuperação `launchJob`) | `tests/lib/plan-state.test.ts` (queued→merged e merged→canceled rejeitam, estado intacto) |
+| GUA-2 | `PUSH_PATTERN` como auxílio + barreira real (`requireHumanAuth`/`requiresHumanAuth` cobrindo `git -C/-c`, `--git-dir/--work-tree`, espaços/aspas, `git -C`) | `tests/lib/coordinator.test.ts` (`isGitPushArgs`), `tests/lib/permission-policy.test.ts` (`isGitPushText` + `ask-user` dentro do worktree) |
+| GUA-3 | `ask-user` visível (`perm:<id>` em memória + sidecar → `mc_overview`/dashboard/TUI) + timeout seguro (publishing auto-deny) + `answer <job> <approve\|deny>` | `tests/lib/question-relay.test.ts` (sem auto-aprovação, pendente visível, `reject` vs `once`) |
+| GUA-4 | Primeiro uso reproduzível (5 passos copiáveis, TUI one-shot, repo+branch destino) | `docs/guards-proof.md` §4 (comandos + exits observados em `/tmp/opencode/first-use-demo-*`), `docs/USER-GUIDE.md` §11 |
+
+Verificação: `bun run build` exit 0; `bun test` exit 0 —
+**963 pass, 16 skip, 0 fail** (62 arquivos; +10 vs 953).

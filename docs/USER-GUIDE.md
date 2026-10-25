@@ -188,9 +188,26 @@ Rules that matter:
   arrive as session forms and your answer goes to the form's reply
   endpoint first (`mc_answer`), falling back to session text only
   when the form is gone; permission replies are session-scoped
-  (`once`/`always`/`reject`). If you ignore an essential question for 120s, the relay
-  auto-responds `use your best judgment` so independent jobs keep
-  moving (`QUESTION_AUTO_RESPONSE_MS` / `QUESTION_DEFAULT_RESPONSE`).
+  (`once`/`always`/`reject`).
+- **Ask-user is always visible.** Permission escalations create a
+  `perm:<id>` pending (memory + `runtime-state.json` sidecar) and show
+  in `mc_overview` Questions/Suggested Actions, dashboard `questions`,
+  TUI `follow`/`questions`/`task` (🔐 + `answer <job> <approve|deny>`).
+  Ordinary questions auto-resolve after 120s (`use your best judgment`);
+  **publishing escalations auto-deny on timeout** — a push is never
+  authorized by silence.
+- **No-push is enforced, not advised.** Operator push paths
+  (`mc_pr`, `orchestrator.createPR`) refuse without `humanAuth: true`;
+  worker shell (`git -C "my dir" push`, `git -c k=v push`,
+  `git --git-dir[=...] push`, `npm --prefix "my dir" publish`, …)
+  forces `ask-user` even inside the worktree. `assertNoPush` stays as
+  defense-in-depth aid for no-push contexts.
+- **Plan transitions are fail-closed.** `updatePlanJob` rejects invalid
+  transitions without applying (`queued → merged` cannot skip the gate;
+  `merged → canceled` cannot un-merge). Only launch-failure recovery
+  forces `failed` with an explicit flag.
+- Parallel ceiling is clamped to **4–8**; tmux jobs cannot be
+  paused via session interrupt (use `mc_kill`, code is preserved).
 - Parallel ceiling is clamped to **4–8**; tmux jobs cannot be
   paused via session interrupt (use `mc_kill`, code is preserved).
 - Empty diffs are valid diagnostics: a merge producing
@@ -255,4 +272,38 @@ mc_report_final(notes: "CSV export manually verified: bun test green, see Tests 
 mc_overview()               # shows Questions: export-csv
 mc_answer(name: "export-csv", response: "Use option B: server-side pagination")
 # other jobs keep running; unanswered essentials auto-resolve after 120s
+```
+
+## 11. Primeiro uso reproduzível (5 passos copiáveis)
+
+TUI = one-shot commands (no REPL). Run from the repo root:
+
+```bash
+bun src/orchestrator-cli/index.ts help
+```
+
+Repo = the `git` repo the session runs in (state namespaces per
+project under `~/.local/share/opencode-mission-control/<project>/`).
+Branch: per job via `mc_launch(branch, baseBranch)` (default
+`mc/<name>`); per plan via `mc_plan(baseBranch)` (integration
+`mc/integration-<planId>`). Proof: `docs/guards-proof.md` §4
+(disposable `/tmp/opencode/first-use-demo-*`, all exits observed).
+
+```bash
+# 1. Iniciar o produto
+bun run build  # exit 0
+bun src/orchestrator-cli/index.ts help     # exit 0
+# 2. Enviar pedido NL com repo + branch destino
+bun src/orchestrator-cli/index.ts send "Add CSV export to the billing view — repo: . base branch: main"  # exit 0
+# 3. Acompanhar + receber questões
+bun src/orchestrator-cli/index.ts follow    # exit 0
+bun src/orchestrator-cli/index.ts questions # exit 0 — 🔐 permission shows here when present
+bun src/orchestrator-cli/index.ts task demo-csv  # exit 0 — Pending questions: 1
+# 4. Responder questão (outros seguem rodando)
+bun src/orchestrator-cli/index.ts answer demo-csv deny  # exit 0 — recorded
+# 5. Pausar / retomar (código preservado; só mc_cleanup descarta)
+bun src/orchestrator-cli/index.ts pause demo-csv   # tmux job → exit 1 with guidance (use mc_kill); serve job → exit 0
+bun src/orchestrator-cli/index.ts resume demo-csv "Continue"  # exit 0/1 by mode (G1 validated serve pause→resume)
+bun src/orchestrator-cli/index.ts log demo-csv     # exit 0 — last milestone only
+bun src/orchestrator-cli/index.ts session demo-csv # exit 0 — read-only attach pointer
 ```
