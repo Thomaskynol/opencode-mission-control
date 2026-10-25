@@ -1,6 +1,7 @@
 import { join } from 'path';
 import { writeFile, unlink, mkdir } from 'fs/promises';
 import { spawnSync } from 'bun';
+import { quoteShellPath } from './sdk-client.js';
 
 const PROMPT_FILENAME = '.mc-prompt.txt';
 const LAUNCHER_FILENAME = '.mc-launch.sh';
@@ -38,7 +39,7 @@ export async function writeLauncherScript(
   const launcherPath = join(worktreePath, LAUNCHER_FILENAME);
   const opencodeBin = resolveOpencodePath();
   const modelFlag = model ? ` -m "${model}"` : '';
-  const script = `#!/bin/bash\nexec ${opencodeBin}${modelFlag} --prompt "$(cat '${promptFilePath}')"\n`;
+  const script = `#!/bin/bash\nexec ${opencodeBin}${modelFlag} --prompt "$(cat ${quoteShellPath(promptFilePath)})"\n`;
   await writeFile(launcherPath, script, { mode: 0o755 });
   return launcherPath;
 }

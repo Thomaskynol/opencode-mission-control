@@ -105,6 +105,9 @@ export const JobSpecSchema = z.object({
   serverUrl: z.string().optional(),
   relayPatterns: z.array(z.string()).optional(),
   launchSessionID: z.string().optional(),
+  // Remote worker session on the serve instance. Parsed (not stripped) so
+  // fix-before-rollback and fork survive a coordinator restart.
+  remoteSessionID: z.string().optional(),
   permissionPolicy: PermissionPolicySchema.optional(),
 });
 

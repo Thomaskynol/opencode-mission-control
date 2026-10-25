@@ -1,6 +1,5 @@
-import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { Job } from './job-state.js';
-import { createJobClient, sendPrompt } from './sdk-client.js';
+import { createV2Client, v2Prompt, v2ReplyPermission, type V2Client } from './sdk-client.js';
 
 /**
  * A pending mcp_question from a serve-mode job's agent.
@@ -95,15 +94,15 @@ export function getPendingQuestionCount(): number {
 
 /**
  * Answer a pending question by sending a user message to the job's session.
- * This unblocks the agent waiting on the mcp_question tool call.
+ * This unblocks the agent waiting on the question tool call.
  */
 export async function answerPendingQuestion(
   question: PendingQuestion,
   response: string,
   password?: string,
 ): Promise<void> {
-  const client = createJobClient(question.port, password);
-  await sendPrompt(client, question.remoteSessionID, response);
+  const client = createV2Client(question.port, password);
+  await v2Prompt(client, question.remoteSessionID, response);
   pendingQuestions.delete(pendingKey(question.jobId, question.partId));
 }
 
@@ -316,50 +315,69 @@ export function buildQuestionPrompt(context: QuestionContext): string {
 export class QuestionRelay {
   private config: QuestionRelayConfig;
   private pendingResponses: Map<string, Timer> = new Map();
-  private clients: Map<number, OpencodeClient> = new Map();
+  private clients: Map<number, V2Client> = new Map();
+  private password?: string;
 
-  constructor(config: Partial<QuestionRelayConfig> = {}) {
+  constructor(config: Partial<QuestionRelayConfig> = {}, password?: string) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.password = password;
+  }
+
+  /** Set the serve password after construction (monitor loads it from config). */
+  setPassword(password: string | undefined): void {
+    this.password = password;
+    this.clients.clear();
   }
 
   /**
-   * Get or create a client for a job's port
+   * Get or create a v2 client for a job's port
    */
-  private getClient(port: number, password?: string): OpencodeClient {
+  private getClient(port: number): V2Client {
     const key = port;
     if (!this.clients.has(key)) {
-      this.clients.set(key, createJobClient(port, password));
+      this.clients.set(key, createV2Client(port, this.password));
     }
     return this.clients.get(key)!;
   }
 
   /**
-   * Handle a permission request from an SSE event
-   * Returns true if auto-approved, false if relayed to user
+   * Handle a permission request from an SSE event.
+   * Auto-approvals reply on the worker's own session; escalations no longer
+   * HTTP-post to the operator session (launchSessionID lives on the
+   * control-center, never on the worker's serve instance — that POST always
+   * missed). Ask-user requests keep the worker unblocked via the
+   * auto-response timeout and surface in the serve TUI / policy log.
    */
   async handlePermissionRequest(
     job: Job,
     permission: PermissionRequest,
-    currentFile?: string,
+    _currentFile?: string,
   ): Promise<PermissionResult> {
     const result = shouldAutoApprove(permission, job.worktreePath);
 
     if (result.autoApproved) {
-      // Auto-approve the permission
-      if (job.port) {
+      // Auto-approve the permission on the worker session.
+      if (job.port && job.remoteSessionID) {
         try {
           const client = this.getClient(job.port);
-          await this.replyToPermission(client, permission.id, true);
+          await this.replyToPermission(client, job.remoteSessionID, permission.id, true);
         } catch (error) {
           console.error(`[QuestionRelay] Failed to auto-approve permission for job ${job.name}:`, error);
         }
+      } else {
+        console.warn(
+          `[QuestionRelay] Cannot auto-approve permission for job ${job.name}: missing serve port or remote session.`,
+        );
       }
       return result;
     }
 
-    // Relay to launching session
-    if (job.launchSessionID && job.port) {
-      await this.relayToLaunchingSession(job, permission, currentFile);
+    // Escalation path: the operator answers in the serve TUI or adjusts the
+    // policy; the timeout below keeps the worker unblocked meanwhile.
+    if (job.port && job.remoteSessionID) {
+      this.setupAutoResponse(job, permission.id);
+    } else {
+      console.warn(`[QuestionRelay] Cannot escalate permission for job ${job.name}: missing serve port or remote session.`);
     }
 
     return result;
@@ -371,63 +389,20 @@ export class QuestionRelay {
     approved: boolean,
     message?: string,
   ): Promise<void> {
-    if (!job.port) {
+    if (!job.port || !job.remoteSessionID) {
       return;
     }
 
     const client = this.getClient(job.port);
-    await this.replyToPermission(client, permissionId, approved, message);
-  }
-
-  /**
-   * Relay a question to the launching session
-   */
-  private async relayToLaunchingSession(
-    job: Job,
-    permission: PermissionRequest,
-    currentFile?: string,
-  ): Promise<void> {
-    if (!job.launchSessionID || !job.port) {
-      console.warn(`[QuestionRelay] Cannot relay: missing launchSessionID or port for job ${job.name}`);
-      return;
-    }
-
-    const context: QuestionContext = {
-      jobName: job.name,
-      taskSummary: buildTaskSummary(job.prompt),
-      currentFile,
-      permissionRequest: permission,
-    };
-
-    const prompt = buildQuestionPrompt(context);
-
-    try {
-      const client = this.getClient(job.port);
-      await client.session.prompt({
-        path: { id: job.launchSessionID },
-        body: {
-          parts: [{ type: 'text', text: prompt }],
-          noReply: false,
-        },
-      });
-
-      // Set up auto-response timeout
-      this.setupAutoResponse(job.id, permission.id, client);
-    } catch (error) {
-      console.error(`[QuestionRelay] Failed to relay question for job ${job.name}:`, error);
-    }
+    await this.replyToPermission(client, job.remoteSessionID, permissionId, approved, message);
   }
 
   /**
    * Set up automatic response after timeout
    */
-  private setupAutoResponse(
-    jobId: string,
-    permissionId: string,
-    client: OpencodeClient,
-  ): void {
+  private setupAutoResponse(job: Job, permissionId: string): void {
     // Clear any existing timeout for this permission
-    const existingKey = `${jobId}:${permissionId}`;
+    const existingKey = `${job.id}:${permissionId}`;
     if (this.pendingResponses.has(existingKey)) {
       clearTimeout(this.pendingResponses.get(existingKey)!);
     }
@@ -435,10 +410,18 @@ export class QuestionRelay {
     // Set new timeout
     const timeoutId = setTimeout(async () => {
       try {
-        await this.replyToPermission(client, permissionId, true, this.config.defaultResponse);
-        console.log(`[QuestionRelay] Auto-responded to permission ${permissionId} for job ${jobId}`);
+        if (job.port && job.remoteSessionID) {
+          await this.replyToPermission(
+            this.getClient(job.port),
+            job.remoteSessionID,
+            permissionId,
+            true,
+            this.config.defaultResponse,
+          );
+        }
+        console.log(`[QuestionRelay] Auto-responded to permission ${permissionId} for job ${job.id}`);
       } catch (error) {
-        console.error(`[QuestionRelay] Failed to auto-respond for job ${jobId}:`, error);
+        console.error(`[QuestionRelay] Failed to auto-respond for job ${job.id}:`, error);
       } finally {
         this.pendingResponses.delete(existingKey);
       }
@@ -448,34 +431,24 @@ export class QuestionRelay {
   }
 
   /**
-   * Reply to a permission request
+   * Reply to a pending permission request owned by the worker session.
+   * Least privilege: approvals are single-use (`once`), never standing.
    */
   private async replyToPermission(
-    client: OpencodeClient,
+    client: V2Client,
+    sessionID: string,
     permissionId: string,
     approved: boolean,
     message?: string,
   ): Promise<void> {
-    // Note: The actual SDK endpoint for replying to permissions may vary
-    // This is a placeholder based on typical SDK patterns
-    // The SDK might have client.permission.reply or similar
     try {
-      // Using a generic approach - actual implementation depends on SDK
-      const response = await fetch(`${(client as any).baseUrl}/permission/${permissionId}/reply`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...((client as any).headers || {}),
-        },
-        body: JSON.stringify({
-          approved,
-          message: message || (approved ? 'Approved' : 'Denied'),
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-      }
+      await v2ReplyPermission(
+        client,
+        sessionID,
+        permissionId,
+        approved ? 'once' : 'reject',
+        message ?? (approved ? 'Approved' : 'Denied'),
+      );
     } catch (error) {
       console.error(`[QuestionRelay] Failed to reply to permission ${permissionId}:`, error);
       throw error;
@@ -498,7 +471,7 @@ export class QuestionRelay {
       this.pendingResponses.delete(key);
     }
 
-    if (!job.port) {
+    if (!job.port || !job.remoteSessionID) {
       return;
     }
 
@@ -524,7 +497,7 @@ export class QuestionRelay {
 
     try {
       const client = this.getClient(job.port);
-      await this.replyToPermission(client, permissionId, approved, message);
+      await this.replyToPermission(client, job.remoteSessionID, permissionId, approved, message);
     } catch (error) {
       console.error(`[QuestionRelay] Failed to send user response for job ${job.name}:`, error);
     }
@@ -544,7 +517,7 @@ export class QuestionRelay {
   }
 
   /**
-   * Clean up all resources
+   * Clear all resources
    */
   dispose(): void {
     for (const timeoutId of this.pendingResponses.values()) {
@@ -552,5 +525,15 @@ export class QuestionRelay {
     }
     this.pendingResponses.clear();
     this.clients.clear();
+  }
+
+  /** Clear the auto-response timeout for one settled permission request. */
+  clearPermissionTimeout(jobId: string, permissionId: string): void {
+    const key = `${jobId}:${permissionId}`;
+    const timeoutId = this.pendingResponses.get(key);
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+      this.pendingResponses.delete(key);
+    }
   }
 }

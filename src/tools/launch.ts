@@ -20,7 +20,12 @@ import { resolvePostCreateHook } from '../lib/worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript } from '../lib/prompt-file';
 import { getCurrentModel, getCurrentModelInfo } from '../lib/model-tracker';
 import { allocatePort, releasePort } from '../lib/port-allocator';
-import { waitForServer, createSessionAndPrompt } from '../lib/sdk-client';
+import {
+  quoteShellPath,
+  v2CreateSession,
+  v2Prompt,
+  v2WaitForServer,
+} from '../lib/sdk-client';
 
 /**
  * Sleep for a given number of milliseconds
@@ -251,7 +256,7 @@ export const mc_launch: ToolDefinition = tool({
       }
 
       // Create tmux session/window
-      const initialCommand = `bash '${launcherPath}'`;
+      const initialCommand = `bash ${quoteShellPath(launcherPath)}`;
       try {
         if (placement === 'session') {
           await createSession({
@@ -291,9 +296,11 @@ export const mc_launch: ToolDefinition = tool({
 
       cleanupLauncherScript(worktreePath);
 
-      // Wait for server and send prompt via SDK
+      // Wait for the 2.1.4 /api surface, create the session with the pinned
+      // model triple, and deliver the prompt. The legacy unprefixed SDK is
+      // not served by 2.1.4 (session.create answered `{}`).
       try {
-        const client = await waitForServer(allocatedPort, {
+        const client = await v2WaitForServer(allocatedPort, {
           password: config.serverPassword,
         });
         const fullPrompt = buildFullPrompt({
@@ -303,7 +310,15 @@ export const mc_launch: ToolDefinition = tool({
           autoCommit: config.autoCommit,
         });
         const modelInfo = getCurrentModelInfo(context?.sessionID);
-        remoteSessionId = await createSessionAndPrompt(client, fullPrompt, undefined, modelInfo);
+        const created = await v2CreateSession(client, {
+          agent: undefined,
+          model: modelInfo
+            ? { providerID: modelInfo.providerID, id: modelInfo.modelID }
+            : undefined,
+          location: { directory: worktreePath },
+        });
+        remoteSessionId = created.id;
+        await v2Prompt(client, remoteSessionId, fullPrompt);
       } catch (error) {
         await releasePort(allocatedPort).catch(() => {});
         try {
@@ -355,7 +370,7 @@ export const mc_launch: ToolDefinition = tool({
         );
       }
 
-      const initialCommand = `bash '${launcherPath}'`;
+      const initialCommand = `bash ${quoteShellPath(launcherPath)}`;
       try {
         if (placement === 'session') {
           await createSession({

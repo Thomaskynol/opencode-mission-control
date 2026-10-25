@@ -3,20 +3,27 @@ import { getRunningJobs, getJob, updateJob, type Job } from './job-state.js';
 import { isPaneRunning, capturePane, captureExitStatus } from './tmux.js';
 import { loadConfig } from './config.js';
 import { readReport } from './reports.js';
-import { createJobClient } from './sdk-client.js';
 import {
   QuestionRelay,
   type PermissionRequest,
   type PendingQuestion,
   addPendingQuestion,
   removePendingQuestion,
-  buildQuestionRelayMessage,
   clearPendingQuestionsForJob,
   buildTaskSummary,
 } from './question-relay.js';
+import {
+  persistPendingQuestion,
+  dropPersistedQuestion,
+} from './durable-state.js';
+import {
+  createV2Client,
+  v2GetForm,
+  v2ListForms,
+  type V2Client,
+} from './sdk-client.js';
 import { loadPlan } from './plan-state.js';
 import { PermissionPolicy, type PermissionPolicyConfig } from './permission-policy.js';
-import type { OpencodeClient } from '@opencode-ai/sdk';
 
 type JobEventType = 'complete' | 'failed' | 'blocked' | 'needs_review' | 'awaiting_input' | 'agent_report' | 'question';
 
@@ -35,7 +42,7 @@ interface EventAccumulator {
 
 interface SSESubscription {
   abortController: AbortController;
-  client: OpencodeClient;
+  client: V2Client;
   reconnectAttempts: number;
 }
 
@@ -51,6 +58,22 @@ export interface JobMonitorOptions {
 
 function hashOutput(output: string): string {
   return Bun.hash(output).toString(36);
+}
+
+/**
+ * Scope a v2 envelope to one worker session. Durable events carry the
+ * session in `durable.aggregateID`; live ones in `data.sessionID`.
+ * Envelopes without any session pointer (heartbeats, server.connected)
+ * never belong to a job.
+ */
+export function eventBelongsToSession(event: any, sessionID: string | undefined): boolean {
+  if (!sessionID) return false;
+  if (typeof event?.data?.sessionID === 'string') return event.data.sessionID === sessionID;
+  if (typeof event?.durable?.aggregateID === 'string') {
+    return event.durable.aggregateID === sessionID;
+  }
+  if (typeof event?.sessionID === 'string') return event.sessionID === sessionID;
+  return false;
 }
 
 type SessionState = 'idle' | 'streaming' | 'awaiting_input' | 'unknown';
@@ -213,7 +236,9 @@ export class JobMonitor extends EventEmitter {
     }
 
     const abortController = new AbortController();
-    const client = createJobClient(job.port);
+    const config = await loadConfig().catch(() => undefined);
+    const client = createV2Client(job.port, config?.serverPassword);
+    this.questionRelay.setPassword(config?.serverPassword);
 
     this.sseSubscriptions.set(job.id, {
       abortController,
@@ -228,32 +253,33 @@ export class JobMonitor extends EventEmitter {
     });
   }
 
-  private async backfillPendingQuestions(job: Job, client: OpencodeClient): Promise<void> {
+  /**
+   * Backfill from the authoritative v2 surface: pending session forms are
+   * questions the agent is waiting on right now (covers restarts where the
+   * `form.created` event fired while we were disconnected).
+   */
+  private async backfillPendingQuestions(job: Job, client: V2Client): Promise<void> {
     if (!job.remoteSessionID) return;
 
     try {
-      const result = await client.session.messages({ path: { id: job.remoteSessionID } });
-      const messages = (result.data ?? result) as Array<{ parts?: Array<Record<string, unknown>> }>;
-      if (!Array.isArray(messages)) return;
-
-      for (const msg of messages) {
-        for (const part of msg.parts ?? []) {
-          if (part.type === 'tool' && part.tool === 'question') {
-            const state = part.state as { status?: string } | undefined;
-            if (state?.status === 'running') {
-              this.handleQuestionToolUpdate(job, part);
-            }
-          }
-        }
+      const forms = await v2ListForms(client, job.remoteSessionID);
+      for (const form of forms) {
+        await this.registerFormQuestion(job, form.id);
       }
     } catch {
       // Non-fatal: backfill failure shouldn't block SSE subscription
     }
   }
 
+  /**
+   * Subscribe to the 2.1.4 native event stream (`GET /api/event`, SSE) and
+   * dispatch this job's session events. Volatile by contract (slow
+   * consumers overflow; disconnects miss events) — backfill above covers
+   * the question gap on reconnect.
+   */
   private async processSSEStream(
     job: Job,
-    client: OpencodeClient,
+    client: V2Client,
     abortController: AbortController,
   ): Promise<void> {
     while (this.isRunning && !abortController.signal.aborted) {
@@ -263,15 +289,7 @@ export class JobMonitor extends EventEmitter {
           subscription.reconnectAttempts = 0;
         }
 
-        const events = await client.event.subscribe();
-
-        for await (const event of events.stream) {
-          if (abortController.signal.aborted) {
-            break;
-          }
-
-          await this.handleSSEEvent(job, event);
-        }
+        await this.consumeEventStream(job, client, abortController);
       } catch (error) {
         if (abortController.signal.aborted) {
           break;
@@ -297,18 +315,110 @@ export class JobMonitor extends EventEmitter {
     }
   }
 
+  private async consumeEventStream(
+    job: Job,
+    client: V2Client,
+    abortController: AbortController,
+  ): Promise<void> {
+    const response = await fetch(`${client.baseUrl}/event`, {
+      headers: { ...client.headers, Accept: 'text/event-stream' },
+      signal: abortController.signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`event stream failed: HTTP ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary >= 0) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        for (const line of raw.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice('data:'.length).trim();
+          if (!payload) continue;
+          try {
+            const event = JSON.parse(payload);
+            if (eventBelongsToSession(event, job.remoteSessionID)) {
+              await this.handleSSEEvent(job, event);
+            }
+          } catch {
+            // Non-fatal: skip malformed SSE payloads
+          }
+        }
+        boundary = buffer.indexOf('\n\n');
+      }
+
+      if (abortController.signal.aborted) break;
+    }
+  }
+
+  /**
+   * Fetch a pending form and register it as the job's question (memory +
+   * durable sidecar, so `mc_answer` works cross-process). No-op for settled
+   * or already-known forms.
+   */
+  private async registerFormQuestion(job: Job, formID: string): Promise<void> {
+    if (!job.remoteSessionID || !job.port) return;
+    const subscription = this.sseSubscriptions.get(job.id);
+    if (!subscription) return;
+
+    let form;
+    try {
+      form = await v2GetForm(subscription.client, job.remoteSessionID, formID);
+    } catch {
+      return;
+    }
+    if (form.state?.status !== 'pending') return;
+
+    const [head] = form.fields;
+    const description = [form.title, head?.description].filter(Boolean).join(' — ');
+    const toolMeta = (form.metadata as { tool?: { id?: unknown } } | undefined)?.tool;
+    const pending: PendingQuestion = {
+      jobId: job.id,
+      jobName: job.name,
+      taskSummary: buildTaskSummary(job.prompt),
+      partId: form.id,
+      callID: typeof toolMeta?.id === 'string' ? toolMeta.id : form.id,
+      remoteSessionID: job.remoteSessionID,
+      port: job.port,
+      question: head?.title && head.title !== form.title ? `${form.title}: ${head.title}` : form.title,
+      options: (head?.options ?? []).map((o) => ({ label: o.label, description: o.description })),
+      header: description || undefined,
+      multiple: false,
+      detectedAt: Date.now(),
+    };
+
+    const isNew = addPendingQuestion(pending);
+    if (isNew) {
+      await persistPendingQuestion(pending).catch(() => {});
+      this.emit('question', job, pending);
+    }
+  }
+
   private async handleSSEEvent(job: Job, event: any): Promise<void> {
     const eventType = event.type || event.event;
 
     // Stale-event guard: the subscribed job may have been killed, finished,
     // or cleaned up after this stream opened. updateJob throws on invalid
     // transitions (fail-closed); writing a terminal event for a non-running
-    // job would throw inside the for-await loop and turn into a reconnect
+    // job would throw inside the stream loop and turn into a reconnect
     // storm. Cleanup and drop the event instead.
     if (
       eventType === 'session.status' ||
       eventType === 'session.idle' ||
-      eventType === 'session.error'
+      eventType === 'session.error' ||
+      eventType === 'session.execution.succeeded' ||
+      eventType === 'session.execution.failed'
     ) {
       let stillRunning = false;
       try {
@@ -326,6 +436,59 @@ export class JobMonitor extends EventEmitter {
     }
 
     switch (eventType) {
+      case 'session.execution.succeeded': {
+        const now = new Date().toISOString();
+        this.cleanupSSEForJob(job.id);
+        await updateJob(job.id, { status: 'completed', completedAt: now });
+        this.emit('complete', { ...job, status: 'completed', completedAt: now });
+        break;
+      }
+
+      case 'session.execution.failed': {
+        const now = new Date().toISOString();
+        this.cleanupSSEForJob(job.id);
+        await updateJob(job.id, { status: 'failed', completedAt: now });
+        this.emit('failed', { ...job, status: 'failed', completedAt: now });
+        break;
+      }
+
+      case 'session.execution.interrupted': {
+        // Pause acknowledgement: the loop stopped, code untouched. The
+        // pause tool already wrote the milestone; nothing to transition.
+        break;
+      }
+
+      case 'form.created': {
+        const formID = event.data?.id;
+        if (typeof formID === 'string') {
+          await this.registerFormQuestion(job, formID);
+        }
+        break;
+      }
+
+      case 'form.replied':
+      case 'form.cancelled': {
+        const formID = event.data?.id;
+        if (typeof formID === 'string') {
+          removePendingQuestion(job.id, formID);
+          await dropPersistedQuestion(job.id, formID).catch(() => {});
+        }
+        break;
+      }
+
+      case 'permission.asked': {
+        void this.handlePermissionAsked(job, event);
+        break;
+      }
+
+      case 'permission.replied':
+      case 'permission.rejected': {
+        const requestID = event.data?.id ?? event.data?.requestID;
+        if (typeof requestID === 'string') {
+          this.questionRelay.clearPermissionTimeout(job.id, requestID);
+        }
+        break;
+      }
       case 'session.status': {
         const statusPayload = event.properties?.status;
         if (statusPayload?.type === 'idle') {
@@ -356,7 +519,7 @@ export class JobMonitor extends EventEmitter {
       case 'message.part.updated': {
         const part = event.properties?.part;
         if (part?.type === 'tool' && part.tool === 'question') {
-          this.handleQuestionToolUpdate(job, part);
+          void this.handleQuestionToolUpdate(job, part);
         }
         this.updateEventAccumulator(job.id, { currentTool: 'streaming' });
         break;
@@ -380,7 +543,7 @@ export class JobMonitor extends EventEmitter {
     }
   }
 
-  private handleQuestionToolUpdate(job: Job, part: any): void {
+  private async handleQuestionToolUpdate(job: Job, part: any): Promise<void> {
     const state = part.state;
     if (!state) return;
 
@@ -414,10 +577,35 @@ export class JobMonitor extends EventEmitter {
 
       const isNew = addPendingQuestion(pending);
       if (isNew) {
+        await persistPendingQuestion(pending).catch(() => {});
         this.emit('question', job, pending);
       }
     } else if (state.status === 'completed' || state.status === 'error') {
       removePendingQuestion(job.id, part.id);
+      await dropPersistedQuestion(job.id, part.id).catch(() => {});
+    }
+  }
+
+  /**
+   * Route a v2 `permission.asked` event through the existing policy flow.
+   * The v2 payload (`data: {id, action, resources, message}`) is adapted to
+   * the legacy envelope the policy builders read.
+   */
+  private async handlePermissionAsked(job: Job, event: any): Promise<void> {
+    try {
+      const data = event.data ?? {};
+      const adapted = {
+        properties: {
+          id: data.id ?? data.requestID,
+          type: data.action,
+          path: Array.isArray(data.resources) ? data.resources[0] : undefined,
+          description: data.message ?? data.action,
+          title: data.action,
+        },
+      };
+      await this.handlePermissionUpdate(job, adapted);
+    } catch (error) {
+      console.error(`[Monitor] Failed to process permission ask for job ${job.name}:`, error);
     }
   }
 

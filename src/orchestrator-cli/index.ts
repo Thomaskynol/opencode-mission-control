@@ -1,6 +1,6 @@
 import { getJobByName } from '../lib/job-state';
 import { loadConfig } from '../lib/config';
-import { createJobClient, createV2Client, sendPrompt } from '../lib/sdk-client';
+import { createV2Client, v2Prompt } from '../lib/sdk-client';
 import { mc_kill } from '../tools/kill';
 import { pauseJob, livePauseOps, pauseTarget } from '../tools/job-pause';
 import { resumeJob, liveResumeOps } from '../tools/job-resume';
@@ -38,7 +38,7 @@ export function createLiveControls(): HumanControls {
       const config = await loadConfig();
       const password = config.serverPassword;
       return answerQuestion(name, response, async (port, sessionID, text) => {
-        await sendPrompt(createJobClient(port, password), sessionID, text);
+        await v2Prompt(createV2Client(port, password), sessionID, text);
       });
     },
     async launch(prompt) {

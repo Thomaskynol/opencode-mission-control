@@ -1,5 +1,6 @@
 import type { JobSpec } from './plan-types';
-import { sendPrompt, waitForServer } from './sdk-client';
+import { v2Prompt, v2WaitForServer } from './sdk-client';
+import { loadConfig } from './config';
 
 export interface RelayContext {
   finding: string;
@@ -93,12 +94,23 @@ export class JobComms {
       return 0;
     }
 
+    // Findings go to the REMOTE worker session. launchSessionID is the
+    // local control-center session — prompting it would inject relay text
+    // into the operator's own session.
+    if (!job.remoteSessionID) {
+      return 0;
+    }
+
     try {
-      const client = await waitForServer(job.port, { timeoutMs: 5000 });
+      const config = await loadConfig();
+      const client = await v2WaitForServer(job.port, {
+        timeoutMs: 5000,
+        password: config.serverPassword,
+      });
 
       for (const message of filtered) {
         const prompt = this.formatRelayPrompt(message);
-        await sendPrompt(client, job.launchSessionID ?? '', prompt);
+        await v2Prompt(client, job.remoteSessionID, prompt);
       }
 
       this.clearMessagesForJob(job.name);

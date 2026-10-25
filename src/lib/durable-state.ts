@@ -100,6 +100,43 @@ export async function saveRuntimeSnapshot(
 }
 
 /**
+ * Persist a question to the sidecar without dropping other runtime sections.
+ * Atomic read-modify-write under the file lock: a load-then-save here would
+ * lose a concurrent process's update.
+ */
+export async function persistPendingQuestion(q: PendingQuestion): Promise<void> {
+  await updateRuntimeSnapshot((current) => ({
+    pendingQuestions: [
+      ...(current.pendingQuestions ?? []).filter(
+        (p) => !(p.jobId === q.jobId && p.partId === q.partId),
+      ),
+      q,
+    ],
+    messageBus: current.messageBus ?? {},
+    accumulators: current.accumulators ?? {},
+    sseCursor: current.sseCursor ?? {},
+  }));
+}
+
+export async function dropPersistedQuestion(jobId: string, partId: string): Promise<void> {
+  // Atomic read-modify-write under the file lock (see above). No-op when
+  // no sidecar exists yet.
+  await updateRuntimeSnapshot((current) => ({
+    pendingQuestions: (current.pendingQuestions ?? []).filter(
+      (p) => !(p.jobId === jobId && p.partId === partId),
+    ),
+    messageBus: current.messageBus ?? {},
+    accumulators: current.accumulators ?? {},
+    sseCursor: current.sseCursor ?? {},
+  }));
+}
+
+export async function listPersistedQuestions(): Promise<PendingQuestion[]> {
+  const snapshot = await loadRuntimeSnapshot();
+  return snapshot?.pendingQuestions ?? [];
+}
+
+/**
  * Read-modify-write the runtime snapshot atomically under the file lock.
  * Use this (not load + save) whenever the new snapshot derives from the
  * current one — otherwise two processes interleave and one update is lost.

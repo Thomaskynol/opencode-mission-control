@@ -442,3 +442,180 @@ export async function v2CompactSession(
   );
   return unwrapData<unknown>(payload, 'compact session');
 }
+
+// ---------------------------------------------------------------------------
+// v2 readiness + forms + permissions (2.1.4 `/api` surface, verified live).
+// The legacy unprefixed SDK (`/session`, `/global/event`) is not served by
+// 2.1.4, so every worker-session touchpoint goes through the helpers below.
+// ---------------------------------------------------------------------------
+
+export interface V2WaitForServerOptions {
+  timeoutMs?: number;
+  password?: string;
+}
+
+/**
+ * Wait for a serve instance to answer. Polls GET /api/info (server-scoped:
+ * unlike /api/session, it never leaks another project's sessions and only
+ * succeeds once THIS server is up).
+ */
+export async function v2WaitForServer(
+  port: number,
+  options?: V2WaitForServerOptions,
+): Promise<V2Client> {
+  const timeoutMs = options?.timeoutMs ?? 60_000;
+  const client = createV2Client(port, options?.password);
+
+  const startTime = Date.now();
+  let delay = 100;
+  const maxDelay = 5_000;
+  const backoffFactor = 1.5;
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      await v2Request(client, 'GET', '/info');
+      return client;
+    } catch {
+      const remaining = timeoutMs - (Date.now() - startTime);
+      const waitTime = Math.min(delay, remaining, maxDelay);
+      if (waitTime <= 0) break;
+
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      delay = Math.min(delay * backoffFactor, maxDelay);
+    }
+  }
+
+  throw new Error(
+    `Server on port ${port} did not become ready within ${timeoutMs}ms`,
+  );
+}
+
+/** Quote a path for `bash '...'` / `"$(cat '...')"` launcher lines. */
+export function quoteShellPath(path: string): string {
+  return `'${path.replace(/'/g, `'\\''`)}'`;
+}
+
+/** One selectable option inside a form field (question tool answers). */
+export interface V2FormOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface V2FormField {
+  key: string;
+  type: string;
+  title?: string;
+  description?: string;
+  options?: V2FormOption[];
+  custom?: boolean;
+}
+
+export interface V2FormInfo {
+  id: string;
+  sessionID: string;
+  title: string;
+  metadata?: Record<string, unknown>;
+  fields: V2FormField[];
+}
+
+export interface V2FormDetail extends V2FormInfo {
+  state: { status: string; answer?: Record<string, unknown>; message?: string };
+}
+
+export async function v2ListForms(client: V2Client, sessionID: string): Promise<V2FormInfo[]> {
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}/form`,
+  );
+  return unwrapData<V2FormInfo[]>(payload, 'list forms');
+}
+
+export async function v2GetForm(
+  client: V2Client,
+  sessionID: string,
+  formID: string,
+): Promise<V2FormDetail> {
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}`,
+  );
+  return unwrapData<V2FormDetail>(payload, 'get form');
+}
+
+export async function v2CreateForm(
+  client: V2Client,
+  sessionID: string,
+  title: string,
+  fields: V2FormField[],
+): Promise<V2FormInfo> {
+  const payload = await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/form`,
+    { title, fields },
+  );
+  return unwrapData<V2FormInfo>(payload, 'create form');
+}
+
+/**
+ * Answer a pending form. The answer maps field keys to values; option
+ * answers use the option `value`. 204 with an empty body on success.
+ */
+export async function v2ReplyForm(
+  client: V2Client,
+  sessionID: string,
+  formID: string,
+  answer: Record<string, unknown>,
+): Promise<void> {
+  await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}/reply`,
+    { answer },
+  );
+}
+
+export type V2PermissionDecision = 'once' | 'always' | 'reject';
+
+export interface V2PermissionRequest {
+  id: string;
+  sessionID: string;
+  action: string;
+  resources: string[];
+  message?: string;
+}
+
+export async function v2ListPermissions(
+  client: V2Client,
+  sessionID: string,
+): Promise<V2PermissionRequest[]> {
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}/permission`,
+  );
+  return unwrapData<V2PermissionRequest[]>(payload, 'list permissions');
+}
+
+/**
+ * Reply to a pending permission request owned by the session.
+ * Session-scoped: the legacy unprefixed `/permission/:id/reply` path
+ * answers 405 on 2.1.4. 204 with an empty body on success.
+ */
+export async function v2ReplyPermission(
+  client: V2Client,
+  sessionID: string,
+  requestID: string,
+  decision: V2PermissionDecision,
+  message?: string,
+): Promise<void> {
+  await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/permission/${encodeURIComponent(requestID)}/reply`,
+    message !== undefined ? { decision, message } : { decision },
+  );
+}

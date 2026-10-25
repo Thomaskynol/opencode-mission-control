@@ -28,7 +28,7 @@ import {
   setPaneDiedHook,
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
-import { forkJobSession, waitForServer, type V2ModelRef } from './sdk-client';
+import { createV2Client, v2ForkSession, v2Prompt, type V2ModelRef } from './sdk-client';
 
 /**
  * Parse a "provider/model" snapshot string into a model ref.
@@ -1447,12 +1447,15 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const sourceSession = sourceJob?.remoteSessionID ?? sourceJob?.launchSessionID;
       if (sourceJob?.port && sourceSession) {
         try {
-          const client = await waitForServer(sourceJob.port, { timeoutMs: 10000 });
-          await forkJobSession(client, sourceSession, {
-            sourceJobName: sourceJob.name,
-            newJobName: newJob.name,
-            additionalPrompt: newJob.prompt,
-          });
+          const client = createV2Client(sourceJob.port, this.config.serverPassword);
+          const forked = await v2ForkSession(client, sourceSession);
+          if (newJob.prompt) {
+            await v2Prompt(
+              client,
+              forked.id,
+              `Forked from job "${sourceJob.name}" as "${newJob.name}".\n\nAdditional context: ${newJob.prompt}`,
+            );
+          }
           newJob.port = sourceJob.port;
           newJob.launchSessionID = sourceJob.launchSessionID;
           newJob.remoteSessionID = sourceJob.remoteSessionID;
