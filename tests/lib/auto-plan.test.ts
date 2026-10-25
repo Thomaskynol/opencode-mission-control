@@ -5,6 +5,7 @@ import {
   normalizeRequest,
   buildPlannerPrompt,
   parsePlannerOutput,
+  extractPlannerText,
   assertSafeDestinations,
   assertAuthorizedActions,
   validateRuntimeDecision,
@@ -136,6 +137,63 @@ describe('auto-plan intake (NL-only public entry)', () => {
     await expect(
       runAutoIntake({ request: 'x' }, async () => 'garbage'),
     ).rejects.toThrow(/model output/i);
+  });
+});
+
+describe('extractPlannerText (opencode run --format json)', () => {
+  const draftJson = JSON.stringify(validDraft());
+
+  it('returns strict JSON and fenced blocks verbatim', () => {
+    expect(extractPlannerText(draftJson)).toBe(draftJson);
+    expect(parsePlannerOutput(extractPlannerText('```json\n' + draftJson + '\n```'))).toBeDefined();
+  });
+
+  it('unwraps a single-JSON envelope', () => {
+    const raw = JSON.stringify({ text: draftJson });
+    expect(parsePlannerOutput(extractPlannerText(raw)).tasks).toHaveLength(2);
+  });
+
+  it('extracts the draft from JSONL step_start + text events', () => {
+    const raw = [
+      JSON.stringify({ type: 'step_start', part: { type: 'step-start' } }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: draftJson } }),
+      JSON.stringify({ type: 'step_finish', part: { type: 'step-finish' } }),
+    ].join('\n');
+    expect(parsePlannerOutput(extractPlannerText(raw)).tasks.map((t) => t.name)).toEqual([
+      'add-retry',
+      'wire-report',
+    ]);
+  });
+
+  it('uses the last complete draft when several text events are present', () => {
+    const other = JSON.stringify({
+      ...validDraft(),
+      tasks: [{ name: 'only', prompt: 'Do it', acceptance: ['done'] }],
+    });
+    const raw = [
+      JSON.stringify({ type: 'text', part: { type: 'text', text: draftJson } }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: other } }),
+    ].join('\n');
+    expect(parsePlannerOutput(extractPlannerText(raw)).tasks.map((t) => t.name)).toEqual(['only']);
+  });
+
+  it('reassembles a draft split across text events', () => {
+    const mid = Math.floor(draftJson.length / 2);
+    const raw = [
+      JSON.stringify({ type: 'text', part: { type: 'text', text: draftJson.slice(0, mid) } }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: draftJson.slice(mid) } }),
+    ].join('\n');
+    expect(parsePlannerOutput(extractPlannerText(raw)).tasks).toHaveLength(2);
+  });
+
+  it('still fails explicitly when no draft JSON is present', () => {
+    const raw = [
+      JSON.stringify({ type: 'step_start', part: { type: 'step-start' } }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: 'thinking aloud, no json' } }),
+    ].join('\n');
+    expect(() => extractPlannerText(raw)).toThrow(/no strict-JSON draft/i);
+    expect(() => extractPlannerText('blob is not json')).toThrow(/no strict-JSON draft/i);
+    expect(() => extractPlannerText('   ')).toThrow(/empty output/i);
   });
 });
 

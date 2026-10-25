@@ -571,6 +571,39 @@ export async function runAutoIntakeWithRetry(
     : new Error(`Planner model failed after ${maxAttempts} attempt(s).`);
 }
 
+function collectEventPayloads(value: unknown, out: string[]): void {
+  // Targeted carriers only (ids/type markers must not pollute reassembly).
+  if (typeof value === 'string') {
+    if (value.trim()) out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectEventPayloads(item, out);
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    const o = value as Record<string, unknown>;
+    for (const key of ['text', 'content', 'delta']) {
+      const v = o[key];
+      if (typeof v === 'string') {
+        if (v.trim()) out.push(v);
+      } else if (Array.isArray(v)) {
+        collectEventPayloads(v, out);
+      } else if (v !== null && typeof v === 'object') {
+        collectEventPayloads(v, out);
+      }
+    }
+    for (const key of ['part', 'parts', 'message', 'messages', 'data']) {
+      const v = o[key];
+      if (typeof v === 'string') {
+        if (v.trim()) out.push(v);
+      } else if (v !== null && typeof v === 'object') {
+        collectEventPayloads(v, out);
+      }
+    }
+  }
+}
+
 function collectTextStrings(value: unknown, out: string[]): void {
   if (typeof value === 'string') {
     if (value.trim()) out.push(value);
@@ -602,8 +635,11 @@ function looksLikeDraftText(text: string): boolean {
 /**
  * Extract the planner's strict-JSON answer from `opencode run --format json`.
  * Accepts already-strict JSON verbatim; otherwise unwraps the outer envelope
- * (text/content/parts/message nests) and returns the first inner string that
- * parses as a draft. Throws explicitly when no draft JSON is found.
+ * (text/content/parts/message nests) or iterates JSONL event lines
+ * (step_start/step_finish/text/message, one object per line) and returns the
+ * inner string that parses as a draft. With several text events, the last
+ * complete draft wins; a draft split across events is reassembled by
+ * concatenation. Throws explicitly when no draft JSON is found.
  */
 export function extractPlannerText(raw: string): string {
   const trimmed = raw.trim();
@@ -611,6 +647,28 @@ export function extractPlannerText(raw: string): string {
   if (looksLikeDraftText(trimmed)) return trimmed;
   const fenced = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/);
   if (fenced && looksLikeDraftText(fenced[1].trim())) return fenced[1].trim();
+  const tryCandidates = (candidates: string[]): string | null => {
+    for (const c of candidates) {
+      const t = c.trim();
+      if (!t) continue;
+      if (looksLikeDraftText(t)) return t;
+      const innerFenced = t.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+      if (innerFenced && looksLikeDraftText(innerFenced[1].trim())) return innerFenced[1].trim();
+    }
+    return null;
+  };
+  const braceFallback = (haystack: string): string | null => {
+    // Last resort: largest {...} substring mentioning "tasks".
+    const braces: string[] = [];
+    const re = /\{[\s\S]*?"tasks"[\s\S]*?\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(haystack)) !== null) braces.push(m[0]);
+    braces.sort((a, b) => b.length - a.length);
+    for (const b of braces) {
+      if (looksLikeDraftText(b)) return b;
+    }
+    return null;
+  };
   let outer: unknown = null;
   try {
     outer = JSON.parse(trimmed);
@@ -620,22 +678,57 @@ export function extractPlannerText(raw: string): string {
   if (outer !== null && typeof outer === 'object') {
     const candidates: string[] = [];
     collectTextStrings(outer, candidates);
-    for (const c of candidates) {
-      const t = c.trim();
+    const hit = tryCandidates(candidates);
+    if (hit) return hit;
+    const fallback = braceFallback(candidates.join('\n'));
+    if (fallback) return fallback;
+  }
+  // JSONL: `opencode run --format json` streams one event object per line;
+  // the whole blob is not valid JSON, so unwrap each line instead.
+  // Targeted payloads reassemble split drafts; generic strings cover
+  // unknown shapes (single-try only, never joined).
+  const perLine: string[][] = [];
+  const payloads: string[] = [];
+  let sawJsonLine = false;
+  for (const line of trimmed.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let evt: unknown = null;
+    try {
+      evt = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    sawJsonLine = true;
+    if (typeof evt === 'string') {
+      if (evt.trim()) {
+        perLine.push([evt]);
+        payloads.push(evt);
+      }
+      continue;
+    }
+    if (evt !== null && typeof evt === 'object') {
       if (looksLikeDraftText(t)) return t;
-      const innerFenced = t.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
-      if (innerFenced && looksLikeDraftText(innerFenced[1].trim())) return innerFenced[1].trim();
+      const found: string[] = [];
+      collectEventPayloads(evt, found);
+      if (found.length === 0) collectTextStrings(evt, found);
+      else payloads.push(...found);
+      if (found.length > 0) perLine.push(found);
     }
-    // Last resort: largest {...} substring mentioning "tasks".
-    const braces: string[] = [];
-    const re = /\{[\s\S]*?"tasks"[\s\S]*?\}/g;
-    let m: RegExpExecArray | null;
-    const haystack = candidates.join('\n');
-    while ((m = re.exec(haystack)) !== null) braces.push(m[0]);
-    braces.sort((a, b) => b.length - a.length);
-    for (const b of braces) {
-      if (looksLikeDraftText(b)) return b;
+  }
+  if (sawJsonLine) {
+    // Last complete draft wins when several text events are present.
+    const hit = tryCandidates(perLine.reverse().flat());
+    if (hit) return hit;
+    // Draft split across events: reassemble by concatenation.
+    const joined = payloads.join('').trim();
+    if (joined && looksLikeDraftText(joined)) return joined;
+    const joinedFenced = joined.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+    if (joinedFenced && looksLikeDraftText(joinedFenced[1].trim())) {
+      return joinedFenced[1].trim();
     }
+    const fallback = braceFallback(perLine.flat().join('\n'));
+    if (fallback) return fallback;
   }
   throw new Error('Planner model output contains no strict-JSON draft — refusing to create tasks.');
 }
