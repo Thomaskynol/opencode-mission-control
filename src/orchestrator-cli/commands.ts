@@ -103,6 +103,32 @@ export async function dispatchCommand(
   const text = input.trim();
   if (!text) return HELP;
   const [verb, ...rest] = splitCommandArgs(text);
+  return dispatchTokens(verb, rest, text.slice(verb.length).trim(), controls, autoDeps);
+}
+
+/**
+ * Shell argv entry: `process.argv.slice(2)` already tokenized by the shell
+ * (quotes stripped, spaces preserved inside a token). Never join/re-split —
+ * that loses the grouping and truncates `--request` to its first word.
+ */
+export async function dispatchArgv(
+  argv: string[],
+  controls: HumanControls,
+  autoDeps?: AutoCommandDeps,
+): Promise<string> {
+  if (argv.length === 0) return HELP;
+  const [verb, ...rest] = argv;
+  if (!verb) return HELP;
+  return dispatchTokens(verb, rest, rest.join(' ').trim(), controls, autoDeps);
+}
+
+async function dispatchTokens(
+  verb: string,
+  rest: string[],
+  sendText: string,
+  controls: HumanControls,
+  autoDeps?: AutoCommandDeps,
+): Promise<string> {
   const lower = verb.toLowerCase();
 
   switch (lower) {
@@ -144,7 +170,7 @@ export async function dispatchCommand(
     }
 
     case 'send': {
-      const request = text.slice('send'.length).trim();
+      const request = sendText;
       if (!request) throw new Error('Usage: send <request>');
       const prompt = buildWorkerPrompt({
         request,

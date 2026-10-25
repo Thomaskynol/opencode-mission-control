@@ -85,13 +85,19 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
   for (let i = 0; i < args.length; i++) {
     const token = args[i];
     if (token.startsWith('--')) {
-      const key = token.slice(2);
-      const next = args[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
-        flags.set(key, next);
-        i++;
+      const body = token.slice(2);
+      const eq = body.indexOf('=');
+      if (eq >= 0) {
+        flags.set(body.slice(0, eq), body.slice(eq + 1));
       } else {
-        flags.set(key, '');
+        const key = body;
+        const next = args[i + 1];
+        if (next !== undefined && !next.startsWith('--')) {
+          flags.set(key, next);
+          i++;
+        } else {
+          flags.set(key, '');
+        }
       }
     } else {
       positional.push(token);
@@ -286,7 +292,11 @@ export function closeFollow(): string {
  */
 export async function startAutonomous(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { positional, flags } = parseFlags(args);
-  const rawRequest = (flags.get('request') ?? positional.join(' ')).trim();
+  // Shell already strips quotes before index.ts sees argv; when the input
+  // went through join/split the multi-word value spills into positional.
+  // Rejoin the spill so --request keeps its full text either way.
+  const requestFlag = flags.get('request');
+  const rawRequest = (requestFlag !== undefined ? [requestFlag, ...positional].join(' ') : positional.join(' ')).trim();
   const request = normalizeRequest(rawRequest);
   const repo = flags.get('repo') || undefined;
   const targetBranch = flags.get('branch') || undefined;

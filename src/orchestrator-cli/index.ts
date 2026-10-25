@@ -5,7 +5,7 @@ import { mc_kill } from '../tools/kill';
 import { pauseJob, livePauseOps, pauseTarget } from '../tools/job-pause';
 import { resumeJob, liveResumeOps } from '../tools/job-resume';
 import { answerQuestion } from './forms';
-import { dispatchCommand, type HumanControls } from './commands';
+import { dispatchArgv, type HumanControls } from './commands';
 
 /**
  * M6 human lane entry: `bun src/orchestrator-cli/index.ts <command>`.
@@ -52,9 +52,12 @@ export function createLiveControls(): HumanControls {
 }
 
 async function main(): Promise<void> {
-  const input = process.argv.slice(2).join(' ');
+  // Pass raw argv through: the shell already tokenized quotes, so a
+  // multi-word --request arrives as one token. Joining + re-splitting
+  // here would lose that grouping and truncate to the first word.
+  const argv = process.argv.slice(2);
   try {
-    console.log(await dispatchCommand(input, createLiveControls()));
+    console.log(await dispatchArgv(argv, createLiveControls()));
   } catch (error) {
     console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
