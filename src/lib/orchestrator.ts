@@ -8,7 +8,7 @@ import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, type MergeTestReport, validateTouchSet } from './merge-train';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
-import { removeReport } from './reports';
+import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
 import { createWorktree, removeWorktree } from './worktree';
 import { resolvePostCreateHook } from './worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript } from './prompt-file';
@@ -254,6 +254,120 @@ export class Orchestrator {
     // Duck-typed: test fakes expose getQueue() without has().
     if (typeof train.has === 'function') return train.has(name);
     return train.getQueue().some((job) => job.name === name);
+  }
+
+  /**
+   * Autonomous conductor cover: the CLI path (start/resume --intake) owns
+   * its JobMonitor, so the reconciler loop must run with the monitor
+   * polling. Idempotent (JobMonitor.start early-returns when active) and
+   * duck-typed so unit fakes without start() keep working.
+   */
+  private ensureMonitorRunning(): void {
+    try {
+      const monitor = this.monitor as unknown as {
+        start?: () => void;
+        isActive?: () => boolean;
+      };
+      if (typeof monitor.start !== 'function') return;
+      if (typeof monitor.isActive === 'function' && monitor.isActive()) return;
+      monitor.start();
+    } catch {
+      // Non-fatal: reconciler still drives one poll cycle per pass below.
+    }
+  }
+
+  /** Reconciler cover for missed session events: one poll cycle, best-effort. */
+  private async driveMonitorOnce(): Promise<void> {
+    try {
+      const monitor = this.monitor as unknown as {
+        pollNow?: () => Promise<void>;
+      };
+      if (typeof monitor.pollNow === 'function') {
+        await monitor.pollNow();
+      }
+    } catch {
+      // Non-fatal: event handlers + safety net below still advance state.
+    }
+  }
+
+  /**
+   * Auto final report (best-effort, never throws): same fail-closed shape as
+   * mc_report_final, written from live state when the run reaches its end
+   * (completed, or all-merged pause at pre_pr when no push is authorized).
+   * Unknown work stays under Gaps, never under Verified.
+   */
+  private async writeAutoFinalReport(plan: PlanSpec): Promise<void> {
+    try {
+      const [state, reports] = await Promise.all([loadJobState(), readAllReports()]);
+      const tasks = plan.jobs.map((job) => ({
+        name: job.name,
+        status: job.status,
+        detail: job.error ?? (job.mergedAt ? `merged at ${job.mergedAt}` : undefined),
+      }));
+      const merged = plan.jobs.filter((job) => job.status === 'merged').map((job) => job.name);
+      const conflicts = plan.jobs
+        .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
+        .map((job) => job.name);
+      const verified: string[] = [];
+      const unmet = plan.jobs
+        .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
+        .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
+      const unverified = plan.jobs
+        .filter((job) => job.status !== 'merged')
+        .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
+        .map((job) => `${job.name} [${job.status}] — outcome not verified`);
+      const markdown = buildFinalReportMarkdown({
+        title: plan.name,
+        request: `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
+        scope: plan.jobs.map((job) => job.name),
+        architecture: [`Integration branch: ${plan.integrationBranch}`, `Base commit: ${plan.baseCommit}`],
+        decisions: [],
+        tasks,
+        contributions: reports.map((report) => ({
+          instance: report.jobId,
+          job: report.jobName,
+          summary: `[${report.status}] ${report.message}`,
+        })),
+        files: [],
+        branches: [
+          plan.integrationBranch,
+          ...plan.jobs.map((job) => job.branch).filter((branch): branch is string => Boolean(branch)),
+        ],
+        integration: {
+          branch: plan.integrationBranch,
+          merged,
+          conflicts,
+          note: plan.prUrl ? `PR: ${plan.prUrl}` : undefined,
+        },
+        installUsage: [],
+        tests: [],
+        evidences: [`Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`],
+        problems: unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
+        verified,
+        unmet,
+        unverified,
+        limitations: [],
+        nextSteps: unverified.length > 0 || unmet.length > 0
+          ? ['Resolve the Gaps above, then re-run this report']
+          : [],
+        preservation: {
+          preserved: state.jobs
+            .filter((job) => job.status === 'running' || job.status === 'completed')
+            .map((job) => `${job.name} [${job.status}] — code preserved in ${job.branch} (${job.worktreePath ?? 'no worktree'})`),
+          closed: merged.map((name) => `${name} — merged into ${plan.integrationBranch}`),
+          cleanup: [],
+        },
+        attachments: reports.map((report) => ({
+          name: `${report.jobName} [${report.status}] @ ${report.timestamp}`,
+          content: report.progress !== undefined
+            ? `${report.message} (${report.progress}%)`
+            : report.message,
+        })),
+      });
+      await writeFinalReport(plan.id, markdown);
+    } catch {
+      // Best-effort only: reporting must never fail a completed run.
+    }
   }
 
   private resolveCoordinatorModel(): V2ModelRef {
@@ -511,6 +625,7 @@ export class Orchestrator {
     this.planLaunchSessionID = spec.launchSessionID;
     this.mergeTrain = new MergeTrain(plan.integrationWorktree, this.getMergeTrainConfig());
     this.subscribeToMonitorEvents();
+    this.ensureMonitorRunning();
     this.startReconciler();
     this.showToast('Mission Control', `Plan "${plan.name}" started.`, 'info');
     this.notify(`📋 Plan "${plan.name}" started in autopilot mode. ${plan.jobs.length} jobs queued.`);
@@ -579,6 +694,10 @@ export class Orchestrator {
   }
 
   private async _doReconcile(): Promise<void> {
+      // Conductor cover: drive one monitor cycle so session events land in
+      // jobs.json even when the interval hasn't fired yet (CLI conductor).
+      await this.driveMonitorOnce();
+      this.ensureMonitorRunning();
       const plan = await loadPlan();
 
       if (!plan || isTerminalPlanStatus(plan.status)) {
@@ -861,6 +980,7 @@ export class Orchestrator {
 
         if (this.isSupervisor(latestPlan)) {
           await this.setCheckpoint('pre_pr', latestPlan);
+          await this.writeAutoFinalReport((await loadPlan()) ?? latestPlan);
           return;
         }
 
@@ -874,6 +994,8 @@ export class Orchestrator {
             prUrl,
             completedAt,
           });
+          const donePlan = (await loadPlan()) ?? { ...latestPlan, status: 'completed' as const, prUrl, completedAt };
+          await this.writeAutoFinalReport(donePlan);
           this.stopReconciler();
           this.unsubscribeFromMonitorEvents();
           this.showToast('Mission Control', `Plan completed! PR: ${prUrl}`, 'success');
@@ -890,6 +1012,7 @@ export class Orchestrator {
               `no push was made. Approve with mc_plan_approve(checkpoint: "pre_pr").`,
             );
             await this.setCheckpoint('pre_pr', latestPlan);
+            await this.writeAutoFinalReport((await loadPlan()) ?? latestPlan);
             return;
           }
           const completedAt = new Date().toISOString();
@@ -1901,6 +2024,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
 
     this.subscribeToMonitorEvents();
+    this.ensureMonitorRunning();
     this.startReconciler();
   }
 

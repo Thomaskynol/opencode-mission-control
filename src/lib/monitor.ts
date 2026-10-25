@@ -160,6 +160,16 @@ export class JobMonitor extends EventEmitter {
     this.questionRelay.dispose();
   }
 
+  /** Conductor-side drive: run one poll cycle on demand (reconciler cover). */
+  async pollNow(): Promise<void> {
+    await this.poll();
+  }
+
+  /** Whether the interval loop is active (idempotent start guard). */
+  isActive(): boolean {
+    return this.isRunning;
+  }
+
   private cleanupSSESubscriptions(): void {
     for (const [jobId, subscription] of this.sseSubscriptions) {
       subscription.abortController.abort();
