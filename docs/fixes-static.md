@@ -135,3 +135,83 @@ stale commit, anchor coverage).
 
 - `bun run build`: exit 0.
 - `bun test`: green except the known `launch` flake (isolated, see §1).
+
+## 8. Serve-mode V2 migration (live-gaps lane)
+
+Root cause of the three live gaps: the legacy unprefixed SDK
+(`OpencodeClient`: `/session`, `/global/event`) is not served by
+2.1.4 — `session.create` answered `{}` ("Failed to create session:
+{}"), and the legacy `/permission/:id/reply` answers 405. The 2.1.4
+surface is `/api`-prefixed and was verified live against disposable
+serve instances (real `muse-spark-1.3-contributor` workers): session
+create/get/prompt/generate/interrupt(+`?resume=true`)/background/
+`experimental/wait`/log/message/fork/move/compact, `form.created` →
+list → reply 204 → agent resumes to `succeeded`, session-scoped
+permission reply (`once`/`always`/`reject`), native event stream
+(`session.execution.*`, `form.*`, `permission.*`).
+
+- `src/lib/sdk-client.ts` (additive only): `v2WaitForServer` (polls
+  `GET /api/info` — server-scoped, unlike `/api/session` which lists
+  every project's sessions), `v2ListForms`/`v2GetForm`/`v2CreateForm`/
+  `v2ReplyForm`, `v2ListPermissions`/`v2ReplyPermission`
+  (session-scoped), `quoteShellPath` (single-quote escaping for
+  `bash '...'` launcher lines). Legacy exports kept untouched.
+- Senders migrated to V2, always targeting `remoteSessionID` (never
+  the operator's `launchSessionID`): `mc_launch` serve path
+  (create with pinned model triple + `location.directory`, then
+  prompt), `JobComms.deliverMessages`, orchestrator `addJob` fork
+  (`v2ForkSession` + follow-up prompt), `QuestionRelay`
+  (auto-approve → single-use `once`; escalation keeps the worker
+  unblocked via the auto-response timeout instead of POSTing to the
+  operator session on the worker port — that POST always missed and
+  operator delivery stays with the notifications hook), monitor SSE
+  (native `/api/event` stream filtered per session +
+  `v2ListForms` backfill; terminal `session.execution.succeeded/failed`
+  reuse the stale-event guard; `form.created` registers + persists the
+  question, `form.replied/cancelled` drops it).
+- `answerQuestion` (`forms.ts`): tries the form reply first (label/
+  value/position → field key), falls back to the text-prompt sender
+  only when the form is gone. Legacy `partId`s never touch the
+  network, so existing unit tests stay hermetic.
+- `JobSpecSchema` now parses `remoteSessionID` (it was already in
+  the interface but zod stripped it on every load — fork and
+  fix-before-rollback lost the worker session after a coordinator
+  restart).
+- Sidecar question helpers moved to `durable-state.ts` (`forms.ts`
+  re-exports; `monitor.ts` imports lib-to-lib). Partial `job-state`
+  mocks (`monitor.test.ts`, `z-workflows.test.ts`) completed with
+  the missing migration exports — the real module surface, not new
+  behavior.
+- Pinned by: `sdk-client-v2.test.ts` (info-poll auth, form reply
+  body, permission reply route/decisions, quoting),
+  `human-controls.test.ts` (form-first answer, no prompt fallback),
+  `monitor-v2.test.ts` (event scoping, terminal events, form
+  lifecycle incl. durable sidecar, permission-asked without worker
+  session), `plan-state.test.ts` (remoteSessionID round-trip),
+  `prompt-file.test.ts` (spaces/quotes), updated `launch`/`job-comms`/
+  `orchestrator` serve-path tests.
+- Deliberately unchanged: `coordinator-client.ts` (read-only over
+  memory + sidecar — correct once the monitor persists),
+  `instance-manager.ts` / `job-pause.ts` / `job-resume.ts` (already
+  V2; the gap was the broken launch beneath them, now fixed).
+  Lane note: this lane touched `sdk-client.ts` and `durable-state.ts`
+  outside the m6-human writer scope, under explicit live-gaps
+  authorization — recorded here instead of rewriting lane scopes.
+- Ask-user permission escalation has no operator push: it stays
+  visible in the serve TUI / policy log with the timeout keeping
+  the worker unblocked. Pending forms are the operator-visible
+  question queue (`questions` command).
+
+## 9. Verification (live-gaps)
+
+- `bun run build`: exit 0.
+- `bun test`: **953 pass, 16 skip, 0 fail** across 62 files
+  (the previously known `launch` flake did not reproduce in the
+  final run; `z-workflows` 24/24 in its isolated subprocess).
+- Live: `bun /tmp/opencode/live-gaps/run.ts` → `ALL LIVE GAPS OK`
+  (exit 0), serve `opencode v2.1.4` on disposable port 14492 + dir
+  `/tmp/opencode/live-gaps-app`, workers
+  `opencode-go/muse-spark-1.3-contributor`. Evidences under
+  `/tmp/opencode/live-gaps/evidence/` (see `docs/live-proof.md`
+  adendo). Teardown: serve processes killed, disposable
+  `live-gaps/state|reports` removed, repo/global state untouched.

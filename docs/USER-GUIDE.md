@@ -184,10 +184,11 @@ Rules that matter:
 
 - Validated against **opencode 2.1.4 only**. Other server versions
   may break the serve-mode endpoints.
-- **`question.*` has no HTTP endpoint in 2.1.4.** Worker questions
-  arrive as forms and your answer travels as session text
-  (`mc_answer`); only `permission.*` uses the permission-reply
-  endpoint. If you ignore an essential question for 120s, the relay
+- **No `question.*` HTTP endpoint in 2.1.4.** Worker questions
+  arrive as session forms and your answer goes to the form's reply
+  endpoint first (`mc_answer`), falling back to session text only
+  when the form is gone; permission replies are session-scoped
+  (`once`/`always`/`reject`). If you ignore an essential question for 120s, the relay
   auto-responds `use your best judgment` so independent jobs keep
   moving (`QUESTION_AUTO_RESPONSE_MS` / `QUESTION_DEFAULT_RESPONSE`).
 - Parallel ceiling is clamped to **4–8**; tmux jobs cannot be

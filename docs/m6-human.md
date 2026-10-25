@@ -44,11 +44,17 @@ Formulários respondíveis (`forms.ts`): memória (via rápida) + sidecar
 de jobs mortos são descartadas, nunca re-entregues). Responder remove dos
 dois stores: pergunta nunca é feita duas vezes.
 
-**Limite 2.1.4 (documentado): `question.*` não tem endpoint HTTP.**
-Perguntas do agente chegam como formulários e a resposta viaja como prompt
-de texto para a sessão do job; só `permission.*` usa o endpoint de reply
-de permissão. Ausência do operador não trava frentes independentes:
-sem resposta em 120s o relay auto-responde `use your best judgment`
+**Resposta do agente (2.1.4, verificado live):** perguntas do agente
+chegam como formulários de sessão (`form.created`,
+`GET /session/:id/form`, `POST .../form/:formID/reply {answer}`) e
+permissões como requisições escopadas à sessão
+(`GET /session/:id/permission`,
+`POST .../permission/:requestID/reply {decision, message}`).
+Não existe endpoint `question.*`. `answerQuestion` tenta o reply do
+formulário primeiro (mapeando texto/rótulo/posição para a chave do campo)
+e só usa prompt de texto quando o formulário sumiu; ausência do operador
+não trava frentes independentes: sem resposta em 120s o relay
+auto-responde `use your best judgment`
 (`QUESTION_AUTO_RESPONSE_MS` / `QUESTION_DEFAULT_RESPONSE`) e os demais
 jobs seguem; `mc_answer`/`overview` sempre mostram quais jobs perguntaram.
 
