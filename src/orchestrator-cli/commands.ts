@@ -5,6 +5,7 @@ import { formatReportLine } from '../lib/reports';
 import { mc_attach } from '../tools/attach';
 import { getDashboard, queryTask, readLatestReport } from './coordinator-client';
 import { listPersistedQuestions, renderQuestionForm } from './forms';
+import { applyModelPlan, closeFollow, complementIntake, startIntake } from './auto-commands';
 
 /**
  * M6 human lane: conversational dispatcher for the separate human TUI.
@@ -23,8 +24,12 @@ export interface HumanControls {
 
 export const HELP = [
   'Human TUI commands (separate from worker sessions):',
+  '  start <request> [--repo R] [--branch B] [--max-parallel N] — capture NL-only intake, persist it, print the planner prompt',
+  '  complement [--intake ID] <text> — extend the persisted request (same work continues)',
+  '  auto-plan --intake ID --plan-file F — validate the model JSON answer into tasks (no dispatch here)',
+  '  close                 — detach this view; coordinator/reconciler keep conducting, recording continues',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
-  '  follow                — short dashboard without raw logs',
+  '  follow | progress     — short dashboard without raw logs',
   '  task <name>           — consult one task (status, last milestone, questions)',
   '  add <name> <text>     — complement a job: continue the SAME session with follow-up text',
   '  pause <name> [--detach] — interrupt the session loop (code preserved)',
@@ -101,7 +106,24 @@ export async function dispatchCommand(
     case 'help':
       return HELP;
 
-    case 'follow': {
+    case 'start': {
+      return startIntake(rest);
+    }
+
+    case 'complement': {
+      return complementIntake(rest);
+    }
+
+    case 'auto-plan': {
+      return applyModelPlan(rest);
+    }
+
+    case 'close': {
+      return closeFollow();
+    }
+
+    case 'follow':
+    case 'progress': {
       const d = await getDashboard();
       return [
         `Follow: ${d.running} running, ${d.completed} completed, ${d.failed} failed, ${d.stopped} stopped${d.paused.length > 0 ? `, paused: ${d.paused.join(', ')}` : ''}`,

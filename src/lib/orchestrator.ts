@@ -29,6 +29,21 @@ import {
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
 import { createV2Client, v2ForkSession, v2Prompt, type V2ModelRef } from './sdk-client';
+import {
+  runAutoIntake,
+  ensureBaseReady,
+  draftToJobSpecs,
+  validateRuntimeDecision,
+  type AutoIntakeInput,
+  type PlannerGenerate,
+  type RuntimeDecision,
+} from './auto-plan';
+import {
+  saveAutoIntake,
+  loadAutoIntake,
+  appendAutoDecision,
+  appendAutoQuestion,
+} from './durable-state';
 
 /**
  * Parse a "provider/model" snapshot string into a model ref.
@@ -1365,6 +1380,173 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     await deleteIntegrationBranch(plan.id);
     await clearPlan();
+  }
+
+  // -------------------------------------------------------------------------
+  // Autonomous intake: NL request → configured-model plan → validated launch.
+  // The caller supplies NL only; `generate` is the configured model slot.
+  // Every model decision is validated before anything runs; the intake
+  // record (request/requirements/decisions/questions/next steps) persists
+  // in the sidecar so a restart resumes without reconstruction.
+  // -------------------------------------------------------------------------
+
+  async startAutonomousPlan(
+    input: AutoIntakeInput,
+    generate: PlannerGenerate,
+    opts?: { launch?: boolean },
+  ): Promise<{ intakeId: string; tasks: string[]; launched: boolean }> {
+    const { intake, draft } = await runAutoIntake(input, generate);
+    const base = await ensureBaseReady(input.repo ?? process.cwd(), input.targetBranch);
+
+    const now = new Date().toISOString();
+    await saveAutoIntake({
+      id: intake.id,
+      request: intake.request,
+      repo: intake.repo,
+      targetBranch: intake.targetBranch,
+      ceiling: intake.ceiling,
+      requirements: draft.requirements.map((r) => ({ ...r })),
+      decisions: [...draft.decisions],
+      questions: [...draft.questions],
+      nextSteps: [],
+      status: 'planned',
+      createdAt: intake.createdAt,
+      updatedAt: now,
+    });
+
+    const tasks = draft.tasks.map((t) => t.name);
+    if (opts?.launch === false) {
+      return { intakeId: intake.id, tasks, launched: false };
+    }
+
+    const jobSpecs: JobSpec[] = draftToJobSpecs(draft).map((shell) => ({
+      ...shell,
+      id: randomUUID(),
+      status: 'queued' as const,
+      // Acceptance rides in the prompt: JobSpec carries no separate field.
+      prompt: `${shell.prompt}\n\nAcceptance criteria:\n${draft.tasks
+        .find((t) => t.name === shell.name)!
+        .acceptance.map((a) => `- [ ] ${a}`)
+        .join('\n')}`,
+    }));
+    const spec: PlanSpec = {
+      id: randomUUID(),
+      name: intake.request.length > 100 ? intake.request.slice(0, 100) : intake.request,
+      mode: 'autopilot',
+      status: 'pending',
+      jobs: jobSpecs,
+      integrationBranch: `mc/integration-${intake.id}`,
+      baseCommit: base.baseCommit,
+      createdAt: now,
+      launchSessionID: this.planLaunchSessionID,
+    };
+    if (input.targetBranch) {
+      spec.baseBranch = base.baseBranch;
+    }
+    await this.startPlan(spec);
+    await appendAutoDecision(intake.id, `plan ${spec.id} launched (${tasks.length} tasks)`);
+    return { intakeId: intake.id, tasks, launched: true };
+  }
+
+  /** Extend the persisted NL request; the same work continues, nothing rebuilds. */
+  async complementAutonomousRequest(intakeId: string, text: string): Promise<void> {
+    const record = await loadAutoIntake(intakeId);
+    if (!record) {
+      throw new Error(`No intake "${intakeId}" persisted — start one before complementing.`);
+    }
+    const followUp = text.trim();
+    if (!followUp) throw new Error('Complement text must not be empty.');
+    await saveAutoIntake({
+      ...record,
+      request: `${record.request}\nFollow-up: ${followUp}`,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Apply one adaptive-loop model decision. Validated first via
+   * validateRuntimeDecision: invalid decisions throw without dispatching,
+   * scope changes are recorded as questions, routine technique runs
+   * autonomously through the existing job/plan paths.
+   */
+  async applyModelAdjustment(
+    decision: RuntimeDecision,
+    opts?: { intakeId?: string },
+  ): Promise<{ route: 'autonomous' | 'needs-user'; message: string }> {
+    const plan = await loadPlan();
+    if (!plan) throw new Error('No active plan — cannot apply a model adjustment.');
+    const route = validateRuntimeDecision(decision, {
+      taskNames: plan.jobs.map((j) => j.name),
+      mergedTasks: plan.jobs.filter((j) => j.status === 'merged').map((j) => j.name),
+    });
+
+    if (route === 'needs-user') {
+      const question = `Model proposes (${decision.action}): ${decision.reason} — approve, deny, or redirect with free text.`;
+      if (opts?.intakeId) {
+        await appendAutoQuestion(opts.intakeId, question).catch(() => {});
+      }
+      return { route, message: question };
+    }
+
+    if (decision.action === 'add_task' && decision.task) {
+      const t = decision.task;
+      await this.addJob({
+        name: t.name.trim(),
+        prompt:
+          `${t.prompt.trim()}\n\nAcceptance criteria:\n` +
+          (t.acceptance.map((a) => `- [ ] ${a}`).join('\n')),
+        dependsOn: t.dependsOn?.length ? [...t.dependsOn] : undefined,
+        touchSet: t.touchSet?.length ? [...t.touchSet] : undefined,
+      });
+      if (opts?.intakeId) {
+        await appendAutoDecision(opts.intakeId, `added task "${t.name}": ${decision.reason}`).catch(
+          () => {},
+        );
+      }
+      return { route, message: `Task "${t.name}" added and queued.` };
+    }
+
+    if (decision.action === 'adjust_deps' && decision.dependsOn) {
+      for (const [name, deps] of Object.entries(decision.dependsOn)) {
+        await updatePlanJob(plan.id, name, { dependsOn: [...deps] });
+      }
+      if (opts?.intakeId) {
+        await appendAutoDecision(opts.intakeId, `adjusted deps: ${decision.reason}`).catch(() => {});
+      }
+      return { route, message: 'Dependencies adjusted.' };
+    }
+
+    if (opts?.intakeId) {
+      await appendAutoDecision(opts.intakeId, `note: ${decision.reason}`).catch(() => {});
+    }
+    return { route, message: 'Note recorded.' };
+  }
+
+  /** Short progress view: intake state + plan state + persisted next steps. */
+  async autonomousProgress(intakeId?: string): Promise<string> {
+    const lines: string[] = [];
+    if (intakeId) {
+      const record = await loadAutoIntake(intakeId);
+      if (record) {
+        lines.push(`Intake ${record.id} [${record.status}]: ${record.request.split('\n')[0]}`);
+        lines.push(`Decisions kept: ${record.decisions.length}, open questions: ${record.questions.length}`);
+        for (const step of record.nextSteps.slice(0, 5)) lines.push(`Next: ${step}`);
+      } else {
+        lines.push(`No intake "${intakeId}" persisted.`);
+      }
+    }
+    const plan = await loadPlan();
+    if (!plan) {
+      lines.push('No active plan.');
+      return lines.join('\n');
+    }
+    const counts = new Map<string, number>();
+    for (const j of plan.jobs) counts.set(j.status, (counts.get(j.status) ?? 0) + 1);
+    lines.push(
+      `Plan "${plan.name}" [${plan.status}]: ` +
+        [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(', '),
+    );
+    return lines.join('\n');
   }
 
   async skipJob(jobName: string, reason?: string): Promise<void> {

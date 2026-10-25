@@ -295,6 +295,74 @@ export function shouldContinueSession(sameWork: boolean): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime validation for model-driven adaptive decisions.
+// The coordinator never fires work from an unchecked decision: unknown
+// tasks, missing/unsatisfied deps, cycles and disallowed targets fail
+// explicitly here, before dispatch.
+// ---------------------------------------------------------------------------
+
+export interface ModelDispatchDecision {
+  name: string;
+  touchSet?: string[];
+}
+
+/**
+ * Validate one model dispatch decision against live plan state.
+ * Throws explicitly on unknown task, unknown dep, unmerged dep or
+ * disallowed destination — the adaptive loop treats that as "ask/fix",
+ * never as work to fire.
+ */
+export function validateModelDispatch(
+  decision: ModelDispatchDecision,
+  jobs: PlanJobView[],
+  merged: string[] | Set<string>,
+): PlanJobView {
+  const mergedSet = merged instanceof Set ? merged : new Set(merged);
+  const byName = new Map(jobs.map((j) => [j.name, j]));
+  const job = byName.get(decision.name);
+  if (!job) {
+    throw new Error(`Model dispatched unknown task "${decision.name}". Refusing.`);
+  }
+  for (const dep of job.dependsOn ?? []) {
+    if (!byName.has(dep)) {
+      throw new Error(`Model dispatch of "${job.name}" depends on unknown job "${dep}". Refusing.`);
+    }
+    if (!mergedSet.has(dep)) {
+      throw new Error(
+        `Model dispatch of "${job.name}" needs dep "${dep}" merged first. Refusing.`,
+      );
+    }
+  }
+  for (const entry of decision.touchSet ?? []) {
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.startsWith('/') || trimmed.split('/').includes('..')) {
+      throw new Error(
+        `Model dispatch of "${job.name}" targets disallowed destination "${entry}". Refusing.`,
+      );
+    }
+  }
+  return job;
+}
+
+export interface GapRequirement {
+  id: string;
+  text: string;
+}
+
+/**
+ * Uncovered requirements: what the deliveries so far do not satisfy.
+ * The adaptive loop turns each gap into a follow-up task proposal
+ * (validated again via validateRuntimeDecision before dispatch).
+ */
+export function detectGaps(
+  requirements: GapRequirement[],
+  coveredIds: string[] | Set<string>,
+): GapRequirement[] {
+  const covered = coveredIds instanceof Set ? coveredIds : new Set(coveredIds);
+  return requirements.filter((r) => !covered.has(r.id));
+}
+
+// ---------------------------------------------------------------------------
 // Loop — observe → decide → dispatch → gate → enqueue.
 // ---------------------------------------------------------------------------
 

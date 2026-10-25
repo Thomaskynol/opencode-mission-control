@@ -35,6 +35,35 @@ export interface AccumulatorSnapshot {
   eventCount: number;
 }
 
+export interface AutoIntakeRequirement {
+  id: string;
+  text: string;
+  acceptance: string[];
+}
+
+export type AutoIntakeStatus = 'awaiting-plan' | 'planned' | 'running';
+
+/**
+ * Autonomous intake record: the original NL request plus everything the
+ * model derived from it (requirements, decisions, questions, next steps).
+ * Kept in the sidecar (not plan.json) so intake survives before a plan
+ * exists and across restarts without manual reconstruction.
+ */
+export interface AutoIntakeRecord {
+  id: string;
+  request: string;
+  repo?: string;
+  targetBranch?: string;
+  ceiling?: { maxParallel?: number; testCommand?: string };
+  requirements: AutoIntakeRequirement[];
+  decisions: string[];
+  questions: string[];
+  nextSteps: string[];
+  status: AutoIntakeStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface RuntimeSnapshot {
   version: 1;
   updatedAt: string;
@@ -42,6 +71,7 @@ export interface RuntimeSnapshot {
   messageBus: Record<string, RelayMessage[]>;
   accumulators: Record<string, AccumulatorSnapshot>;
   sseCursor: Record<string, { lastActivityAt: number; lastEventId?: string }>;
+  autoIntake: AutoIntakeRecord | null;
 }
 
 export interface ReconcileReport {
@@ -64,6 +94,7 @@ function emptySnapshot(): RuntimeSnapshot {
     messageBus: {},
     accumulators: {},
     sseCursor: {},
+    autoIntake: null,
   };
 }
 
@@ -115,6 +146,7 @@ export async function persistPendingQuestion(q: PendingQuestion): Promise<void> 
     messageBus: current.messageBus ?? {},
     accumulators: current.accumulators ?? {},
     sseCursor: current.sseCursor ?? {},
+    autoIntake: current.autoIntake ?? null,
   }));
 }
 
@@ -128,6 +160,7 @@ export async function dropPersistedQuestion(jobId: string, partId: string): Prom
     messageBus: current.messageBus ?? {},
     accumulators: current.accumulators ?? {},
     sseCursor: current.sseCursor ?? {},
+    autoIntake: current.autoIntake ?? null,
   }));
 }
 
@@ -335,4 +368,75 @@ export async function reconcileOnBoot(): Promise<ReconcileReport> {
   }
 
   return report;
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous intake record (NL request → model plan, resumable).
+// Single active intake: one autonomous run at a time, like one active plan.
+// ---------------------------------------------------------------------------
+
+/** Persist (or replace) the autonomous intake record. */
+export async function saveAutoIntake(record: AutoIntakeRecord): Promise<void> {
+  await updateRuntimeSnapshot((current) => ({
+    pendingQuestions: current.pendingQuestions ?? [],
+    messageBus: current.messageBus ?? {},
+    accumulators: current.accumulators ?? {},
+    sseCursor: current.sseCursor ?? {},
+    autoIntake: record,
+  }));
+}
+
+/** Load the intake record by id (null when absent or a different id). */
+export async function loadAutoIntake(id: string): Promise<AutoIntakeRecord | null> {
+  const snapshot = await loadRuntimeSnapshot();
+  if (!snapshot?.autoIntake || snapshot.autoIntake.id !== id) return null;
+  return snapshot.autoIntake;
+}
+
+async function mutateAutoIntake(
+  id: string,
+  mutate: (record: AutoIntakeRecord) => AutoIntakeRecord,
+): Promise<AutoIntakeRecord> {
+  let updated: AutoIntakeRecord | null = null;
+  await updateRuntimeSnapshot((current) => {
+    const record = current.autoIntake;
+    if (!record || record.id !== id) {
+      throw new Error(`No intake "${id}" persisted — start one before appending.`);
+    }
+    updated = mutate({ ...record, updatedAt: new Date().toISOString() });
+    return {
+      pendingQuestions: current.pendingQuestions ?? [],
+      messageBus: current.messageBus ?? {},
+      accumulators: current.accumulators ?? {},
+      sseCursor: current.sseCursor ?? {},
+      autoIntake: updated,
+    };
+  });
+  return updated!;
+}
+
+/** Append a coordinator/model decision (preserved across restarts). */
+export async function appendAutoDecision(id: string, decision: string): Promise<void> {
+  await mutateAutoIntake(id, (record) => ({
+    ...record,
+    decisions: [...record.decisions, decision],
+  }));
+}
+
+/** Append a user-facing question (answered via free text, never lost). */
+export async function appendAutoQuestion(id: string, question: string): Promise<void> {
+  await mutateAutoIntake(id, (record) => ({
+    ...record,
+    questions: [...record.questions, question],
+  }));
+}
+
+/** Replace the next-steps list (derived from the latest validated draft). */
+export async function setAutoNextSteps(id: string, nextSteps: string[]): Promise<void> {
+  await mutateAutoIntake(id, (record) => ({ ...record, nextSteps: [...nextSteps] }));
+}
+
+/** Advance the intake lifecycle without rebuilding the request. */
+export async function setAutoIntakeStatus(id: string, status: AutoIntakeStatus): Promise<void> {
+  await mutateAutoIntake(id, (record) => ({ ...record, status }));
 }
