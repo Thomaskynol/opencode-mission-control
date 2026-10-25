@@ -6,12 +6,37 @@
 
 import { join } from 'path';
 import { gitCommand, getDefaultBranch } from './git';
+import { withFileLock, INTEGRATION_STALE_MS, type FileLockOptions } from './file-lock';
 import { getProjectId, getXdgDataDir } from './paths';
 import { createWorktree, removeWorktree } from './worktree';
 import type { PostCreateHook } from './providers/worktree-provider';
 import { extractConflicts } from './utils';
 
 const XDG_DATA_DIR = getXdgDataDir();
+
+/**
+ * Explicit authorization for publishing actions (push/PR/deploy).
+ * The human must opt in per call — absence of the flag is a refusal.
+ */
+export interface PublishAuthOptions {
+  humanAuth?: boolean;
+}
+
+/**
+ * Guard: refuse push/PR/deploy without explicit human authorization.
+ * Call this at the start of any code path that publishes to a remote.
+ * Throws when `opts?.humanAuth !== true`.
+ */
+export function requireHumanAuth(action: string, opts?: PublishAuthOptions): void {
+  if (opts?.humanAuth === true) {
+    return;
+  }
+  throw new Error(
+    `[MC] Refusing "${action}" without explicit human authorization. ` +
+    `Push/PR/deploy require requireHumanAuth — re-run with { humanAuth: true } ` +
+    `after the user explicitly approved this exact operation.`,
+  );
+}
 
 /**
  * Create an integration branch from the current main HEAD.
@@ -122,6 +147,32 @@ export async function deleteIntegrationBranch(planId: string): Promise<void> {
       throw new Error(`Failed to delete integration branch: ${deleteBranchResult.stderr}`);
     }
   }
+}
+
+/**
+ * Lockfile path for one integration branch worktree.
+ * One lock per integration branch serializes merge-train writers.
+ */
+export function integrationLockPath(worktreePath: string): string {
+  return `${worktreePath}.lock`;
+}
+
+/**
+ * Run `fn` holding the per-integration-branch file lock.
+ * Merge-train integration must go through here so concurrent processes
+ * cannot interleave merges into the same branch.
+ * Uses INTEGRATION_STALE_MS (not the 15s default): merge+test runs hold
+ * the lock for minutes, and a stale break mid-run would corrupt the branch.
+ */
+export async function withIntegrationLock<T>(
+  worktreePath: string,
+  fn: () => Promise<T>,
+  opts?: FileLockOptions,
+): Promise<T> {
+  return withFileLock(integrationLockPath(worktreePath), fn, {
+    staleMs: INTEGRATION_STALE_MS,
+    ...opts,
+  });
 }
 
 /**

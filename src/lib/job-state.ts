@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { z } from 'zod';
 import { getDataDir } from './paths';
-import { GitMutex } from './git-mutex';
+import { withFileLock, lockPathFor } from './file-lock';
 import { isValidJobTransition, VALID_JOB_TRANSITIONS } from './plan-types';
 import type { JobStatus } from './plan-types';
 import { JobSchema, JobStateSchema } from './schemas';
@@ -44,23 +44,16 @@ export function migrateJobState(state: Record<string, unknown>): JobState {
 const STATE_FILE = 'jobs.json';
 
 /**
- * In-process mutex for serializing job state operations.
- * Prevents concurrent read-modify-write cycles from losing updates
- * within the same process.
- *
- * LIMITATION: This mutex only protects within a single process.
- * If multiple processes (e.g., mc_plan_cancel and mc_cleanup from
- * different sessions) access jobs.json concurrently, they each have
- * their own mutex instance and can race. The atomicWrite with
- * renameSync makes individual writes atomic, but the full
- * read-modify-write cycle is unprotected across processes.
- *
- * In practice, this manifests as a brief window where mc_jobs may
- * show a stale entry immediately after mc_cleanup completes.
- * A subsequent mc_jobs call will show the correct state.
- * See: E2E_TEST_FINDINGS.md, FINDING 1.
+ * Serialize read-modify-write cycles across processes via the lockfile
+ * (`jobs.json.lock`). withFileLock also serializes same-process callers,
+ * so concurrent addJob/updateJob/removeJob calls can neither lose updates
+ * within one process nor race across processes. Stale locks left by a
+ * kill -9 are broken after the stale timeout (see file-lock.ts).
  */
-const stateMutex = new GitMutex();
+async function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
+  const filePath = await getStateFilePath();
+  return withFileLock(lockPathFor(filePath), fn);
+}
 
 async function getStateFilePath(): Promise<string> {
   const dataDir = await getDataDir();
@@ -114,7 +107,7 @@ export async function saveJobState(state: JobState): Promise<void> {
 }
 
 export async function addJob(job: Job): Promise<void> {
-  await stateMutex.withLock(async () => {
+  await withStateLock(async () => {
     const state = await loadJobState();
     state.jobs.push(job);
     await saveJobState(state);
@@ -125,7 +118,7 @@ export async function updateJob(
   id: string,
   updates: Partial<Job>
 ): Promise<void> {
-  await stateMutex.withLock(async () => {
+  await withStateLock(async () => {
     const state = await loadJobState();
     const jobIndex = state.jobs.findIndex((j) => j.id === id);
 
@@ -139,7 +132,10 @@ export async function updateJob(
       const toStatus = updates.status as string;
       if (fromStatus in VALID_JOB_TRANSITIONS && toStatus in VALID_JOB_TRANSITIONS) {
         if (!isValidJobTransition(fromStatus as JobStatus, toStatus as JobStatus)) {
-          console.warn(`[MC] Invalid job transition: ${fromStatus} → ${toStatus} (job: ${job.name})`);
+          // Fail-closed: an invalid transition is a bug in the caller, never
+          // a state to persist. Throw instead of writing a state the rest of
+          // the pipeline (and the transition map) does not understand.
+          throw new Error(`Invalid job transition: ${fromStatus} → ${toStatus} (job: ${job.name})`);
         }
       }
     }
@@ -154,7 +150,7 @@ export async function updateJob(
 }
 
 export async function removeJob(id: string): Promise<void> {
-  await stateMutex.withLock(async () => {
+  await withStateLock(async () => {
     const state = await loadJobState();
     const initialLength = state.jobs.length;
     state.jobs = state.jobs.filter((j) => j.id !== id);

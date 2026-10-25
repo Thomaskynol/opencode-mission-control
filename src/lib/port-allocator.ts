@@ -1,6 +1,6 @@
 import { join } from 'path';
 import { getDataDir } from './paths';
-import { GitMutex } from './git-mutex';
+import { withFileLock, lockPathFor } from './file-lock';
 import { atomicWrite } from './utils';
 import type { MCConfig } from './config';
 import type { Job } from './job-state';
@@ -8,11 +8,14 @@ import type { Job } from './job-state';
 const LOCK_FILE = 'port.lock';
 
 /**
- * In-process mutex for serializing port allocation operations.
- * Same pattern as job-state.ts — protects read-modify-write cycles
- * within a single process.
+ * Cross-process lock for port allocation (see file-lock.ts).
+ * Serializes read-modify-write cycles on port.lock across processes so
+ * two concurrent launches can never allocate the same port.
  */
-const portMutex = new GitMutex();
+async function withPortLock<T>(fn: () => Promise<T>): Promise<T> {
+  const dataDir = await getDataDir();
+  return withFileLock(lockPathFor(join(dataDir, LOCK_FILE)), fn);
+}
 
 async function getLockFilePath(): Promise<string> {
   const dataDir = await getDataDir();
@@ -54,7 +57,7 @@ export async function allocatePort(
   config: MCConfig,
   activeJobs: Job[],
 ): Promise<number> {
-  return portMutex.withLock(async () => {
+  return withPortLock(async () => {
     const rangeStart = config.portRangeStart ?? 14100;
     const rangeEnd = config.portRangeEnd ?? 14199;
 
@@ -86,7 +89,7 @@ export async function allocatePort(
  * Idempotent — no-op if port is not in the lock file.
  */
 export async function releasePort(port: number): Promise<void> {
-  await portMutex.withLock(async () => {
+  await withPortLock(async () => {
     const lockedPorts = await readLockedPorts();
     const filtered = lockedPorts.filter((p) => p !== port);
 

@@ -23,6 +23,12 @@ export type PermissionPolicyRequest = {
   description?: string;
   action?: string;
   target?: string;
+  /**
+   * Explicit human authorization carried in the request (e.g. the user
+   * approved this exact push/PR/deploy). Publishing actions are never
+   * auto-approved without it — see requiresHumanAuth().
+   */
+  humanAuth?: boolean;
 };
 
 export type PermissionJobContext = {
@@ -70,6 +76,30 @@ function looksLikePackageInstall(input?: string): boolean {
   return installSignals.some((signal) => normalized.includes(signal));
 }
 
+/**
+ * Publishing actions that must never run without explicit human
+ * authorization: git push, PR creation/merge, deploys, package publishes.
+ * Only command-like requests are inspected — file_operation paths are
+ * excluded so editing a file named e.g. `deploy.sh` stays auto-approved.
+ */
+const PUBLISH_PATTERNS = [
+  /\bgit\s+push\b/,
+  /\bgh\s+pr\s+(create|merge)\b/,
+  /\bnpm\s+publish\b/,
+  /\bdeploy\b/,
+];
+
+export function requiresHumanAuth(permissionRequest: PermissionPolicyRequest): boolean {
+  if (permissionRequest.type === 'file_operation') {
+    return false;
+  }
+  const haystack = [permissionRequest.action, permissionRequest.description, permissionRequest.target]
+    .filter((part): part is string => typeof part === 'string')
+    .join('\n')
+    .toLowerCase();
+  return PUBLISH_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
 export class PermissionPolicy {
   private readonly policy: PermissionPolicyConfig;
   private readonly decisionLog: PermissionPolicyLogEntry[] = [];
@@ -110,6 +140,22 @@ export class PermissionPolicy {
     permissionRequest: PermissionPolicyRequest,
     jobContext: PermissionJobContext,
   ): PermissionPolicyDecision {
+    // Publishing actions require explicit human authorization carried in
+    // the request. Without it, force human review even inside the worktree.
+    if (requiresHumanAuth(permissionRequest) && permissionRequest.humanAuth !== true) {
+      const action = permissionRequest.action ?? permissionRequest.description ?? permissionRequest.type;
+      const target = permissionRequest.target ?? permissionRequest.path ?? '(unknown target)';
+      this.decisionLog.push({
+        timestamp: new Date().toISOString(),
+        permissionType: this.resolvePermissionType(permissionRequest),
+        action,
+        target,
+        policyDecision: 'ask-user',
+        reason: 'Publishing action (push/PR/deploy) requires explicit human authorization',
+      });
+      return 'ask-user';
+    }
+
     const permissionType = this.resolvePermissionType(permissionRequest);
 
     let policyDecision: PermissionPolicyDecision;

@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { z } from 'zod';
 import { getDataDir } from './paths';
-import { GitMutex } from './git-mutex';
+import { withFileLock, lockPathFor } from './file-lock';
 import type { PlanSpec, JobSpec, CheckpointContext } from './plan-types';
 import { isValidPlanTransition, isValidJobTransition } from './plan-types';
 import { PlanSpecSchema } from './schemas';
@@ -9,7 +9,11 @@ import { atomicWrite } from './utils';
 
 const PLAN_FILE = 'plan.json';
 
-const planMutex = new GitMutex();
+/** Cross-process lock for plan.json read-modify-write cycles (see file-lock.ts). */
+async function withPlanLock<T>(fn: () => Promise<T>): Promise<T> {
+  const dataDir = await getDataDir();
+  return withFileLock(lockPathFor(join(dataDir, PLAN_FILE)), fn);
+}
 
 async function getPlanFilePath(): Promise<string> {
   const dataDir = await getDataDir();
@@ -40,7 +44,7 @@ export async function loadPlan(): Promise<PlanSpec | null> {
 }
 
 export async function savePlan(plan: PlanSpec): Promise<void> {
-  await planMutex.withLock(async () => {
+  await withPlanLock(async () => {
     const existing = await loadPlan();
 
     if (existing && existing.id !== plan.id) {
@@ -75,7 +79,7 @@ export async function updatePlanJob(
   jobName: string,
   updates: Partial<JobSpec>,
 ): Promise<void> {
-  await planMutex.withLock(async () => {
+  await withPlanLock(async () => {
     const plan = await loadPlan();
 
     if (!plan) {
@@ -135,7 +139,7 @@ export async function updatePlanFields(
   planId: string,
   updates: PlanFieldUpdates,
 ): Promise<void> {
-  await planMutex.withLock(async () => {
+  await withPlanLock(async () => {
     const plan = await loadPlan();
 
     if (!plan) {
@@ -181,7 +185,7 @@ export async function updatePlanFields(
 }
 
 export async function clearPlan(): Promise<void> {
-  await planMutex.withLock(async () => {
+  await withPlanLock(async () => {
     const filePath = await getPlanFilePath();
     const fs = await import('fs');
     if (fs.existsSync(filePath)) {

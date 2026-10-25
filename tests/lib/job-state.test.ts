@@ -205,6 +205,47 @@ describe('job-state', () => {
         'Job with id nonexistent not found'
       );
     });
+
+    it('should throw on an invalid status transition instead of persisting it', async () => {
+      const job: Job = {
+        id: 'job-1',
+        name: 'Bad Transition',
+        worktreePath: '/path/to/worktree',
+        branch: 'main',
+        tmuxTarget: 'mc-job1',
+        placement: 'session',
+        status: 'running',
+        prompt: 'Prompt',
+        mode: 'vanilla',
+        createdAt: new Date().toISOString(),
+      };
+
+      await addJob(job);
+      await expect(updateJob('job-1', { status: 'merged' })).rejects.toThrow(
+        /Invalid job transition: running → merged/
+      );
+      // The illegal state was not persisted.
+      expect((await getJob('job-1'))?.status).toBe('running');
+    });
+
+    it('should allow running → stopped (kill path)', async () => {
+      const job: Job = {
+        id: 'job-2',
+        name: 'Stoppable',
+        worktreePath: '/path/to/worktree',
+        branch: 'main',
+        tmuxTarget: 'mc-job2',
+        placement: 'session',
+        status: 'running',
+        prompt: 'Prompt',
+        mode: 'vanilla',
+        createdAt: new Date().toISOString(),
+      };
+
+      await addJob(job);
+      await updateJob('job-2', { status: 'stopped' });
+      expect((await getJob('job-2'))?.status).toBe('stopped');
+    });
   });
 
   describe('removeJob', () => {
@@ -417,7 +458,7 @@ describe('job-state', () => {
             prompt: 'Test prompt',
             mode: 'vanilla',
             createdAt: '2024-01-01T00:00:00Z',
-            launchSessionID: 'ses_existing',
+            launchSessionID: 'ses_fixt0001',
           },
         ],
         updatedAt: '2024-01-01T00:00:00Z',
@@ -426,7 +467,7 @@ describe('job-state', () => {
       const migrated = migrateV2ToV3(v2State);
 
       expect(migrated.version).toBe(3);
-      expect(migrated.jobs[0].launchSessionID).toBe('ses_existing');
+      expect(migrated.jobs[0].launchSessionID).toBe('ses_fixt0001');
     });
 
     it('should handle empty jobs array', () => {
