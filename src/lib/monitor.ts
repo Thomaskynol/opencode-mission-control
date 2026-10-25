@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { getRunningJobs, updateJob, type Job } from './job-state.js';
+import { getRunningJobs, getJob, updateJob, type Job } from './job-state.js';
 import { isPaneRunning, capturePane, captureExitStatus } from './tmux.js';
 import { loadConfig } from './config.js';
 import { readReport } from './reports.js';
@@ -299,6 +299,31 @@ export class JobMonitor extends EventEmitter {
 
   private async handleSSEEvent(job: Job, event: any): Promise<void> {
     const eventType = event.type || event.event;
+
+    // Stale-event guard: the subscribed job may have been killed, finished,
+    // or cleaned up after this stream opened. updateJob throws on invalid
+    // transitions (fail-closed); writing a terminal event for a non-running
+    // job would throw inside the for-await loop and turn into a reconnect
+    // storm. Cleanup and drop the event instead.
+    if (
+      eventType === 'session.status' ||
+      eventType === 'session.idle' ||
+      eventType === 'session.error'
+    ) {
+      let stillRunning = false;
+      try {
+        const fresh = await getJob(job.id);
+        stillRunning = fresh?.status === 'running';
+      } catch {
+        // Fail open: let updateJob validate. A throw there is per-event,
+        // never a state this guard invented.
+        stillRunning = true;
+      }
+      if (!stillRunning) {
+        this.cleanupSSEForJob(job.id);
+        return;
+      }
+    }
 
     switch (eventType) {
       case 'session.status': {

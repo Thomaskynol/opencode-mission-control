@@ -111,12 +111,14 @@ export const mc_report_final: ToolDefinition = tool({
     const conflicts = plan.jobs
       .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
       .map((job) => job.name);
-    // Fail-closed: only merged jobs count as verified. A completed job
-    // that never merged (no reviewer gate, no integration) is unverified —
-    // its code may be untested or unreviewed.
-    const verified = plan.jobs
-      .filter((job) => job.status === 'merged')
-      .map((job) => `${job.name} [${job.status}]`);
+    // Fail-closed, two distinct claims:
+    // - integrated = merged into the integration branch (a merge happened).
+    // - verified = merged AND backed by recorded test evidence.
+    // A merge alone does not prove functioning, and no per-job test
+    // evidence is persisted at report time — so nothing is claimed
+    // verified here. Merges are listed under Integration; unknown work
+    // stays under Gaps, never under Verified.
+    const verified: string[] = [];
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
       .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
@@ -184,7 +186,8 @@ export const mc_report_final: ToolDefinition = tool({
     return [
       `Final report for plan "${plan.name}" written to ${filePath}.`,
       '',
-      `Verified: ${verified.length}, Unmet: ${unmet.length}, Unverified: ${unverified.length}.`,
+      `Integrated: ${merged.length}, Unmet: ${unmet.length}, Unverified: ${unverified.length}.`,
+      'Merges are integration, not verification: a merge alone does not prove functioning.',
       'Long logs are in Annexes; unknown work is under Gaps, never under Verified.',
     ].join('\n');
   },

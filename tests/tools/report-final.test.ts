@@ -21,7 +21,7 @@ function makePlanJob(name: string, status: string) {
   };
 }
 
-describe('mc_report_final verification lists (review fix)', () => {
+describe('mc_report_final integrated-vs-verified (static fixes)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
@@ -64,15 +64,19 @@ describe('mc_report_final verification lists (review fix)', () => {
     ) as unknown as Mock;
   });
 
-  it('counts only merged jobs as verified; completed-but-unmerged stays unverified', async () => {
+  it('lists merged jobs as integrated, never as verified without evidence', async () => {
     const mockContext = { sessionID: 'test-session' } as any;
     const result = await mc_report_final.execute({}, mockContext) as unknown as string;
 
-    expect(result).toContain('Verified: 1');
+    // A merge alone does not prove functioning: merged jobs are
+    // integration, not verification.
+    expect(result).toContain('Integrated: 1');
+    expect(result).toContain('Unverified: 1');
     const markdown = (mockWriteFinalReport as any).lastMarkdown as string;
     const verifiedSection = markdown.split('## Verified')[1].split('## Gaps')[0];
-    expect(verifiedSection).toContain('merged-job [merged]');
-    expect(verifiedSection).not.toContain('done-job');
+    expect(verifiedSection).toContain('Nothing verified yet');
+    expect(verifiedSection).not.toContain('merged-job');
+    expect(markdown).toContain('Merged: merged-job');
     // A "completed" worker claim without a merge is not evidence: it lands
     // under Gaps as unverified, never under Verified.
     expect(markdown).toContain('done-job [completed] — outcome not verified');

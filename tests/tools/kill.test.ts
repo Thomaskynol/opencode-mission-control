@@ -97,6 +97,28 @@ describe('mc_kill', () => {
       expect(mockKillSession).not.toHaveBeenCalled();
       expect(mockUpdateJob).not.toHaveBeenCalled();
     });
+
+    it('should not touch terminal merged/canceled jobs (no valid transition to stopped)', async () => {
+      for (const status of ['merged', 'canceled'] as const) {
+        vi.clearAllMocks();
+        setupDefaultMocks();
+        mockGetJobByName.mockResolvedValue({
+          id: 'job-1',
+          name: 'my-job',
+          status,
+          placement: 'session',
+          tmuxTarget: 'mc-my-job',
+          worktreePath: '/tmp/worktree',
+        } as unknown as Job);
+
+        const result = await mc_kill.execute({ name: 'my-job' }, mockContext);
+
+        expect(result).toContain(status);
+        expect(mockKillSession).not.toHaveBeenCalled();
+        expect(mockKillWindow).not.toHaveBeenCalled();
+        expect(mockUpdateJob).not.toHaveBeenCalled();
+      }
+    });
   });
 
   describe('session placement', () => {

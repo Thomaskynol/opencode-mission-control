@@ -3,6 +3,7 @@ import type { Job } from '../../src/lib/job-state';
 
 mock.module('../../src/lib/job-state', () => ({
   getRunningJobs: mock(),
+  getJob: mock(),
   updateJob: mock(),
 }));
 
@@ -22,6 +23,7 @@ const tmux = await import('../../src/lib/tmux');
 const reports = await import('../../src/lib/reports');
 
 const mockGetRunningJobs = jobState.getRunningJobs as Mock<any>;
+const mockGetJob = (jobState as any).getJob as Mock<any>;
 const mockUpdateJob = jobState.updateJob as Mock<any>;
 const mockIsPaneRunning = tmux.isPaneRunning as Mock<any>;
 const mockCapturePane = (tmux as any).capturePane as Mock<any>;
@@ -34,12 +36,14 @@ const STREAMING_OUTPUT = 'Working...\n  ⬝⬝⬝⬝  esc interrupt  ctrl+p comm
 describe('JobMonitor', () => {
   beforeEach(() => {
     mockGetRunningJobs.mockReset();
+    mockGetJob.mockReset();
     mockUpdateJob.mockReset();
     mockIsPaneRunning.mockReset();
     mockCapturePane.mockReset();
     mockCaptureExitStatus.mockReset();
     mockReadReport.mockReset();
     mockGetRunningJobs.mockResolvedValue([]);
+    mockGetJob.mockResolvedValue(undefined);
     mockReadReport.mockResolvedValue(null);
   });
 
@@ -428,6 +432,61 @@ describe('JobMonitor', () => {
   });
 
   describe('events', () => {
+    it('drops stale terminal SSE events for non-running jobs instead of throwing', async () => {
+      // A late session.idle for a killed (stopped) job: updateJob would
+      // throw on stopped → completed, killing the for-await loop and
+      // causing a reconnect storm. The event is dropped instead.
+      const staleJob: Job = {
+        id: 'job-stale',
+        name: 'Stale Job',
+        worktreePath: '/path/to/worktree',
+        branch: 'main',
+        tmuxTarget: 'mc-stale',
+        placement: 'session',
+        status: 'stopped',
+        prompt: 'Test prompt',
+        mode: 'vanilla',
+        createdAt: new Date().toISOString(),
+        port: 8081,
+      };
+      mockGetJob.mockResolvedValue(staleJob);
+
+      const monitor = new JobMonitor();
+      const completeHandler = mock();
+      monitor.on('complete', completeHandler);
+
+      await (monitor as any).handleSSEEvent(staleJob, { type: 'session.idle' });
+
+      expect(mockUpdateJob).not.toHaveBeenCalled();
+      expect(completeHandler).not.toHaveBeenCalled();
+    });
+
+    it('processes terminal SSE events for jobs that are still running', async () => {
+      const liveJob: Job = {
+        id: 'job-live',
+        name: 'Live Job',
+        worktreePath: '/path/to/worktree',
+        branch: 'main',
+        tmuxTarget: 'mc-live',
+        placement: 'session',
+        status: 'running',
+        prompt: 'Test prompt',
+        mode: 'vanilla',
+        createdAt: new Date().toISOString(),
+        port: 8082,
+      };
+      mockGetJob.mockResolvedValue(liveJob);
+      mockUpdateJob.mockResolvedValue(undefined);
+
+      const monitor = new JobMonitor();
+      const completeHandler = mock();
+      monitor.on('complete', completeHandler);
+
+      await (monitor as any).handleSSEEvent(liveJob, { type: 'session.idle' });
+
+      expect(mockUpdateJob).toHaveBeenCalledWith('job-live', expect.objectContaining({ status: 'completed' }));
+      expect(completeHandler).toHaveBeenCalledTimes(1);
+    });
      it('should emit complete event when job completes', async () => {
        const mockJob: Job = {
          id: 'job-1',

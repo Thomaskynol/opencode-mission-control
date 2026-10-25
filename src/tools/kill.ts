@@ -24,6 +24,13 @@ export const mc_kill: ToolDefinition = tool({
       return `Job "${args.name}" is already stopped.`;
     }
 
+    // Terminal states that cannot transition to 'stopped' (updateJob throws
+    // on invalid transitions): killing them is meaningless — the process is
+    // gone and the work is merged or discarded. Report instead of throwing.
+    if (job.status === 'merged' || job.status === 'canceled') {
+      return `Job "${args.name}" is already ${job.status} (terminal state, nothing to stop).`;
+    }
+
     // 3. Kill tmux session or window
     try {
       if (job.placement === 'session') {

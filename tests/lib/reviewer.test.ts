@@ -100,6 +100,24 @@ describe('reviewJob', () => {
     expect(noOutput.reasons.join('\n')).toMatch(/output/i);
   });
 
+  it('never passes on a "pass" claim without observed execution', () => {
+    // No evidence at all, with or without an explicit pass claim.
+    for (const claimedPass of [true, false]) {
+      const verdict = reviewJob(baseInput({ evidence: null, claimedPass }));
+      expect(verdict.verdict).toBe('fail');
+      expect(verdict.reasons.join('\n')).toMatch(/without evidence/i);
+    }
+    // Command + exit 0 but no tested commit: unknown which code ran.
+    const noCommit = reviewJob(
+      baseInput({
+        evidence: { command: 'bun test', exitCode: 0, output: 'pass: rejects bad password', testedCommit: '  ' },
+        claimedPass: true,
+      }),
+    );
+    expect(noCommit.verdict).toBe('fail');
+    expect(noCommit.reasons.join('\n')).toMatch(/tested commit/i);
+  });
+
   it('fails green tests that do not cover the requirement', () => {
     const verdict = reviewJob(
       baseInput({

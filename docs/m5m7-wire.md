@@ -79,13 +79,15 @@ este doc. Não toca `coordinator.ts`, `instance-manager.ts`,
   Solutions · **Verified** · **Gaps (Unmet / Unverified)** · Limitations &
   Next Steps · Preservation (Preserved vs Closed vs Cleanup) · Annexes.
 - **Verificado vs lacunas por construção**: `Verified` só recebe
-  `merged`/`completed`; o resto cai em `Unmet` (failed/conflict/
-  needs_rebase/canceled) ou `Unverified` — nunca inventado.
+  entradas com evidência de teste registrada; merges aparecem sob
+  `## Integration` (`Merged: <nome>`). `completed` sem merge cai em
+  `Unverified`, `failed`/`conflict`/`needs_rebase`/`canceled` em `Unmet` —
+  nunca inventado. Merge sozinho não prova funcionamento.
 - `writeFinalReport(planId, markdown)` / `readFinalReport(planId)` —
   persiste em `reports/final-<planId>.md`.
 - `mc_report_final` (args: `notes?`, `includeAttachments?`) — monta o
   relatório do plano ativo + job-state + milestone reports e persiste;
-  retorna contagens `Verified/Unmet/Unverified`.
+  retorna contagens `Integrated/Unmet/Unverified`.
 
 ## Verificação
 

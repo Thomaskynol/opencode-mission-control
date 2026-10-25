@@ -59,6 +59,17 @@ describe('plugin initialization', () => {
       expect(toolKeys).toContain('mc_status');
     });
 
+    it('job agent has no mc_report_final (command-center only, registered once)', async () => {
+      mockState.isManaged = true;
+      vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
+
+      const { default: MissionControl } = await import('../src/index');
+      const mockClient = createMockClient();
+      const plugin = await MissionControl({ client: mockClient } as any);
+
+      expect(Object.keys(plugin.tool || {})).not.toContain('mc_report_final');
+    });
+
     it('monitor.start() is not called', async () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
@@ -132,6 +143,10 @@ describe('plugin initialization', () => {
       
       const toolKeys = Object.keys(plugin.tool || {});
       expect(toolKeys).toHaveLength(21);
+      // Registered once, never duplicated: mc_report_final appears exactly
+      // once and is a distinct tool from mc_report.
+      expect(toolKeys.filter((k) => k === 'mc_report_final')).toHaveLength(1);
+      expect(plugin.tool.mc_report).not.toBe(plugin.tool.mc_report_final);
       expect(toolKeys).toContain('mc_launch');
       expect(toolKeys).toContain('mc_jobs');
       expect(toolKeys).toContain('mc_status');

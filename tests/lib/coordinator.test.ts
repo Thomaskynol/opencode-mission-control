@@ -25,6 +25,20 @@ describe('clampMaxParallel', () => {
     expect(clampMaxParallel(6)).toBe(6);
     expect(clampMaxParallel(99)).toBe(8);
   });
+
+  it('treats non-finite input as unset and floors fractions', () => {
+    expect(clampMaxParallel(NaN)).toBe(4);
+    expect(clampMaxParallel(5.9)).toBe(5);
+  });
+
+  it('accepts a custom window instead of the 4..8 default', () => {
+    // No mandatory minimum 4, no permanent ceiling 8: callers pass bounds.
+    expect(clampMaxParallel(undefined, { min: 1, max: 16 })).toBe(1);
+    expect(clampMaxParallel(3, { min: 1, max: 16 })).toBe(3);
+    expect(clampMaxParallel(99, { min: 1, max: 16 })).toBe(16);
+    expect(clampMaxParallel(undefined, { min: 2, max: 6, defaultValue: 2 })).toBe(2);
+    expect(clampMaxParallel(NaN, { min: 2, max: 6, defaultValue: 5 })).toBe(5);
+  });
 });
 
 describe('decideNextJobs', () => {
@@ -70,6 +84,21 @@ describe('assertNoPush', () => {
     expect(() => assertNoPush(['gh', 'pr', 'create', '--title', 'x'])).toThrow();
     expect(() => assertNoPush(['npm', 'install'])).not.toThrow();
     expect(() => assertNoPush(['git', 'status'])).not.toThrow();
+  });
+
+  it('blocks push with quoted -C paths containing spaces', () => {
+    // Shell-string callers quote the path; argv execution is shell-free
+    // and safe by construction, but the guard must still catch the quoted form.
+    expect(() => assertNoPush(['git', '-C', '"my dir"', 'push', 'origin', 'main'])).toThrow(/push/i);
+    expect(() => assertNoPush(['git', '-C', "'my dir'", 'push'])).toThrow(/push/i);
+    expect(() => assertNoPush(['git', 'commit', '-m', 'x'])).not.toThrow();
+  });
+
+  it('blocks publish with package-manager flags, before or after', () => {
+    expect(() => assertNoPush(['pnpm', '--filter', 'foo', 'publish'])).toThrow();
+    expect(() => assertNoPush(['npm', '--prefix', '/tmp/x', 'publish'])).toThrow();
+    expect(() => assertNoPush(['npm', 'run', 'publish'])).not.toThrow();
+    expect(() => assertNoPush(['git', 'commit', '-m', 'push origin'])).not.toThrow();
   });
 });
 

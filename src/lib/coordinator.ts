@@ -20,10 +20,27 @@ import { evaluateDepthGuard, readInstanceDepth } from './instance-manager.js';
 export const MIN_PARALLEL = 4;
 export const MAX_PARALLEL = 8;
 
-/** Clamp the configured parallelism into the 4–8 contract window. */
-export function clampMaxParallel(raw?: number): number {
-  if (raw === undefined || !Number.isFinite(raw)) return MIN_PARALLEL;
-  return Math.min(MAX_PARALLEL, Math.max(MIN_PARALLEL, Math.floor(raw)));
+export interface ParallelBounds {
+  /** Floor. Defaults to MIN_PARALLEL (4). */
+  min?: number;
+  /** Ceiling. Defaults to MAX_PARALLEL (8). */
+  max?: number;
+  /** Returned for undefined/non-finite input. Defaults to the active `min`. */
+  defaultValue?: number;
+}
+
+/**
+ * Clamp the configured parallelism into the contract window.
+ * Defaults to the 4–8 window with a 4 fallback; pass `bounds` to run a
+ * different window (smaller for debugging, larger for big machines).
+ * Neither 4 nor 8 is hard-coded at the call sites.
+ */
+export function clampMaxParallel(raw?: number, bounds?: ParallelBounds): number {
+  const min = bounds?.min ?? MIN_PARALLEL;
+  const max = bounds?.max ?? MAX_PARALLEL;
+  const fallback = bounds?.defaultValue ?? min;
+  if (raw === undefined || !Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(raw)));
 }
 
 /** Guards: refuse to fan out beyond the remaining parallel budget. */
@@ -35,8 +52,13 @@ export function evaluateFanoutGuard(requested: number, budget: number): void {
   }
 }
 
-const PUSH_PATTERN =
-  /(^|\s)(git(\s+-C\s+\S+)*\s+push|gh\s+(pr\s+(create|merge)|repo\s+fork)|(npm|pnpm|yarn)\s+publish)(\s|$)/i;
+const QUOTED_PATH = `"[^"]*"|'[^']*'|\\S+`;
+const PM_FLAGS = `(\\s+--\\S+(\\s+\\S+)?)*`;
+
+const PUSH_PATTERN = new RegExp(
+  `(^|\\s)(git(\\s+-C\\s+(?:${QUOTED_PATH}))*\\s+push|gh\\s+(pr\\s+(create|merge)|repo\\s+fork)|(npm|pnpm|yarn)${PM_FLAGS}\\s+publish)(\\s|$)`,
+  'i',
+);
 
 /** Guards: no remote push — local commits/branches only, PR creation stays structural. */
 export function assertNoPush(argv: string[]): void {

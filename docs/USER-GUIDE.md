@@ -27,9 +27,9 @@ The autonomous orchestrator adds a closed loop around those jobs:
   without losing code (stopping a process never discards code;
   only `mc_cleanup` discards).
 - **Final report** (`mc_report_final`): one readable document —
-  request → Verified vs Gaps → next steps — with long logs as
+  request → Integrated vs Gaps → next steps — with long logs as
   truncated annexes. Unknown work is listed under Gaps, never
-  under Verified.
+  under Verified; a merge alone does not prove functioning.
 
 ## 2. Prerequisites
 
@@ -154,7 +154,8 @@ Rules that matter:
   - At the end: `mc_report_final(notes?, includeAttachments?)`
     assembles the plan + job-state + milestone reports and writes
     `~/.local/share/opencode-mission-control/<project>/reports/final-<planId>.md`.
-    It prints `Verified / Unmet / Unverified` counts. Per-job full
+    It prints `Integrated / Unmet / Unverified` counts (merges are
+    integration, not verification). Per-job full
     messages go to `## Annexes`, truncated at 12000 chars with a
     `[truncated N chars, see source]` marker.
 
@@ -232,7 +233,7 @@ mc_plan(name: "feat: search upgrade", mode: "autopilot", jobs: [
   { name: "ui",     prompt: "Build search UI",            dependsOn: ["api"] }
 ])
 mc_plan_status()            # watch merge train
-mc_report_final()           # → reports/final-<planId>.md + Verified/Unmet/Unverified
+mc_report_final()           # → reports/final-<planId>.md + Integrated/Unmet/Unverified
 ```
 
 **Supervised run with a mid-course correction:**
@@ -244,7 +245,7 @@ bun src/orchestrator-cli/index.ts follow
 bun src/orchestrator-cli/index.ts add export-csv "Also handle empty result sets"
 bun src/orchestrator-cli/index.ts pause export-csv
 bun src/orchestrator-cli/index.ts resume export-csv "Continue with the empty-set fix" --wait
-mc_report_final(notes: "CSV export verified manually")
+mc_report_final(notes: "CSV export manually verified: bun test green, see Tests section")
 ```
 
 **Answer a blocked job without stopping the rest:**
