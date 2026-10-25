@@ -1,13 +1,13 @@
-# Delivery Report — feat/autonomous-orchestrator-v2 (M1–M7 + review-fixes)
+# Delivery Report — feat/autonomous-orchestrator-v2 (M1–M7 + review-fixes + static + live-gaps + final-close)
 
-Final verification lane (`final-verify`). Sole writer of this file. No product-logic changes made.
+Final verification lane (`final-close`). Sole writer of this file and `docs/matrix-final.md`. No product-logic changes made.
 
 ## 1. Clone path / base / commits
 
 - Local path: `/home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control`
 - Branch: `feat/autonomous-orchestrator-v2` (local only; tracks nothing — `git branch -vv` shows no upstream for it)
 - Base = `main` = `origin/main` = `6db667e ci(deps): Update dependency bun to v1.3.14 (#82)`
-- Branch was cut exactly at base (`main` also at `6db667e`); **all M1–M7 + review-fixes work is uncommitted** (23 modified + 21 untracked paths, `git diff --cached` empty)
+- Branch was cut exactly at base (`main` also at `6db667e`); work committed locally in 11 commits (`0b90745`…`fd86c39`, full list in `docs/matrix-final.md` §17); tree clean at final-close (the earlier uncommitted state from the partial report has since been committed)
 - Remotes (sanitized): `origin git@github.com:Thomaskynol/opencode-mission-control.git` (fetch+push),
   `upstream https://github.com/nigel-dev/opencode-mission-control.git` (fetch only, `no_push`)
 - Recent base history (`git log --oneline -8` on branch): `6db667e`, `895a232`, `d234113`, `0e76440`, `ea0d1a2`, `16692aa`, `32d3207`, `c63ba10`
@@ -113,17 +113,53 @@ failure pair (`tests/tools/launch.test.ts`, `tests/lib/model-tracker.test.ts`) a
 ## 8. Publication confirmation
 
 - **Nothing published**: no `push`, no PR, no tag, no `npm publish`, no remote mutation of any kind.
-  `git status` shows the branch ahead of nothing / tracking nothing; `origin`/`upstream` untouched.
-- Commits: **BLOCKED — no git identity configured** (`git config user.name` / `user.email` both empty).
-  Per instructions no identity was invented, so no local commit was created. To unblock (human runs):
-  `git config user.name "…" && git config user.email "…"`, then stage + commit conventionally on
-  `feat/autonomous-orchestrator-v2` (e.g. grouped `feat:`/`fix:`/`docs:` commits per lane; do not rewrite base history).
+  `git status` shows the branch tracking nothing; `origin`/`upstream` untouched.
+- Commits: unblocked since the partial report — 11 local commits now exist on
+  `feat/autonomous-orchestrator-v2` (`0b90745`…`fd86c39`; full list in `docs/matrix-final.md` §17).
+  This lane adds one more local commit (matrix-final + this report update). Still no push/PR.
 
-## 9. Limitations / pending / unproven
+## 9. Limitations / pending / unproven (superseeded in part — see §10)
 
-- The `launch` order-flake (§5) is the only failing test; fix is a suggested follow-up, not applied (out of scope).
-- `mc_report_final` is exported + tested but **not registered in `src/index.ts`** (documented follow-up in `docs/m5m7-wire.md`).
-- Legacy (non-`/api`) senders remain in `question-relay.ts`, `job-comms.ts`, `monitor.ts`, `orchestrator-cli/index.ts`
-  (only `mc_answer` migrated); `instance-manager` projectID create-vs-assert pauses with a drift question by design.
-- Live E2E (multi-instance tmux/worktree orchestration, `MANUAL_TEST_PLAN.md`) was **not executed** by this lane — unit/integration
-  evidence only. Interventions by this lane: none (read-only verification + this report).
+- The `launch` order-flake (§5) was the only failing test at partial time; at final-close it **did not reproduce**
+  (**0 fail** in 969 tests). The `afterEach` reset follow-up remains suggested, not applied (out of scope).
+- `mc_report_final` **is now registered** in `src/index.ts` (see `docs/fixes-static.md` §2) — the §5-era follow-up is closed.
+- Legacy (non-`/api`) senders were migrated by the live-gaps lane (job-comms, fork, relay, monitor SSE, answer —
+  see `docs/fixes-static.md` §8); ask-user escalation still has no operator push (visible in serve TUI/policy log).
+- Live E2E (multi-instance orchestration) **was executed** by the live-proof + live-gaps lanes (see §10),
+  though not as the `MANUAL_TEST_PLAN.md` phase-by-phase script (honest pending: `docs/matrix-final.md` E2E-E).
+
+## 10. Final close (2026-10-25, this lane)
+
+- **Corrigido desde o parcial**: static-fixes (verified-vs-integrated split, throwing-transition guards,
+  clamp 4–8 configurável, `mc_report_final` registrado, `PUSH_PATTERN`/`assertNoPush` ampliados) em `a8373f5`;
+  migração serve-mode V2 (launch serve, job-comms, fork, relay, monitor SSE, answer via `remoteSessionID`)
+  em `0281b85`; contratos V2 pinados em `2f4e762`; adendo live-gaps em `fd86c39`. Detalhes em
+  `docs/fixes-static.md` §§1–9 e `docs/live-proof.md` adendo.
+- **Evidência de ciclo completo pela interface**: plano `47916cd4` (supervisor) com 2 frentes independentes
+  lançadas simultâneas + 1 dependente; rejeição touchSet real → correção via `mc_plan_approve(relaunch)` →
+  3 merges gated com `bun test` → integração 9/9 verde → `pre_pr` sem push. Reutilização de repo existente
+  sem regressão. Crash (kill -9) + resume sem duplicar. Cancel preservando código. Teardown limpo
+  (main do fixture `321cc40` intacta). Ver `docs/live-proof.md` §§1–5.
+- **Workers simultâneos + modelo/perfil observado**: pico de 3 workers reais (2 frentes + probe), processos
+  `opencode --prompt` em tmux `mc-live-*`; modelo **muse-spark-1.3-contributor (opencode-go)** o tempo todo
+  (banners TUI + `session.get`: triplo + agent `build` + location + projectID). Pausa/retoma, pergunta→resposta
+  via form e triplo `session.get` fechados contra serve 2.1.4 descartável (porta 14492). Ver `docs/live-proof.md` §5 + adendo.
+- **Checks deste fechamento** (frescos, log integral, exit capturado sem pipe mascarar):
+  `bun run build` → exit 0 (`/tmp/opencode/final-close-build.log`);
+  `bun test` → **exit 0, 953 pass, 16 skip, 0 fail**, 969 testes / 62 arquivos (`/tmp/opencode/final-close-test.log`).
+  `git status` limpa (após commit deste fechamento); `git log` 12 commits sobre `6db667e`; remotes intocados.
+- **Matriz final**: `docs/matrix-final.md` — todos os IDs do Anexo A (INT/COR/EST/INS/TETO/REV/FIX/MER/PRC/PER/REL/MOD/SEG/OBS)
+  + E2E A–E + tabela de aceitação, cada um com status honesto e evidência própria.
+- **Pendentes honestos**: `MANUAL_TEST_PLAN.md` fases 1–18 não executadas passo a passo (cenário live equivalente
+  validado no lugar); ask-user escalation sem push ao operador; `PUSH_PATTERN` sem `git -c`/`--git-dir=`;
+  `updatePlanJob` warn-and-apply intencional; INS-5 sem teste dedicado. Ver `docs/matrix-final.md` §15.
+- **Caminho/branch/commits**: `/home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control`,
+  branch `feat/autonomous-orchestrator-v2`, base `6db667e`, 12 commits locais (11 das lanes + 1 deste fechamento), nada publicado.
+- **Comandos exatos iniciar/usar**:
+  `bun install` → `bun run build` → `bun test` (ou `bun test <path>` focado);
+  plugin via `"opencode-mission-control"` em `plugins` no `opencode.json`;
+  CLI humana `bun src/orchestrator-cli/index.ts help|follow|send|task|pause|resume|add|answer|questions|order|session|log|cancel`;
+  E2E manual em `MANUAL_TEST_PLAN.md` (Nuclear Cleanup antes/depois; `tmc-`; sem push remoto).
+- Evidências locais mantidas em `/tmp/opencode/` (`live-full/`, `live-gaps/`, `final-suite.log`,
+  `final-verify-*.log`, `final-close-*.log`). Sem ZIP obrigatório. Sem perfil global, sem segredos,
+  sem fixtures úteis apagadas.
