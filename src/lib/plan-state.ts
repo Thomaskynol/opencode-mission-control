@@ -78,6 +78,7 @@ export async function updatePlanJob(
   planId: string,
   jobName: string,
   updates: Partial<JobSpec>,
+  opts?: { force?: boolean },
 ): Promise<void> {
   await withPlanLock(async () => {
     const plan = await loadPlan();
@@ -99,7 +100,16 @@ export async function updatePlanJob(
 
     if (updates.status && updates.status !== plan.jobs[jobIndex].status) {
       if (!isValidJobTransition(plan.jobs[jobIndex].status, updates.status)) {
-        console.warn(`[MC] Invalid job transition: ${plan.jobs[jobIndex].status} → ${updates.status} (job: ${jobName})`);
+        const msg = `[MC] Invalid job transition: ${plan.jobs[jobIndex].status} → ${updates.status} (job: ${jobName})`;
+        if (!opts?.force) {
+          // Fail-closed: an invalid transition is a bug, never a state to
+          // persist. Reject without applying so a skipped gate (e.g.
+          // queued → merged) cannot mark work integrated. Recovery paths
+          // that must force a terminal state (launch failure from
+          // queued/waiting_deps) pass { force: true } explicitly.
+          throw new Error(`Invalid job transition: ${plan.jobs[jobIndex].status} → ${updates.status} (job: ${jobName})`);
+        }
+        console.warn(`${msg} (forced recovery)`);
       }
     }
 

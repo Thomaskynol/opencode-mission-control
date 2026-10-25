@@ -1,5 +1,27 @@
 import type { Job } from './job-state.js';
 import { createV2Client, v2Prompt, v2ReplyPermission, type V2Client } from './sdk-client.js';
+import { isGitPushText } from './permission-policy.js';
+
+/**
+ * Publishing-like permission (push/PR/publish/deploy): must never
+ * auto-approve, even inside the worktree. Mirrors
+ * `requiresHumanAuth` (`permission-policy.ts`) for the relay's own
+ * `shouldAutoApprove` path so a policy `ask-user` cannot be re-approved
+ * here.
+ */
+function isPublishingPermissionText(haystack: string): boolean {
+  if (isGitPushText(haystack)) return true;
+  const lower = haystack.toLowerCase();
+  return (
+    /\bgh\s+pr\s+(create|merge)\b/.test(lower) ||
+    /\b(npm|pnpm|yarn)\b[^\n]*\bpublish\b/.test(lower) ||
+    /\bdeploy\b/.test(lower)
+  );
+}
+
+function permissionHaystack(p: { action?: string; description: string; target?: string; path?: string }): string {
+  return [p.action, p.description, p.target, p.path].filter((x): x is string => typeof x === 'string').join('\n');
+}
 
 /**
  * A pending mcp_question from a serve-mode job's agent.
@@ -216,6 +238,17 @@ export function shouldAutoApprove(
   permission: PermissionRequest,
   worktreePath: string,
 ): PermissionResult {
+  // Publishing actions never auto-approve, even inside the worktree.
+  // Without this, a policy `ask-user` for `git push` inside the worktree
+  // would be re-approved here and push without the operator.
+  if (isPublishingPermissionText(permissionHaystack(permission))) {
+    return {
+      approved: false,
+      autoApproved: false,
+      reason: 'Publishing action (push/PR/deploy) requires explicit human authorization',
+    };
+  }
+
   // MCP tool execution: auto-approve
   if (permission.type === 'mcp') {
     return {
@@ -345,8 +378,11 @@ export class QuestionRelay {
    * Auto-approvals reply on the worker's own session; escalations no longer
    * HTTP-post to the operator session (launchSessionID lives on the
    * control-center, never on the worker's serve instance — that POST always
-   * missed). Ask-user requests keep the worker unblocked via the
-   * auto-response timeout and surface in the serve TUI / policy log.
+   * missed). Ask-user requests are now visible as pending questions
+   * (memory + durable sidecar → `mc_overview`, dashboard `questions`,
+   * TUI `questions`/`follow`) and keep the worker unblocked via the
+   * auto-response timeout. Publishing escalations auto-deny on timeout
+   * instead of approving, so a push can never be authorized by silence.
    */
   async handlePermissionRequest(
     job: Job,
@@ -372,10 +408,38 @@ export class QuestionRelay {
       return result;
     }
 
-    // Escalation path: the operator answers in the serve TUI or adjusts the
-    // policy; the timeout below keeps the worker unblocked meanwhile.
+    // Escalation path: make it operator-visible (memory + sidecar) so
+    // `mc_overview`/dashboard/`questions` show it. Best-effort persist:
+    // unit callers without a mocked data dir still get the memory entry.
+    const publishing = isPublishingPermissionText(permissionHaystack(permission));
+    const pending: PendingQuestion = {
+      jobId: job.id,
+      jobName: job.name,
+      taskSummary: buildTaskSummary(job.prompt),
+      partId: `perm:${permission.id}`,
+      callID: permission.id,
+      remoteSessionID: job.remoteSessionID ?? '',
+      port: job.port ?? 0,
+      question: `Permission needed [${permission.type}]: ${permission.description}${permission.path ? ` (${permission.path})` : ''}`,
+      options: [
+        { label: 'approve', description: 'Allow once' },
+        { label: 'deny', description: 'Deny' },
+      ],
+      header: `Permission escalation for job "${job.name}"`,
+      multiple: false,
+      detectedAt: Date.now(),
+    };
+    addPendingQuestion(pending);
+    try {
+      const { persistPendingQuestion } = await import('./durable-state.js');
+      await persistPendingQuestion(pending);
+    } catch {
+      // Memory entry above already makes it visible this process;
+      // sidecar sync retries on the next monitor tick/boot.
+    }
+
     if (job.port && job.remoteSessionID) {
-      this.setupAutoResponse(job, permission.id);
+      this.setupAutoResponse(job, permission.id, !publishing);
     } else {
       console.warn(`[QuestionRelay] Cannot escalate permission for job ${job.name}: missing serve port or remote session.`);
     }
@@ -398,9 +462,12 @@ export class QuestionRelay {
   }
 
   /**
-   * Set up automatic response after timeout
+   * Set up automatic response after timeout.
+   * Publishing escalations auto-deny (never approve by silence); ordinary
+   * escalations approve with the default response so independent fronts
+   * keep moving.
    */
-  private setupAutoResponse(job: Job, permissionId: string): void {
+  private setupAutoResponse(job: Job, permissionId: string, autoApprove = true): void {
     // Clear any existing timeout for this permission
     const existingKey = `${job.id}:${permissionId}`;
     if (this.pendingResponses.has(existingKey)) {
@@ -415,15 +482,20 @@ export class QuestionRelay {
             this.getClient(job.port),
             job.remoteSessionID,
             permissionId,
-            true,
-            this.config.defaultResponse,
+            autoApprove,
+            autoApprove ? this.config.defaultResponse : 'Denied by policy: publishing requires explicit human authorization',
           );
         }
-        console.log(`[QuestionRelay] Auto-responded to permission ${permissionId} for job ${job.id}`);
+        console.log(`[QuestionRelay] Auto-${autoApprove ? 'approved' : 'denied'} permission ${permissionId} for job ${job.id}`);
       } catch (error) {
         console.error(`[QuestionRelay] Failed to auto-respond for job ${job.id}:`, error);
       } finally {
         this.pendingResponses.delete(existingKey);
+        removePendingQuestion(job.id, `perm:${permissionId}`);
+        try {
+          const { dropPersistedQuestion } = await import('./durable-state.js');
+          await dropPersistedQuestion(job.id, `perm:${permissionId}`);
+        } catch {}
       }
     }, this.config.autoResponseTimeoutMs);
 

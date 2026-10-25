@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import {
   PermissionPolicy,
+  isGitPushText,
+  requiresHumanAuth,
   type PermissionPolicyConfig,
 } from '../../src/lib/permission-policy';
 
@@ -187,5 +189,38 @@ describe('PermissionPolicy', () => {
     expect(log[0].policyDecision).toBe('auto-approve');
     expect(log[1].policyDecision).toBe('deny');
     expect(log[1].reason.length).toBeGreaterThan(0);
+  });
+
+  it('detects git push through -C/-c/--git-dir with space/quote paths', () => {
+    expect(isGitPushText('git push origin x')).toBe(true);
+    expect(isGitPushText('git -C /tmp/x push')).toBe(true);
+    expect(isGitPushText('git -C "my dir" push origin main')).toBe(true);
+    expect(isGitPushText("git -C 'my dir' push")).toBe(true);
+    expect(isGitPushText('git -c core.sshCommand=ssh push')).toBe(true);
+    expect(isGitPushText('git --git-dir=/tmp/x push')).toBe(true);
+    expect(isGitPushText('git --git-dir /tmp/x push')).toBe(true);
+    expect(isGitPushText('git --no-pager push')).toBe(true);
+    expect(isGitPushText('git commit -m "push origin"')).toBe(false);
+    expect(isGitPushText('git status')).toBe(false);
+  });
+
+  it('requires human auth for scoped git pushes inside the worktree', () => {
+    for (const description of [
+      'git push origin x',
+      'git -C "my dir" push origin main',
+      'git -c core.sshCommand=ssh push',
+      'git --git-dir=/tmp/x push',
+    ]) {
+      expect(
+        requiresHumanAuth({ type: 'shell_command', description }),
+      ).toBe(true);
+      const policy = PermissionPolicy.resolvePolicy({});
+      expect(
+        policy.evaluate(
+          { type: 'shell_command', path: WORKTREE, description },
+          { worktreePath: WORKTREE },
+        ),
+      ).toBe('ask-user');
+    }
   });
 });

@@ -244,6 +244,65 @@ describe('plan-state', () => {
         updatePlanJob('plan-1', 'fix-login', { status: 'running' }),
       ).rejects.toThrow('No active plan exists');
     });
+
+    it('rejects invalid transitions without applying (no gate bypass)', async () => {
+      vi.spyOn(
+        await import('../../src/lib/plan-state'),
+        'validateGhAuth',
+      ).mockResolvedValue(true);
+
+      const plan = makePlan({
+        status: 'running',
+        jobs: [makeJob({ name: 'fix-login', status: 'queued' })],
+      });
+      await savePlan(plan);
+
+      // queued → merged would skip the reviewer gate + merge train.
+      await expect(
+        updatePlanJob('plan-1', 'fix-login', { status: 'merged' }),
+      ).rejects.toThrow(/Invalid job transition: queued → merged/);
+
+      const loaded = await loadPlan();
+      expect(loaded!.jobs[0].status).toBe('queued');
+    });
+
+    it('rejects merged → canceled without applying (no un-merge)', async () => {
+      vi.spyOn(
+        await import('../../src/lib/plan-state'),
+        'validateGhAuth',
+      ).mockResolvedValue(true);
+
+      const plan = makePlan({
+        status: 'running',
+        jobs: [makeJob({ name: 'fix-login', status: 'merged' })],
+      });
+      await savePlan(plan);
+
+      await expect(
+        updatePlanJob('plan-1', 'fix-login', { status: 'canceled' }),
+      ).rejects.toThrow(/Invalid job transition: merged → canceled/);
+
+      const loaded = await loadPlan();
+      expect(loaded!.jobs[0].status).toBe('merged');
+    });
+
+    it('allows forced recovery for launch failures (queued → failed)', async () => {
+      vi.spyOn(
+        await import('../../src/lib/plan-state'),
+        'validateGhAuth',
+      ).mockResolvedValue(true);
+
+      const plan = makePlan({
+        status: 'running',
+        jobs: [makeJob({ name: 'fix-login', status: 'queued' })],
+      });
+      await savePlan(plan);
+
+      await updatePlanJob('plan-1', 'fix-login', { status: 'failed', error: 'boom' }, { force: true });
+
+      const loaded = await loadPlan();
+      expect(loaded!.jobs[0].status).toBe('failed');
+    });
   });
 
   describe('updatePlanFields', () => {

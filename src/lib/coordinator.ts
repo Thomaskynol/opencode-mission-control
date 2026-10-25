@@ -53,16 +53,82 @@ export function evaluateFanoutGuard(requested: number, budget: number): void {
 }
 
 const QUOTED_PATH = `"[^"]*"|'[^']*'|\\S+`;
-const PM_FLAGS = `(\\s+--\\S+(\\s+\\S+)?)*`;
+const QUOTED_VALUE = `(?:"[^"]*"|'[^']*'|\\S+)`;
+const PM_FLAGS = `(\\s+--\\S+(\\s+${QUOTED_VALUE})?)*`;
 
 const PUSH_PATTERN = new RegExp(
   `(^|\\s)(git(\\s+-C\\s+(?:${QUOTED_PATH}))*\\s+push|gh\\s+(pr\\s+(create|merge)|repo\\s+fork)|(npm|pnpm|yarn)${PM_FLAGS}\\s+publish)(\\s|$)`,
   'i',
 );
 
+/**
+ * Token-based git-push detector (handles `-C`, `-c`, `--git-dir`,
+ * `--work-tree`, spaces/quotes and `git -C` forms that the regex above
+ * misses). Aid only: no caller in `src/` enforces it unconditionally —
+ * authorized pushes (`mc_pr`, `orchestrator.createPR`) must pass with
+ * `humanAuth: true`, so the real barriers are `requireHumanAuth`
+ * (`integration.ts`) for operator paths and `requiresHumanAuth` /
+ * `PermissionPolicy` (`permission-policy.ts`) for worker shell commands.
+ * This helper stays as defense-in-depth for contexts where a push must
+ * never happen (prompts, internal merges).
+ */
+function stripGitQuotes(s: string): string {
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return s.slice(1, -1);
+    }
+  }
+  return s;
+}
+
+export function isGitPushArgs(argv: string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    if (stripGitQuotes(argv[i]).toLowerCase() !== 'git') continue;
+    let j = i + 1;
+    while (j < argv.length) {
+      const raw = argv[j];
+      const low = stripGitQuotes(raw).toLowerCase();
+      if (low === '-c' || low === '--git-dir' || low === '--work-tree' || low === '--namespace' || low === '--super-prefix' || low === '--config-env') {
+        // Flag with separate value: `git -C <dir>`, `git -c k=v`, `git --git-dir <dir>`.
+        j += 2;
+        continue;
+      }
+      if (
+        low.startsWith('--git-dir=') ||
+        low.startsWith('--work-tree=') ||
+        low.startsWith('--namespace=') ||
+        low.startsWith('--super-prefix=') ||
+        low.startsWith('--config-env=')
+      ) {
+        j += 1;
+        continue;
+      }
+      // `-C` (upper) is the worktree flag; lower-cased above already covers
+      // both cases, kept here for readability of the original `-C` form.
+      if (raw === '-C' || raw === '-c') {
+        j += 2;
+        continue;
+      }
+      if (low.startsWith('-')) {
+        // Any other global flag without a separate value
+        // (`--no-pager`, `-p`, `--bare`, ...).
+        j += 1;
+        continue;
+      }
+      break;
+    }
+    if (j < argv.length && stripGitQuotes(argv[j]).toLowerCase() === 'push') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Guards: no remote push — local commits/branches only, PR creation stays structural. */
 export function assertNoPush(argv: string[]): void {
-  if (PUSH_PATTERN.test(argv.join(' '))) {
+  if (isGitPushArgs(argv) || PUSH_PATTERN.test(argv.join(' '))) {
     throw new Error(`No-push guard: refusing remote write "${argv.join(' ')}"`);
   }
 }

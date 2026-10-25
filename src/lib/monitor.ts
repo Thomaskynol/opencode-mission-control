@@ -486,6 +486,10 @@ export class JobMonitor extends EventEmitter {
         const requestID = event.data?.id ?? event.data?.requestID;
         if (typeof requestID === 'string') {
           this.questionRelay.clearPermissionTimeout(job.id, requestID);
+          removePendingQuestion(job.id, `perm:${requestID}`);
+          try {
+            await dropPersistedQuestion(job.id, `perm:${requestID}`);
+          } catch {}
         }
         break;
       }

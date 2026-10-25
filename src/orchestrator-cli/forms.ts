@@ -14,6 +14,7 @@ import {
   createV2Client,
   v2GetForm,
   v2ReplyForm,
+  v2ReplyPermission,
 } from '../lib/sdk-client';
 import { loadConfig } from '../lib/config';
 
@@ -41,8 +42,9 @@ export interface AnswerSender {
 
 /** Render a question as a respondable form (numbered options + free text). */
 export function renderQuestionForm(q: PendingQuestion): string {
+  const isPermission = q.partId.startsWith('perm:');
   const lines = [
-    `❓ Job "${q.jobName}" asks:`,
+    `${isPermission ? '🔐' : '❓'} Job "${q.jobName}" ${isPermission ? 'needs a permission decision:' : 'asks:'}`,
     '',
     q.question,
     '',
@@ -60,11 +62,19 @@ export function renderQuestionForm(q: PendingQuestion): string {
   if (q.multiple) {
     lines.push('(Multiple selections allowed)', '');
   }
-  lines.push(
-    `Reply with the option number/label, or free-text instructions.`,
-    `No reply within ${QUESTION_AUTO_RESPONSE_MS / 1000}s → "${QUESTION_DEFAULT_RESPONSE}".`,
-    `Other jobs keep running meanwhile.`,
-  );
+  if (isPermission) {
+    lines.push(
+      `Reply with "approve"/"1" or "deny"/"2".`,
+      `No reply within ${QUESTION_AUTO_RESPONSE_MS / 1000}s → publishing denied by policy, others "${QUESTION_DEFAULT_RESPONSE}".`,
+      `Other jobs keep running meanwhile. Answer via: answer ${q.jobName} <approve|deny>`,
+    );
+  } else {
+    lines.push(
+      `Reply with the option number/label, or free-text instructions.`,
+      `No reply within ${QUESTION_AUTO_RESPONSE_MS / 1000}s → "${QUESTION_DEFAULT_RESPONSE}".`,
+      `Other jobs keep running meanwhile.`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -109,6 +119,52 @@ export async function answerViaForm(
 }
 
 /**
+ * Answer a permission escalation (`perm:<id>`) via the session-scoped
+ * permission reply endpoint. Maps `approve/1/yes` → `once`,
+ * `deny/2/no` → `reject`; any other explicit text approves with that
+ * message (the operator typed it, so it is explicit authorization).
+ * Returns true when a permission reply was sent.
+ */
+export async function answerViaPermission(
+  port: number,
+  sessionID: string,
+  partId: string,
+  response: string,
+): Promise<boolean> {
+  if (!partId.startsWith('perm:')) return false;
+  if (!port || !sessionID) return false;
+  const permissionId = partId.slice('perm:'.length);
+  const want = response.trim().toLowerCase();
+  let approved: boolean;
+  let message: string;
+  if (want === '2' || want === 'deny' || want === 'denied' || want === 'no' || want === 'n' || want === 'reject') {
+    approved = false;
+    message = 'Denied by operator';
+  } else if (
+    want === '1' ||
+    want === 'approve' ||
+    want === 'approved' ||
+    want === 'yes' ||
+    want === 'y' ||
+    want === 'allow' ||
+    want === 'once'
+  ) {
+    approved = true;
+    message = 'Approved by operator (once)';
+  } else if (want.includes('deny') || want.includes('reject') || want === 'no') {
+    approved = false;
+    message = response;
+  } else {
+    approved = true;
+    message = response;
+  }
+  const config = await loadConfig();
+  const client = createV2Client(port, config.serverPassword);
+  await v2ReplyPermission(client, sessionID, permissionId, approved ? 'once' : 'reject', message);
+  return true;
+}
+
+/**
  * Answer a pending question from memory first, then the durable sidecar.
  * Removes it from both stores so it is never asked twice.
  */
@@ -119,6 +175,14 @@ export async function answerQuestion(
 ): Promise<string> {
   const live = findPendingQuestionByJobName(jobName);
   if (live) {
+    if (live.partId.startsWith('perm:')) {
+      const sent = await answerViaPermission(live.port, live.remoteSessionID, live.partId, response).catch(() => false);
+      removePendingQuestion(live.jobId, live.partId);
+      await dropPersistedQuestion(live.jobId, live.partId);
+      return sent
+        ? `Permission decision sent to job "${jobName}": "${response}"`
+        : `Permission "${live.partId}" recorded for job "${jobName}" (worker offline — decision visible in overview)`;
+    }
     const formID = await answerViaForm(live.port, live.remoteSessionID, live.partId, response).catch(() => null);
     if (!formID) {
       await sender(live.port, live.remoteSessionID, response);
@@ -139,6 +203,13 @@ export async function answerQuestion(
     );
   }
   const q = persisted[0];
+  if (q.partId.startsWith('perm:')) {
+    const sent = await answerViaPermission(q.port, q.remoteSessionID, q.partId, response).catch(() => false);
+    await dropPersistedQuestion(q.jobId, q.partId);
+    return sent
+      ? `Permission decision sent to job "${jobName}" (from durable sidecar): "${response}"`
+      : `Permission "${q.partId}" recorded for job "${jobName}" (from durable sidecar, worker offline)`;
+  }
   const formID = await answerViaForm(q.port, q.remoteSessionID, q.partId, response).catch(() => null);
   if (!formID) {
     await sender(q.port, q.remoteSessionID, response);

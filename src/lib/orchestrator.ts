@@ -1085,10 +1085,13 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         await removeWorktree(worktreePath, true).catch(() => {});
       }
 
+      // Recovery: the job never left queued/waiting_deps (no worktree yet),
+      // but queued/waiting_deps → failed is not a valid transition. Force
+      // it explicitly so the failure is visible instead of stuck queued.
       await updatePlanJob(planId, job.name, {
         status: 'failed',
         error: error instanceof Error ? error.message : String(error),
-      });
+      }, { force: true });
     }
   }
 

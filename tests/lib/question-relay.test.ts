@@ -1,13 +1,19 @@
-import { mock, describe, it, expect, beforeEach } from 'bun:test';
+import { mock, describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   buildTaskSummary,
   isPathInsideWorktree,
   shouldAutoApprove,
   buildQuestionPrompt,
   QuestionRelay,
+  getPendingQuestionsForJob,
+  removePendingQuestion,
+  clearPendingQuestionsForJob,
   type PermissionRequest,
 } from '../../src/lib/question-relay';
 import type { Job } from '../../src/lib/job-state';
+import * as paths from '../../src/lib/paths';
 
 describe('buildTaskSummary', () => {
   it('should return the full prompt if under 120 chars', () => {
@@ -222,9 +228,26 @@ describe('buildQuestionPrompt', () => {
 
 describe('QuestionRelay', () => {
   let relay: QuestionRelay;
+  let outerStateDir = '';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     relay = new QuestionRelay();
+    const fs = await import('fs');
+    outerStateDir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-relay-outer-'));
+    spyOn(paths, 'getDataDir').mockResolvedValue(join(outerStateDir, 'state'));
+    fs.mkdirSync(join(outerStateDir, 'state'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    relay.dispose();
+    for (const id of ['job-1', 'job-vis', 'job-pub-timeout', 'job-plain-timeout']) {
+      clearPendingQuestionsForJob(id);
+    }
+    (paths.getDataDir as unknown as { mockRestore?: () => void }).mockRestore?.();
+    const fs = await import('fs');
+    if (outerStateDir && fs.existsSync(outerStateDir)) {
+      fs.rmSync(outerStateDir, { recursive: true, force: true });
+    }
   });
 
   const mockJob: Job = {
@@ -328,6 +351,113 @@ describe('QuestionRelay', () => {
 
     it('should dispose without errors', () => {
       relay.dispose();
+    });
+  });
+
+  describe('publishing guard + operator visibility', () => {
+    let realFetch: typeof fetch;
+
+    beforeEach(async () => {
+      realFetch = globalThis.fetch;
+    });
+
+    afterEach(async () => {
+      globalThis.fetch = realFetch;
+    });
+
+    it('never auto-approves git push with -C space/quote paths inside the worktree', () => {
+      for (const description of [
+        'git push origin x',
+        'git -C "my dir" push origin main',
+        "git -C 'my dir' push",
+        'git -c core.sshCommand=ssh push',
+        'git --git-dir=/tmp/x push',
+      ]) {
+        const result = shouldAutoApprove(
+          { id: 'p', type: 'shell_command', path: '/home/user/project', description },
+          '/home/user/project',
+        );
+        expect(result.autoApproved).toBe(false);
+      }
+    });
+
+    it('makes ask-user escalation visible as a pending question (memory + sidecar)', async () => {
+      const job: Job = {
+        ...mockJob,
+        id: 'job-vis',
+        name: 'vis-job',
+        port: 18080,
+        remoteSessionID: 'ses_vis',
+      };
+      const permission: PermissionRequest = {
+        id: 'per-vis-1',
+        type: 'shell_command',
+        path: '/etc',
+        description: 'Run system command outside worktree',
+      };
+      const result = await relay.handlePermissionRequest(job, permission);
+      expect(result.autoApproved).toBe(false);
+
+      const pending = getPendingQuestionsForJob('job-vis');
+      expect(pending.map((q) => q.partId)).toContain('perm:per-vis-1');
+      expect(pending[0].question).toMatch(/Permission needed/);
+
+      const { loadRuntimeSnapshot } = await import('../../src/lib/durable-state');
+      const sidecar = await loadRuntimeSnapshot();
+      expect((sidecar?.pendingQuestions ?? []).map((q) => q.partId)).toContain('perm:per-vis-1');
+
+      relay.cleanup('job-vis');
+      removePendingQuestion('job-vis', 'perm:per-vis-1');
+    });
+
+    it('auto-denies publishing escalations on timeout, auto-approves ordinary ones', async () => {
+      const seen: Array<{ url: string; body: unknown }> = [];
+      globalThis.fetch = (async (url: unknown, init?: unknown) => {
+        seen.push({ url: String(url), body: (init as { body?: unknown })?.body });
+        return new Response('{}', { status: 200 });
+      }) as typeof fetch;
+
+      const fastRelay = new QuestionRelay({ autoResponseTimeoutMs: 20 });
+
+      const pubJob: Job = {
+        ...mockJob,
+        id: 'job-pub-timeout',
+        name: 'pub-job',
+        port: 18081,
+        remoteSessionID: 'ses_pub',
+      };
+      await fastRelay.handlePermissionRequest(pubJob, {
+        id: 'per-pub-1',
+        type: 'shell_command',
+        path: '/home/user/project',
+        description: 'git -C "my dir" push origin main',
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      const pubCall = seen.find((s) => s.url.includes('per-pub-1'));
+      expect(pubCall).toBeDefined();
+      expect(JSON.stringify(pubCall!.body)).toMatch(/reject/);
+      fastRelay.dispose();
+
+      seen.length = 0;
+      const plainRelay = new QuestionRelay({ autoResponseTimeoutMs: 20 });
+      const plainJob: Job = {
+        ...mockJob,
+        id: 'job-plain-timeout',
+        name: 'plain-job',
+        port: 18082,
+        remoteSessionID: 'ses_plain',
+      };
+      await plainRelay.handlePermissionRequest(plainJob, {
+        id: 'per-plain-1',
+        type: 'shell_command',
+        path: '/etc',
+        description: 'Run system command outside worktree',
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      const plainCall = seen.find((s) => s.url.includes('per-plain-1'));
+      expect(plainCall).toBeDefined();
+      expect(JSON.stringify(plainCall!.body)).toMatch(/once/);
+      plainRelay.dispose();
     });
   });
 });

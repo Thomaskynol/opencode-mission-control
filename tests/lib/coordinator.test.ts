@@ -6,6 +6,7 @@ import {
   decideNextJobs,
   evaluateFanoutGuard,
   assertNoPush,
+  isGitPushArgs,
   buildWorkerPrompt,
   redactSecrets,
   shouldContinueSession,
@@ -99,6 +100,27 @@ describe('assertNoPush', () => {
     expect(() => assertNoPush(['npm', '--prefix', '/tmp/x', 'publish'])).toThrow();
     expect(() => assertNoPush(['npm', 'run', 'publish'])).not.toThrow();
     expect(() => assertNoPush(['git', 'commit', '-m', 'push origin'])).not.toThrow();
+  });
+
+  it('blocks git push through -c / --git-dir / --work-tree scoped flags', () => {
+    expect(isGitPushArgs(['git', '-c', 'core.sshCommand=ssh -i key', 'push'])).toBe(true);
+    expect(isGitPushArgs(['git', '--git-dir=/tmp/x', 'push'])).toBe(true);
+    expect(isGitPushArgs(['git', '--git-dir', '/tmp/x', 'push'])).toBe(true);
+    expect(isGitPushArgs(['git', '--work-tree=/tmp/x', 'push'])).toBe(true);
+    expect(isGitPushArgs(['git', '--no-pager', 'push'])).toBe(true);
+    expect(() => assertNoPush(['git', '-c', 'a=b', 'push', 'origin', 'x'])).toThrow(/push/i);
+    expect(() => assertNoPush(['git', '--git-dir=/tmp/x', 'push'])).toThrow(/push/i);
+    expect(() => assertNoPush(['git', 'commit', '-m', 'x'])).not.toThrow();
+  });
+
+  it('blocks git -C push with space/quote paths in argv form', () => {
+    // Shell-free argv: single token with a space (no shell quoting).
+    expect(isGitPushArgs(['git', '-C', 'my dir', 'push', 'origin', 'main'])).toBe(true);
+    // Shell-string callers keep the quotes inside the token.
+    expect(isGitPushArgs(['git', '-C', '"my dir"', 'push'])).toBe(true);
+    expect(isGitPushArgs(['git', '-C', "'my dir'", 'push'])).toBe(true);
+    expect(() => assertNoPush(['git', '-C', 'my dir', 'push'])).toThrow(/push/i);
+    expect(() => assertNoPush(['git', '-C', '"my dir"', 'push'])).toThrow(/push/i);
   });
 });
 
