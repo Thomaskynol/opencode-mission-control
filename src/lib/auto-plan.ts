@@ -14,6 +14,7 @@ import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
 import { gitCommand } from './git';
+import { getCurrentModel } from './model-tracker';
 
 export interface AutoCeiling {
   maxParallel?: number;
@@ -488,5 +489,220 @@ export async function runAutoIntake(
     },
     draft,
     plannerPrompt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous single-run: retry + private model invocation.
+// The public `start --request` path never trusts one model answer: invalid
+// output retries with backoff, valid output is the only thing that proceeds.
+// No side effects happen here — persistence/dispatch live in the caller, so
+// a failed attempt never creates tasks, branches or workers.
+// ---------------------------------------------------------------------------
+
+/** Default planner model (normal opencode auth, never a key prompt). */
+export const PLANNER_MODEL_DEFAULT = 'opencode-go/muse-spark-1.3-contributor';
+
+/** Resolve the planner model: explicit env → tracked session model → default. */
+export function resolvePlannerModel(): string {
+  const env = process.env.MC_PLANNER_MODEL?.trim();
+  if (env) return env;
+  return getCurrentModel() ?? PLANNER_MODEL_DEFAULT;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface PlannerRetryOptions {
+  /** Total attempts including the first (default 3). */
+  maxAttempts?: number;
+  /** Base backoff in ms, doubled per retry (default 1000). */
+  baseDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * NL→validated-draft with retry. Each attempt fully validates (JSON/fenced,
+ * unique names, known deps, no cycle, prompt/acceptance, safe destinations,
+ * authorized actions); failures sleep with exponential backoff and retry.
+ * Throws the last error after exhausting attempts — never partial work.
+ */
+export async function runAutoIntakeWithRetry(
+  input: AutoIntakeInput,
+  generate: PlannerGenerate,
+  opts?: PlannerRetryOptions,
+): Promise<{ intake: AutoIntake; draft: AutoPlanDraft; plannerPrompt: string; attempts: number }> {
+  const maxAttempts = Math.max(1, Math.floor(opts?.maxAttempts ?? 3));
+  const baseDelayMs = Math.max(0, opts?.baseDelayMs ?? 1000);
+  const sleep = opts?.sleep ?? defaultSleep;
+  const request = normalizeRequest(input.request);
+  const plannerPrompt = buildPlannerPrompt({ ...input, request });
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const raw = await generate(plannerPrompt);
+      const draft = parsePlannerOutput(raw);
+      assertSafeDestinations(draft);
+      assertAuthorizedActions(draft);
+      return {
+        intake: {
+          id: randomUUID(),
+          request,
+          repo: input.repo,
+          targetBranch: input.targetBranch,
+          docs: input.docs,
+          ceiling: input.ceiling,
+          createdAt: new Date().toISOString(),
+        },
+        draft,
+        plannerPrompt,
+        attempts: attempt,
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts && baseDelayMs > 0) {
+        await sleep(baseDelayMs * 2 ** (attempt - 1));
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Planner model failed after ${maxAttempts} attempt(s).`);
+}
+
+function collectTextStrings(value: unknown, out: string[]): void {
+  if (typeof value === 'string') {
+    if (value.trim()) out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTextStrings(item, out);
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const v of Object.values(value as Record<string, unknown>)) collectTextStrings(v, out);
+  }
+}
+
+function looksLikeDraftText(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text);
+    return (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      Array.isArray((parsed as Record<string, unknown>).requirements) &&
+      Array.isArray((parsed as Record<string, unknown>).tasks)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract the planner's strict-JSON answer from `opencode run --format json`.
+ * Accepts already-strict JSON verbatim; otherwise unwraps the outer envelope
+ * (text/content/parts/message nests) and returns the first inner string that
+ * parses as a draft. Throws explicitly when no draft JSON is found.
+ */
+export function extractPlannerText(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) throw new Error('Planner model returned empty output — refusing to create tasks.');
+  if (looksLikeDraftText(trimmed)) return trimmed;
+  const fenced = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/);
+  if (fenced && looksLikeDraftText(fenced[1].trim())) return fenced[1].trim();
+  let outer: unknown = null;
+  try {
+    outer = JSON.parse(trimmed);
+  } catch {
+    outer = null;
+  }
+  if (outer !== null && typeof outer === 'object') {
+    const candidates: string[] = [];
+    collectTextStrings(outer, candidates);
+    for (const c of candidates) {
+      const t = c.trim();
+      if (looksLikeDraftText(t)) return t;
+      const innerFenced = t.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+      if (innerFenced && looksLikeDraftText(innerFenced[1].trim())) return innerFenced[1].trim();
+    }
+    // Last resort: largest {...} substring mentioning "tasks".
+    const braces: string[] = [];
+    const re = /\{[\s\S]*?"tasks"[\s\S]*?\}/g;
+    let m: RegExpExecArray | null;
+    const haystack = candidates.join('\n');
+    while ((m = re.exec(haystack)) !== null) braces.push(m[0]);
+    braces.sort((a, b) => b.length - a.length);
+    for (const b of braces) {
+      if (looksLikeDraftText(b)) return b;
+    }
+  }
+  throw new Error('Planner model output contains no strict-JSON draft — refusing to create tasks.');
+}
+
+export interface RunPlannerOptions {
+  model?: string;
+  timeoutMs?: number;
+  opencodeBin?: string;
+  run?: (args: string[], prompt: string) => Promise<string>;
+}
+
+/**
+ * Build the configured-model slot on top of a real product session.
+ * Default runs `opencode run --standalone` (a private server, never the
+ * shared background service holding user sessions) with the pinned planner
+ * model. Auth flows through the normal opencode mechanisms — no keys asked.
+ * shortcut: text extraction is heuristic, upgrade to a typed envelope when
+ * `opencode run --format json` stabilizes its schema.
+ */
+export function createRunPlannerGenerate(opts?: RunPlannerOptions): PlannerGenerate {
+  const model = opts?.model ?? resolvePlannerModel();
+  const timeoutMs = opts?.timeoutMs ?? 300_000;
+  const opencodeBin = opts?.opencodeBin ?? process.env.OPENCODE_BIN ?? 'opencode';
+  const run = opts?.run;
+  return async (plannerPrompt: string): Promise<string> => {
+    let raw: string;
+    if (run) {
+      raw = await run(['run', '--standalone', '--model', model, '--format', 'json'], plannerPrompt);
+    } else {
+      raw = await new Promise<string>((resolve, reject) => {
+        const proc = Bun.spawn([opencodeBin, 'run', '--standalone', '--model', model, '--format', 'json', plannerPrompt], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          try {
+            proc.kill();
+          } catch {}
+          reject(new Error(`Planner model timed out after ${timeoutMs}ms.`));
+        }, timeoutMs);
+        (async () => {
+          try {
+            const [stdout, stderr, exitCode] = await Promise.all([
+              new Response(proc.stdout).text(),
+              new Response(proc.stderr).text(),
+              proc.exited,
+            ]);
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (exitCode !== 0) {
+              reject(new Error(`Planner model failed (exit ${exitCode}): ${(stderr || stdout).slice(0, 500)}`));
+              return;
+            }
+            resolve(stdout);
+          } catch (error) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+          }
+        })();
+      });
+    }
+    return extractPlannerText(raw);
   };
 }

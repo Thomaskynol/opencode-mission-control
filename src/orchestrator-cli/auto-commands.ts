@@ -8,23 +8,39 @@ import {
   assertAuthorizedActions,
   nextStepsFor,
   ensureBaseReady,
+  createRunPlannerGenerate,
+  type AutoIntakeInput,
+  type PlannerGenerate,
 } from '../lib/auto-plan';
 import {
   saveAutoIntake,
   loadAutoIntake,
   loadRuntimeSnapshot,
+  appendAutoQuestion,
   setAutoNextSteps,
   setAutoIntakeStatus,
   type AutoIntakeRecord,
 } from '../lib/durable-state';
+import { loadPlan } from '../lib/plan-state';
 
 /**
  * Autonomous intake commands for the human TUI (public NL path).
- * Pure-ish handlers: persistence goes through the durable sidecar, the
- * model transform arrives via --plan-file (the configured model's
- * strict-JSON answer to the printed planner prompt). Nothing here
- * dispatches worker work — dispatch stays with the coordinator loop.
+ * `start --request` is the single autonomous entry: it invokes the
+ * configured model internally (private `opencode run --standalone` session,
+ * never the shared background service), validates with retry + backoff,
+ * persists the intake, ensures the base, creates the plan via startPlan and
+ * lets the coordinator/reconciler schedule workers. `auto-plan --plan-file`
+ * stays only as an advanced diagnostic (never required).
  */
+
+export interface AutoCommandDeps {
+  generate?: PlannerGenerate;
+  startAutonomous?: (
+    input: AutoIntakeInput,
+    generate: PlannerGenerate,
+  ) => Promise<{ intakeId: string; tasks: string[]; launched: boolean }>;
+  resumeAutonomous?: (intakeId: string) => Promise<string>;
+}
 
 /** Absolute CLI entry so help/answers print full copyable commands. */
 export function cliPath(): string {
@@ -33,6 +49,34 @@ export function cliPath(): string {
 
 export function resumeCommand(intakeId: string): string {
   return `bun ${cliPath()} auto-plan --intake ${intakeId} --plan-file <model-output.json>`;
+}
+
+function splitCliArgs(input: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else cur += c;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (/\s/.test(c)) {
+      if (cur) {
+        out.push(cur);
+        cur = '';
+      }
+    } else {
+      cur += c;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+export function splitCommandArgs(input: string): string[] {
+  return splitCliArgs(input);
 }
 
 function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string> } {
@@ -67,9 +111,15 @@ function ceilingFrom(flags: Map<string, string>): AutoIntakeRecord['ceiling'] {
   };
 }
 
-/** `start <NL...> [--repo R] [--branch B] [--max-parallel N] [--test-command C]` */
-export async function startIntake(args: string[]): Promise<string> {
+/** `start <NL...> [--repo R] [--branch B] [--max-parallel N]` (legacy, two-step) or
+ * `start --repo R --branch B --request "NL" [--context C] [--max-parallel N] [--test-command C]`
+ * (single autonomous run: model invoked internally, plan created, workers scheduled). */
+export async function startIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { positional, flags } = parseFlags(args);
+  const requested = (flags.get('request') ?? '').trim();
+  if (requested) {
+    return startAutonomous(args, deps);
+  }
   const request = normalizeRequest(positional.join(' '));
   const now = new Date().toISOString();
   const record: AutoIntakeRecord = {
@@ -130,8 +180,23 @@ export async function complementIntake(args: string[]): Promise<string> {
     request: `${record.request}\nFollow-up: ${text}`,
     updatedAt: new Date().toISOString(),
   });
+  // Pause-aware: a paused/blocked plan keeps its decision; the free-text
+  // follow-up is recorded as a question (content, never approve/deny).
+  // A running plan takes the complement into the scheduler — the
+  // coordinator/reconciler advance eligible work with no manual resume.
+  const plan = await loadPlan().catch(() => null);
+  const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
+  if (paused) {
+    await appendAutoQuestion(record.id, text).catch(() => {});
+    return [
+      `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
+      `Plan is paused — pause respected, follow-up kept as an open question (free text, not approve/deny).`,
+      `Request now ends with: "Follow-up: ${text}"`,
+    ].join('\n');
+  }
   return [
     `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
+    `Running: follow-up enters the scheduler — coordinator/reconciler advance eligible work, no manual resume needed.`,
     `Request now ends with: "Follow-up: ${text}"`,
   ].join('\n');
 }
@@ -197,15 +262,119 @@ export async function applyModelPlan(args: string[]): Promise<string> {
 
 /**
  * `close` — detach the follow view. Conducting (coordinator observe →
- * decide → dispatch, reconciler merges) and recording (reports,
- * questions, decisions) continue; closing never stops or discards work.
+ * decide → dispatch, reconciler merges, monitor records) and recording
+ * (reports, questions, decisions) continue; closing never stops, cancels
+ * or discards work. `close` is explicit and never a silent cancel.
  */
 export function closeFollow(): string {
   return [
     'Follow closed — the run continues.',
-    'Conducting: the coordinator (observe → decide → dispatch) and the reconciler loop keep driving tasks; this view only reads state.',
+    'Conducting: the coordinator (observe → decide → dispatch), the reconciler loop (merges), and the monitor (reports) keep driving tasks; this view only reads state.',
     'Recording: worker reports, pending questions and decisions keep being persisted; resume anytime with:',
     `bun ${cliPath()} follow`,
     'Nothing was stopped or discarded by closing this view.',
+  ].join('\n');
+}
+
+/**
+ * Single autonomous run:
+ * `start --repo R --branch B --request "NL" [--context C] [--max-parallel N] [--test-command C]`.
+ * Invokes the configured model internally on a private session, validates
+ * with retry + backoff, persists the intake, ensures the base, creates the
+ * plan via startPlan and lets the coordinator/reconciler schedule workers.
+ * Invalid model output retries, then fails explicitly — never wrong work.
+ */
+export async function startAutonomous(args: string[], deps?: AutoCommandDeps): Promise<string> {
+  const { positional, flags } = parseFlags(args);
+  const rawRequest = (flags.get('request') ?? positional.join(' ')).trim();
+  const request = normalizeRequest(rawRequest);
+  const repo = flags.get('repo') || undefined;
+  const targetBranch = flags.get('branch') || undefined;
+  const context = flags.get('context');
+  const docs = context ? [context] : undefined;
+  const input: AutoIntakeInput = {
+    request,
+    repo,
+    targetBranch,
+    docs,
+    ceiling: ceilingFrom(flags),
+  };
+  const generate = deps?.generate ?? createRunPlannerGenerate();
+  const startFn =
+    deps?.startAutonomous ??
+    (async (inp: AutoIntakeInput, gen: PlannerGenerate) => {
+      const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
+        import('../lib/orchestrator'),
+        import('../lib/monitor'),
+        import('../lib/config'),
+      ]);
+      const config = await loadConfig();
+      const orchestrator = new Orchestrator(new JobMonitor(), config);
+      return orchestrator.startAutonomousPlan(inp, gen);
+    });
+  try {
+    const { intakeId, tasks, launched } = await startFn(input, generate);
+    return [
+      `Intake ${intakeId} persisted (running).`,
+      `Request: ${request}`,
+      ...(targetBranch ? [`Destination branch: ${targetBranch}`] : []),
+      `Plan launched: ${tasks.length} task(s) [${tasks.join(', ')}]${launched ? '' : ' (launch deferred)'}.`,
+      'Conducting: coordinator (observe → decide → dispatch) + reconciler (merge) + monitor (reports).',
+      'Track with:',
+      `bun ${cliPath()} follow`,
+      'Detaching is safe:',
+      `bun ${cliPath()} close   # view only; never cancels the run`,
+    ].join('\n');
+  } catch (error) {
+    // Preserve state for a public resume: keep the NL request as an
+    // awaiting-plan intake so `resume --intake <id>` retries the model
+    // without new JSON. No tasks, branches or workers are created here.
+    const now = new Date().toISOString();
+    const record: AutoIntakeRecord = {
+      id: randomUUID(),
+      request,
+      repo,
+      targetBranch,
+      ceiling: input.ceiling,
+      requirements: [],
+      decisions: [`model failed: ${error instanceof Error ? error.message : String(error)}`],
+      questions: [],
+      nextSteps: [`resume without new JSON: bun ${cliPath()} resume --intake <id>`],
+      status: 'awaiting-plan',
+      createdAt: now,
+      updatedAt: now,
+    };
+    await saveAutoIntake(record).catch(() => {});
+    throw new Error(
+      `Autonomous start failed (intake ${record.id} kept for resume): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * `resume [--intake ID]` — public retake without new JSON. A disposable
+ * coordinator process may be killed; this resumes from persisted
+ * intake + plan, never duplicates workers and never reintegrates merged
+ * work. Never restarts the machine, never touches user sessions.
+ */
+export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
+  const { flags } = parseFlags(args);
+  const record = await resolveIntake(flags);
+  const resumeFn =
+    deps?.resumeAutonomous ??
+    (async (intakeId: string) => {
+      const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
+        import('../lib/orchestrator'),
+        import('../lib/monitor'),
+        import('../lib/config'),
+      ]);
+      const config = await loadConfig();
+      const orchestrator = new Orchestrator(new JobMonitor(), config);
+      return orchestrator.resumeAutonomousIntake(intakeId);
+    });
+  const progress = await resumeFn(record.id);
+  return [
+    `Resumed intake ${record.id} without new JSON (no duplicated workers, no reintegration).`,
+    progress,
   ].join('\n');
 }

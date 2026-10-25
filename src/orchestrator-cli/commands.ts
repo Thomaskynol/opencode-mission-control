@@ -5,7 +5,7 @@ import { formatReportLine } from '../lib/reports';
 import { mc_attach } from '../tools/attach';
 import { getDashboard, queryTask, readLatestReport } from './coordinator-client';
 import { listPersistedQuestions, renderQuestionForm } from './forms';
-import { applyModelPlan, closeFollow, complementIntake, startIntake } from './auto-commands';
+import { applyModelPlan, closeFollow, complementIntake, resumeIntake, splitCommandArgs, startIntake, type AutoCommandDeps } from './auto-commands';
 
 /**
  * M6 human lane: conversational dispatcher for the separate human TUI.
@@ -24,10 +24,12 @@ export interface HumanControls {
 
 export const HELP = [
   'Human TUI commands (separate from worker sessions):',
-  '  start <request> [--repo R] [--branch B] [--max-parallel N] — capture NL-only intake, persist it, print the planner prompt',
+  '  start --repo R --branch B --request "NL" [--context C] [--max-parallel N] — single autonomous run (model invoked internally, plan + workers scheduled)',
+  '  start <request> [--repo R] [--branch B] [--max-parallel N] — capture NL-only intake, persist it, print the planner prompt (legacy two-step)',
   '  complement [--intake ID] <text> — extend the persisted request (same work continues)',
-  '  auto-plan --intake ID --plan-file F — validate the model JSON answer into tasks (no dispatch here)',
-  '  close                 — detach this view; coordinator/reconciler keep conducting, recording continues',
+  '  resume [--intake ID] — retake without new JSON (no duplicated workers, no reintegration)',
+  '  auto-plan --intake ID --plan-file F — advanced diagnostic only, never required for start',
+  '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
   '  follow | progress     — short dashboard without raw logs',
   '  task <name>           — consult one task (status, last milestone, questions)',
@@ -96,10 +98,11 @@ export async function readMilestoneLog(name: string): Promise<string> {
 export async function dispatchCommand(
   input: string,
   controls: HumanControls,
+  autoDeps?: AutoCommandDeps,
 ): Promise<string> {
   const text = input.trim();
   if (!text) return HELP;
-  const [verb, ...rest] = text.split(/\s+/);
+  const [verb, ...rest] = splitCommandArgs(text);
   const lower = verb.toLowerCase();
 
   switch (lower) {
@@ -107,7 +110,7 @@ export async function dispatchCommand(
       return HELP;
 
     case 'start': {
-      return startIntake(rest);
+      return startIntake(rest, autoDeps);
     }
 
     case 'complement': {
@@ -169,8 +172,11 @@ export async function dispatchCommand(
     }
 
     case 'resume': {
+      if (rest.some((w) => w === '--intake')) {
+        return resumeIntake(rest, autoDeps);
+      }
       const name = rest[0];
-      if (!name) throw new Error('Usage: resume <name> [follow-up text] [--wait]');
+      if (!name) throw new Error('Usage: resume <name> [follow-up text] [--wait] | resume --intake <id>');
       const wait = rest.includes('--wait');
       const message = rest.slice(1).filter((w) => w !== '--wait').join(' ') || undefined;
       return controls.resume(name, { message, waitForIdle: wait });

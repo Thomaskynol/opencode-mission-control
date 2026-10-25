@@ -30,7 +30,7 @@ import {
 import { JobComms, type RelayContext } from './job-comms';
 import { createV2Client, v2ForkSession, v2Prompt, type V2ModelRef } from './sdk-client';
 import {
-  runAutoIntake,
+  runAutoIntakeWithRetry,
   ensureBaseReady,
   draftToJobSpecs,
   validateRuntimeDecision,
@@ -41,8 +41,10 @@ import {
 import {
   saveAutoIntake,
   loadAutoIntake,
+  loadRuntimeSnapshot,
   appendAutoDecision,
   appendAutoQuestion,
+  setAutoIntakeStatus,
 } from './durable-state';
 
 /**
@@ -1395,7 +1397,11 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     generate: PlannerGenerate,
     opts?: { launch?: boolean },
   ): Promise<{ intakeId: string; tasks: string[]; launched: boolean }> {
-    const { intake, draft } = await runAutoIntake(input, generate);
+    // Retry with backoff: an invalid model answer never becomes work.
+    const { intake, draft, attempts } = await runAutoIntakeWithRetry(input, generate, {
+      maxAttempts: 3,
+      baseDelayMs: 1000,
+    });
     const base = await ensureBaseReady(input.repo ?? process.cwd(), input.targetBranch);
 
     const now = new Date().toISOString();
@@ -1413,6 +1419,14 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       createdAt: intake.createdAt,
       updatedAt: now,
     });
+    await appendAutoDecision(
+      intake.id,
+      `model answered in ${attempts} attempt(s) (${draft.requirements.length} requirements, ${draft.tasks.length} tasks)`,
+    ).catch(() => {});
+    await appendAutoDecision(
+      intake.id,
+      `base ready: ${base.baseBranch}@${base.baseCommit.slice(0, 8)}${base.createdBranch ? ' (destination branch created locally, never pushed)' : ''}`,
+    ).catch(() => {});
 
     const tasks = draft.tasks.map((t) => t.name);
     if (opts?.launch === false) {
@@ -1444,11 +1458,42 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       spec.baseBranch = base.baseBranch;
     }
     await this.startPlan(spec);
-    await appendAutoDecision(intake.id, `plan ${spec.id} launched (${tasks.length} tasks)`);
+    await appendAutoDecision(intake.id, `plan ${spec.id} launched (${tasks.length} tasks)`).catch(() => {});
+    await setAutoIntakeStatus(intake.id, 'running').catch(() => {});
+    await appendAutoDecision(
+      intake.id,
+      'conducting: coordinator (observe → decide → dispatch) + reconciler (merge) + monitor (reports); follow detaches, close never cancels',
+    ).catch(() => {});
     return { intakeId: intake.id, tasks, launched: true };
   }
 
-  /** Extend the persisted NL request; the same work continues, nothing rebuilds. */
+  /**
+   * Public resume without new JSON: a disposable coordinator process may be
+   * killed; this re-enters via persisted intake + plan, never duplicates
+   * workers (resumePlan reuses tmux/panes, reconciler dedupes queue) and
+   * never reintegrates merged work. Never touches user sessions.
+   */
+  async resumeAutonomousIntake(intakeId: string): Promise<string> {
+    const record = await loadAutoIntake(intakeId);
+    if (!record) {
+      throw new Error(`No intake "${intakeId}" persisted — start one before resuming.`);
+    }
+    const plan = await loadPlan();
+    if (!plan) {
+      return `Intake ${record.id} [${record.status}]: no active plan to resume (nothing duplicated, nothing reintegrated).`;
+    }
+    await this.resumePlan();
+    await appendAutoDecision(record.id, `resumed via public path (plan ${plan.id}, no new JSON)`).catch(() => {});
+    return await this.autonomousProgress(record.id);
+  }
+
+  /**
+   * Extend the persisted NL request; the same work continues, nothing rebuilds.
+   * When running, the follow-up enters the scheduler and the reconciler /
+   * coordinator advance eligible work with no manual resume. When paused or
+   * blocked by a decision, the pause is respected and the free-text follow-up
+   * is recorded as a question (content, never an approve/deny).
+   */
   async complementAutonomousRequest(intakeId: string, text: string): Promise<void> {
     const record = await loadAutoIntake(intakeId);
     if (!record) {
@@ -1461,6 +1506,22 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       request: `${record.request}\nFollow-up: ${followUp}`,
       updatedAt: new Date().toISOString(),
     });
+    const plan = await loadPlan().catch(() => null);
+    const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
+    if (paused) {
+      // Free content recorded as a question; the pause/decision stands.
+      await appendAutoQuestion(intakeId, followUp).catch(() => {});
+      return;
+    }
+    await appendAutoDecision(intakeId, `complement: "${followUp.slice(0, 120)}"`).catch(() => {});
+    // Running: make sure the loop that advances eligible work is alive, so no
+    // manual resumePlan is needed after a complement/new task.
+    try {
+      const latest = await loadPlan();
+      if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
+        this.startReconciler();
+      }
+    } catch {}
   }
 
   /**
@@ -1525,6 +1586,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   /** Short progress view: intake state + plan state + persisted next steps. */
   async autonomousProgress(intakeId?: string): Promise<string> {
     const lines: string[] = [];
+    lines.push('Conducting: coordinator (observe → decide → dispatch) + reconciler (merge) + monitor (reports). Follow detaches; close never cancels.');
     if (intakeId) {
       const record = await loadAutoIntake(intakeId);
       if (record) {
@@ -1533,6 +1595,14 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         for (const step of record.nextSteps.slice(0, 5)) lines.push(`Next: ${step}`);
       } else {
         lines.push(`No intake "${intakeId}" persisted.`);
+      }
+    } else {
+      // Single active intake: surface it without requiring the id.
+      const snapshot = await loadRuntimeSnapshot().catch(() => null);
+      const record = snapshot?.autoIntake ?? null;
+      if (record) {
+        lines.push(`Intake ${record.id} [${record.status}]: ${record.request.split('\n')[0]}`);
+        lines.push(`Decisions kept: ${record.decisions.length}, open questions: ${record.questions.length}`);
       }
     }
     const plan = await loadPlan();
@@ -1664,6 +1734,15 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     await this.appendAuditLog(plan.id, auditEntry);
     this.showToast('Mission Control', `Job "${newJob.name}" added to plan`, 'info');
     await this.reconcile();
+    // Incident C fix: addJob must not need a manual resumePlan to advance.
+    // When the plan is active (not paused/terminal), ensure the reconciler
+    // loop is alive so eligible work dispatches on its own.
+    try {
+      const latest = await loadPlan();
+      if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
+        this.startReconciler();
+      }
+    } catch {}
   }
 
   async reorderJobs(newOrder: string[]): Promise<void> {
