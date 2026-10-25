@@ -1574,15 +1574,14 @@ describe('orchestrator dynamic replanning', () => {
       expect(planState!.auditLog![0].jobName).toBe('new-job');
     });
 
-    it('attempts session fork when forkFrom is specified', async () => {
-      const mockClient = { session: { fork: async () => ({ data: { id: 'forked-session' } }) } };
-      spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      spyOn(sdkClientMod, 'forkJobSession').mockResolvedValue('forked-session');
+    it('attempts session fork on the remote worker session when forkFrom is specified', async () => {
+      spyOn(sdkClientMod, 'v2ForkSession').mockResolvedValue({ id: 'forked-session' } as any);
+      const promptSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       planState = makePlan({
         status: 'running',
         mode: 'autopilot',
-        jobs: [makeJob('source-job', { status: 'running', port: 14100, launchSessionID: 'src-session' })],
+        jobs: [makeJob('source-job', { status: 'running', port: 14100, remoteSessionID: 'src-remote' })],
       });
 
       const orchestrator = new Orchestrator(monitor as any, makeConfig() as any);
@@ -1594,26 +1593,25 @@ describe('orchestrator dynamic replanning', () => {
         { forkFrom: 'source-job' },
       );
 
-      expect(sdkClientMod.forkJobSession).toHaveBeenCalledWith(
-        mockClient,
-        'src-session',
-        expect.objectContaining({
-          sourceJobName: 'source-job',
-          newJobName: 'forked-job',
-          additionalPrompt: 'continue work',
-        }),
+      expect(sdkClientMod.v2ForkSession).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        'src-remote',
+      );
+      expect(promptSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        'forked-session',
+        expect.stringContaining('continue work'),
       );
     });
 
     it('records forkFrom in audit log details', async () => {
-      const mockClient = { session: {} };
-      spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      spyOn(sdkClientMod, 'forkJobSession').mockResolvedValue('forked-session');
+      spyOn(sdkClientMod, 'v2ForkSession').mockResolvedValue({ id: 'forked-session' } as any);
+      spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       planState = makePlan({
         status: 'running',
         mode: 'autopilot',
-        jobs: [makeJob('source', { status: 'running', port: 14100, launchSessionID: 'sess-1' })],
+        jobs: [makeJob('source', { status: 'running', port: 14100, remoteSessionID: 'sess-1' })],
       });
 
       const orchestrator = new Orchestrator(monitor as any, makeConfig() as any);

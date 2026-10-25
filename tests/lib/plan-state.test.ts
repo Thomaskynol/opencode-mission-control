@@ -141,6 +141,24 @@ describe('plan-state', () => {
       expect(await tmpFile.exists()).toBe(false);
     });
 
+    it('preserves the remote worker session across a save/load round-trip', async () => {
+      vi.spyOn(
+        await import('../../src/lib/plan-state'),
+        'validateGhAuth',
+      ).mockResolvedValue(true);
+
+      const plan = makePlan({
+        jobs: [
+          makeJob({ port: 14100, serverUrl: 'http://127.0.0.1:14100', remoteSessionID: 'ses_remote_9' }),
+        ],
+      });
+      await savePlan(plan);
+
+      const loaded = await loadPlan();
+      expect(loaded!.jobs[0].remoteSessionID).toBe('ses_remote_9');
+      expect(loaded!.jobs[0].port).toBe(14100);
+    });
+
     it('stores gh auth validation result in plan', async () => {
       vi.spyOn(
         await import('../../src/lib/plan-state'),

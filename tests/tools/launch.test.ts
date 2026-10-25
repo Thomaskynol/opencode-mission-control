@@ -37,8 +37,9 @@ let mockCopyPlansToWorktree: any;
 let mockResolvePostCreateHook: any;
 let mockAllocatePort: any;
 let mockReleasePort: any;
-let mockWaitForServer: any;
-let mockCreateSessionAndPrompt: any;
+let mockV2WaitForServer: any;
+let mockV2CreateSession: any;
+let mockV2Prompt: any;
 let mockWriteServeLauncherScript: any;
 let mockGetRunningJobs: any;
 
@@ -104,8 +105,9 @@ describe('mc_launch', () => {
     vi.spyOn(modelTracker, 'getCurrentModel').mockReturnValue(undefined);
     mockAllocatePort = vi.spyOn(portAllocator, 'allocatePort').mockImplementation(() => Promise.resolve(14100) as any);
     mockReleasePort = vi.spyOn(portAllocator, 'releasePort').mockImplementation(() => Promise.resolve(undefined) as any);
-    mockWaitForServer = vi.spyOn(sdkClient, 'waitForServer').mockImplementation(() => Promise.resolve({ session: {} } as any));
-    mockCreateSessionAndPrompt = vi.spyOn(sdkClient, 'createSessionAndPrompt').mockImplementation(() => Promise.resolve('sdk-session-1') as any);
+    mockV2WaitForServer = vi.spyOn(sdkClient, 'v2WaitForServer').mockImplementation(() => Promise.resolve({ baseUrl: 'http://127.0.0.1:14100/api', headers: {} }) as any);
+    mockV2CreateSession = vi.spyOn(sdkClient, 'v2CreateSession').mockImplementation(() => Promise.resolve({ id: 'ses-v2-1' }) as any);
+    mockV2Prompt = vi.spyOn(sdkClient, 'v2Prompt').mockImplementation(() => Promise.resolve({}) as any);
     mockWriteServeLauncherScript = vi.spyOn(promptFile, 'writeServeLauncherScript').mockImplementation(() => Promise.resolve('/tmp/mc-worktrees/test-job/.mc-launch.sh') as any);
     mockGetRunningJobs = vi.spyOn(jobState, 'getRunningJobs').mockImplementation(() => Promise.resolve([]) as any);
     vi.spyOn(tmux, 'killSession').mockImplementation(() => Promise.resolve(undefined) as any);
@@ -632,24 +634,29 @@ describe('mc_launch', () => {
       expect(mockWriteLauncherScript).not.toHaveBeenCalled();
     });
 
-    it('should wait for server and send prompt via SDK', async () => {
+    it('should wait for the v2 surface, create the pinned session, and prompt it', async () => {
       await mc_launch.execute(
         { name: 'serve-job', prompt: 'Do task' },
         mockContext,
       );
 
-      expect(mockWaitForServer).toHaveBeenCalledWith(14100, {
+      expect(mockV2WaitForServer).toHaveBeenCalledWith(14100, {
         password: undefined,
       });
-      expect(mockCreateSessionAndPrompt).toHaveBeenCalledWith(
-        expect.anything(),
+      expect(mockV2CreateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        expect.objectContaining({
+          location: { directory: '/tmp/mc-worktrees/test-job' },
+        }),
+      );
+      expect(mockV2Prompt).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        'ses-v2-1',
         expect.stringContaining('Do task'),
-        undefined,
-        undefined,
       );
     });
 
-    it('should store port and serverUrl on job record', async () => {
+    it('should store port, serverUrl and the remote worker session on the job record', async () => {
       await mc_launch.execute(
         { name: 'serve-job', prompt: 'Do task' },
         mockContext,
@@ -659,6 +666,7 @@ describe('mc_launch', () => {
         expect.objectContaining({
           port: 14100,
           serverUrl: 'http://127.0.0.1:14100',
+          remoteSessionID: 'ses-v2-1',
         }),
       );
     });
@@ -696,7 +704,7 @@ describe('mc_launch', () => {
         14100,
         'my-secret',
       );
-      expect(mockWaitForServer).toHaveBeenCalledWith(14100, {
+      expect(mockV2WaitForServer).toHaveBeenCalledWith(14100, {
         password: 'my-secret',
       });
     });
@@ -722,8 +730,8 @@ describe('mc_launch', () => {
       expect(mockSendKeys).not.toHaveBeenCalled();
     });
 
-    it('should cleanup on waitForServer failure', async () => {
-      mockWaitForServer.mockRejectedValue(new Error('Server timeout'));
+    it('should cleanup on v2 readiness failure', async () => {
+      mockV2WaitForServer.mockRejectedValue(new Error('Server timeout'));
 
       await expect(
         mc_launch.execute(
@@ -768,7 +776,7 @@ describe('mc_launch', () => {
 
       expect(mockAllocatePort).not.toHaveBeenCalled();
       expect(mockWriteServeLauncherScript).not.toHaveBeenCalled();
-      expect(mockWaitForServer).not.toHaveBeenCalled();
+      expect(mockV2WaitForServer).not.toHaveBeenCalled();
       expect(mockWritePromptFile).toHaveBeenCalled();
       expect(mockWriteLauncherScript).toHaveBeenCalled();
     });

@@ -24,7 +24,9 @@ import {
   QUESTION_AUTO_RESPONSE_MS,
   QUESTION_DEFAULT_RESPONSE,
   answerQuestion,
+  answerViaForm,
   listPersistedQuestions,
+  mapResponseToFormAnswer,
   persistPendingQuestion,
   renderQuestionForm,
 } from '../../src/orchestrator-cli/forms';
@@ -273,6 +275,72 @@ describe('m6 human controls', () => {
       await expect(mc_answer.execute({ name: 'ghost', response: 'x' })).rejects.toThrow(/not found/);
       await addJob(serveJob({ status: 'stopped' }));
       await expect(mc_answer.execute({ name: 'alpha', response: 'x' })).rejects.toThrow(/not running/);
+    });
+  });
+
+  describe('v2 form answers', () => {
+    const realFetch = globalThis.fetch;
+
+    afterEach(() => {
+      globalThis.fetch = realFetch;
+    });
+
+    it('maps labels, values and positions onto the first field key', () => {
+      const fields = [{ key: 'q0', options: [{ value: 'Red', label: 'Red' }, { value: 'b', label: 'Blue' }] }];
+      expect(mapResponseToFormAnswer(fields, 'Red')).toEqual({ q0: 'Red' });
+      expect(mapResponseToFormAnswer(fields, 'blue')).toEqual({ q0: 'b' });
+      expect(mapResponseToFormAnswer(fields, '2')).toEqual({ q0: 'b' });
+      expect(mapResponseToFormAnswer(fields, 'something else')).toEqual({ q0: 'something else' });
+      expect(mapResponseToFormAnswer([], 'x')).toEqual({});
+    });
+
+    it('skips the network for legacy (non-form) question IDs', async () => {
+      let fetched = false;
+      globalThis.fetch = (async () => {
+        fetched = true;
+        return new Response('{}', { status: 200 });
+      }) as typeof fetch;
+
+      await expect(answerViaForm(14101, 'ses_remote1', 'p1', 'Red')).resolves.toBeNull();
+      expect(fetched).toBe(false);
+    });
+
+    it('answers a pending form via the reply endpoint instead of the prompt', async () => {
+      const seen: Array<{ url: string; body: unknown }> = [];
+      globalThis.fetch = (async (url: unknown, init: unknown) => {
+        const u = String(url);
+        if (u.endsWith('/form/frm_9')) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                id: 'frm_9',
+                sessionID: 'ses_remote1',
+                title: 'Pick',
+                fields: [{ key: 'q0', options: [{ value: 'Red', label: 'Red' }] }],
+                state: { status: 'pending' },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        seen.push({ url: u, body: JSON.parse(String((init as RequestInit)?.body)) });
+        return new Response('', { status: 204 });
+      }) as typeof fetch;
+
+      addPendingQuestion(pendingFixture({ partId: 'frm_9' }));
+      let prompted = 0;
+      const result = await answerQuestion('alpha', 'Red', async () => {
+        prompted += 1;
+      });
+
+      expect(result).toMatch(/form reply/);
+      expect(prompted).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].url).toContain('/session/ses_remote1/form/frm_9/reply');
+      expect(seen[0].body).toEqual({ answer: { q0: 'Red' } });
+      await expect(
+        answerQuestion('alpha', 'Red', async () => {}),
+      ).rejects.toThrow(/No pending question/);
     });
   });
 

@@ -69,6 +69,10 @@ mock.module('../../src/lib/job-state', () => {
     getRunningJobs: vi.fn(async () => {
       return jobs.filter((j) => j.status === 'running');
     }),
+    // Migration helpers mirror the real module surface (durable-state links
+    // them for sidecar reconcile). Passthrough: workflow state is current.
+    migrateJobState: vi.fn((state: Record<string, unknown>) => state),
+    migrateV2ToV3: vi.fn((state: Record<string, unknown>) => state),
     // Expose for test cleanup
     _resetJobs: () => {
       jobs = [];

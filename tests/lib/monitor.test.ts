@@ -5,6 +5,9 @@ mock.module('../../src/lib/job-state', () => ({
   getRunningJobs: mock(),
   getJob: mock(),
   updateJob: mock(),
+  // Linked transitively via durable-state; unused on this file's paths.
+  migrateJobState: mock(),
+  migrateV2ToV3: mock(),
 }));
 
 mock.module('../../src/lib/tmux', () => ({

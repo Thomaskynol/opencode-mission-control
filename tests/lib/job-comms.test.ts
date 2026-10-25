@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:te
 import type { JobSpec } from '../../src/lib/plan-types';
 import { JobComms, type RelayContext } from '../../src/lib/job-comms';
 import * as sdkClientMod from '../../src/lib/sdk-client';
+import * as configMod from '../../src/lib/config';
 
 function makeJob(name: string, overrides: Partial<JobSpec> = {}): JobSpec {
   return {
@@ -142,10 +143,14 @@ describe('JobComms', () => {
   });
 
   describe('deliverMessages', () => {
-    it('delivers messages to job via SDK and clears queue', async () => {
-      const mockClient = { session: { promptAsync: async () => ({}) } };
-      const waitSpy = spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      const sendSpy = spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+    beforeEach(() => {
+      spyOn(configMod, 'loadConfig').mockResolvedValue({ serverPassword: undefined } as any);
+    });
+
+    it('delivers messages to the remote worker session via v2 and clears queue', async () => {
+      const v2Client = { baseUrl: 'http://127.0.0.1:14100/api', headers: {} };
+      const waitSpy = spyOn(sdkClientMod, 'v2WaitForServer').mockResolvedValue(v2Client as any);
+      const sendSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       comms.registerJob(makeJob('target'));
       comms.relayFinding('source', 'target', {
@@ -154,22 +159,22 @@ describe('JobComms', () => {
         severity: 'error',
       });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       const delivered = await comms.deliverMessages(job);
 
       expect(delivered).toBe(1);
-      expect(waitSpy).toHaveBeenCalledWith(14100, { timeoutMs: 5000 });
+      expect(waitSpy).toHaveBeenCalledWith(14100, { timeoutMs: 5000, password: undefined });
       expect(sendSpy).toHaveBeenCalledTimes(1);
       expect(sendSpy).toHaveBeenCalledWith(
-        mockClient,
-        'session-1',
+        v2Client,
+        'ses-remote-1',
         expect.stringContaining('Schema change detected'),
       );
       expect(comms.getMessagesForJob('target')).toHaveLength(0);
     });
 
     it('returns 0 when no messages exist for job', async () => {
-      const job = makeJob('empty', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('empty', { port: 14100, remoteSessionID: 'ses-remote-1' });
       const delivered = await comms.deliverMessages(job);
       expect(delivered).toBe(0);
     });
@@ -183,28 +188,37 @@ describe('JobComms', () => {
       expect(delivered).toBe(0);
     });
 
+    it('returns 0 when job has no remote session (never the operator session)', async () => {
+      comms.registerJob(makeJob('target'));
+      comms.relayFinding('source', 'target', { finding: 'msg' });
+
+      const job = makeJob('target', { port: 14100, launchSessionID: 'ses-operator' });
+      const delivered = await comms.deliverMessages(job);
+      expect(delivered).toBe(0);
+    });
+
     it('returns 0 when server connection fails', async () => {
-      spyOn(sdkClientMod, 'waitForServer').mockRejectedValue(new Error('connection refused'));
+      spyOn(sdkClientMod, 'v2WaitForServer').mockRejectedValue(new Error('connection refused'));
 
       comms.registerJob(makeJob('target'));
       comms.relayFinding('source', 'target', { finding: 'msg' });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       const delivered = await comms.deliverMessages(job);
       expect(delivered).toBe(0);
     });
 
     it('filters messages by source when filterFrom is specified', async () => {
-      const mockClient = { session: { promptAsync: async () => ({}) } };
-      spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      const sendSpy = spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+      const v2Client = { baseUrl: 'http://127.0.0.1:14100/api', headers: {} };
+      spyOn(sdkClientMod, 'v2WaitForServer').mockResolvedValue(v2Client as any);
+      const sendSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       comms.registerJob(makeJob('target'));
       comms.relayFinding('job-a', 'target', { finding: 'from A' });
       comms.relayFinding('job-b', 'target', { finding: 'from B' });
       comms.relayFinding('job-c', 'target', { finding: 'from C' });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       const delivered = await comms.deliverMessages(job, { filterFrom: ['job-a', 'job-c'] });
 
       expect(delivered).toBe(2);
@@ -215,15 +229,15 @@ describe('JobComms', () => {
       comms.registerJob(makeJob('target'));
       comms.relayFinding('job-a', 'target', { finding: 'from A' });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       const delivered = await comms.deliverMessages(job, { filterFrom: ['nonexistent'] });
       expect(delivered).toBe(0);
     });
 
     it('formats relay prompt with all context fields', async () => {
-      const mockClient = { session: { promptAsync: async () => ({}) } };
-      spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      const sendSpy = spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+      const v2Client = { baseUrl: 'http://127.0.0.1:14100/api', headers: {} };
+      spyOn(sdkClientMod, 'v2WaitForServer').mockResolvedValue(v2Client as any);
+      const sendSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       comms.registerJob(makeJob('target'));
       comms.relayFinding('api-job', 'target', {
@@ -233,7 +247,7 @@ describe('JobComms', () => {
         severity: 'error',
       });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       await comms.deliverMessages(job);
 
       const promptArg = sendSpy.mock.calls[0][2];
@@ -245,14 +259,14 @@ describe('JobComms', () => {
     });
 
     it('formats relay prompt without optional fields', async () => {
-      const mockClient = { session: { promptAsync: async () => ({}) } };
-      spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-      const sendSpy = spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+      const v2Client = { baseUrl: 'http://127.0.0.1:14100/api', headers: {} };
+      spyOn(sdkClientMod, 'v2WaitForServer').mockResolvedValue(v2Client as any);
+      const sendSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined as any);
 
       comms.registerJob(makeJob('target'));
       comms.relayFinding('source', 'target', { finding: 'Simple message' });
 
-      const job = makeJob('target', { port: 14100, launchSessionID: 'session-1' });
+      const job = makeJob('target', { port: 14100, remoteSessionID: 'ses-remote-1' });
       await comms.deliverMessages(job);
 
       const promptArg = sendSpy.mock.calls[0][2];
