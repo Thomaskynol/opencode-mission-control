@@ -1,0 +1,66 @@
+import { getJobByName } from '../lib/job-state';
+import { loadConfig } from '../lib/config';
+import { createJobClient, createV2Client, sendPrompt } from '../lib/sdk-client';
+import { mc_kill } from '../tools/kill';
+import { pauseJob, livePauseOps, pauseTarget } from '../tools/job-pause';
+import { resumeJob, liveResumeOps } from '../tools/job-resume';
+import { answerQuestion } from './forms';
+import { dispatchCommand, type HumanControls } from './commands';
+
+/**
+ * M6 human lane entry: `bun src/orchestrator-cli/index.ts <command>`.
+ * Separate conversational TUI process — talks to the coordinator only via
+ * local APIs (state files, coordinator pure functions, session endpoints
+ * scoped to one execution). Never drives worker internals directly.
+ */
+export function createLiveControls(): HumanControls {
+  return {
+    async pause(name, opts) {
+      const job = await getJobByName(name);
+      if (!job) throw new Error(`Job "${name}" not found.`);
+      const target = pauseTarget(job);
+      const config = await loadConfig();
+      return pauseJob(job, livePauseOps(createV2Client(target.port, config.serverPassword), target.sessionID), opts);
+    },
+    async resume(name, opts) {
+      const job = await getJobByName(name);
+      if (!job) throw new Error(`Job "${name}" not found.`);
+      const target = pauseTarget(job);
+      const config = await loadConfig();
+      return resumeJob(job, liveResumeOps(createV2Client(target.port, config.serverPassword), target.sessionID), opts);
+    },
+    async cancel(name) {
+      // Cancel = stop the process, preserve the work. Only mc_cleanup discards code.
+      const result = await mc_kill.execute({ name });
+      return `Canceled (process stopped, code preserved):\n${result}`;
+    },
+    async answer(name, response) {
+      const config = await loadConfig();
+      const password = config.serverPassword;
+      return answerQuestion(name, response, async (port, sessionID, text) => {
+        await sendPrompt(createJobClient(port, password), sessionID, text);
+      });
+    },
+    async launch(prompt) {
+      return [
+        'Request wrapped with coordinator guards, ready to dispatch via mc_launch:',
+        '',
+        prompt,
+      ].join('\n');
+    },
+  };
+}
+
+async function main(): Promise<void> {
+  const input = process.argv.slice(2).join(' ');
+  try {
+    console.log(await dispatchCommand(input, createLiveControls()));
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
+
+if (import.meta.main) {
+  await main();
+}

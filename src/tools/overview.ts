@@ -1,7 +1,9 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { loadJobState, getRunningJobs, type Job } from '../lib/job-state';
 import { loadPlan } from '../lib/plan-state';
-import { readAllReports, type AgentReport } from '../lib/reports';
+import { readAllReports, formatReportLine, type AgentReport } from '../lib/reports';
+import { getPendingQuestionsForJob } from '../lib/question-relay';
+import { loadRuntimeSnapshot } from '../lib/durable-state';
 import { formatTimeAgo } from '../lib/utils';
 import { getSharedMonitor } from '../lib/orchestrator-singleton';
 
@@ -121,10 +123,66 @@ function formatRecentFailures(jobs: Job[]): string[] {
   });
 }
 
+function formatPausedJobs(reports: AgentReport[]): string[] {
+  // One line per job, by LATEST report overall: an older paused report must
+  // not resurface after the job later reported progress/completion, and
+  // repeated paused reports collapse into one line.
+  const latestByJob = new Map<string, AgentReport>();
+  for (const report of [...reports].sort(
+    (a, b) =>
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  )) {
+    latestByJob.set(report.jobName, report);
+  }
+  const paused = [...latestByJob.values()]
+    .filter((report) => report.status === 'paused')
+    .sort(
+      (a, b) =>
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    );
+
+  if (paused.length === 0) {
+    return ['- None'];
+  }
+
+  return paused.slice(0, 5).map((report) => formatReportLine(report));
+}
+
+function formatPendingQuestions(
+  jobs: Job[],
+  sidecarCount: number,
+): { lines: string[]; count: number } {
+  const lines: string[] = [];
+  let count = 0;
+
+  for (const job of jobs.filter((j) => j.status === 'running')) {
+    const pending = getPendingQuestionsForJob(job.id);
+    for (const q of pending) {
+      count += 1;
+      const opts = q.options.length > 0
+        ? ` (options: ${q.options.map((o) => o.label).join(', ')})`
+        : '';
+      lines.push(`- ${job.name}: "${truncate(q.question, 100)}"${opts}`);
+    }
+  }
+
+  if (sidecarCount > count) {
+    lines.push(`- (+${sidecarCount - count} durable question(s) in sidecar)`);
+    count = sidecarCount;
+  }
+
+  if (lines.length === 0) {
+    return { lines: ['- None'], count: 0 };
+  }
+
+  return { lines: lines.slice(0, 5), count };
+}
+
 function getSuggestedActions(
   jobs: Job[],
   planLoaded: Awaited<ReturnType<typeof loadPlan>>,
   reports: AgentReport[],
+  pendingQuestions: number = 0,
 ): string[] {
   const runningJobs = jobs.filter((job) => job.status === 'running');
   const completedJobs = jobs.filter((job) => job.status === 'completed');
@@ -135,6 +193,12 @@ function getSuggestedActions(
   );
 
   const actions: string[] = [];
+
+  if (pendingQuestions > 0) {
+    actions.push(
+      `${pendingQuestions} question(s) need answers - run mc_answer (others keep running)`,
+    );
+  }
 
   if (blockedReports.length > 0) {
     const names = blockedReports
@@ -192,11 +256,12 @@ export const mc_overview: ToolDefinition = tool({
     'START HERE — Get a complete overview of all Mission Control activity, jobs, plans, and alerts',
   args: {},
   async execute() {
-    const [jobState, runningJobs, plan, reports] = await Promise.all([
+    const [jobState, runningJobs, plan, reports, sidecar] = await Promise.all([
       loadJobState(),
       getRunningJobs(),
       loadPlan(),
       readAllReports(),
+      loadRuntimeSnapshot(),
     ]);
 
     const jobs = jobState.jobs;
@@ -263,8 +328,15 @@ export const mc_overview: ToolDefinition = tool({
     lines.push('', 'Alerts', '------');
     lines.push(...formatAlerts(reports));
 
+    lines.push('', 'Paused', '------');
+    lines.push(...formatPausedJobs(reports));
+
+    const pending = formatPendingQuestions(jobs, sidecar?.pendingQuestions.length ?? 0);
+    lines.push('', 'Questions', '---------');
+    lines.push(...pending.lines);
+
     lines.push('', 'Suggested Actions', '-----------------');
-    lines.push(...getSuggestedActions(jobs, plan, reports));
+    lines.push(...getSuggestedActions(jobs, plan, reports, pending.count));
 
     return lines.join('\n');
   },

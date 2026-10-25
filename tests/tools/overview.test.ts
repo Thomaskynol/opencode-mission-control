@@ -418,3 +418,51 @@ describe('mc_overview', () => {
     });
   });
 });
+
+describe('paused section (review fix)', () => {
+  it('hides a stale paused report once the job reported progress', async () => {
+    mockReadAllReports.mockResolvedValue([
+      {
+        jobId: 'job-1',
+        jobName: 'resumed-job',
+        status: 'paused',
+        message: 'waiting on input',
+        timestamp: new Date(Date.now() - 3600000).toISOString(),
+      },
+      {
+        jobId: 'job-1',
+        jobName: 'resumed-job',
+        status: 'progress',
+        message: 'continuing after answer',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    const result = await mc_overview.execute({}) as unknown as string;
+    const pausedSection = result.split('Paused')[1].split('Questions')[0];
+    expect(pausedSection).not.toContain('resumed-job');
+  });
+
+  it('lists a job once even with several paused reports', async () => {
+    mockReadAllReports.mockResolvedValue([
+      {
+        jobId: 'job-1',
+        jobName: 'stuck-job',
+        status: 'paused',
+        message: 'waiting',
+        timestamp: new Date(Date.now() - 3600000).toISOString(),
+      },
+      {
+        jobId: 'job-1',
+        jobName: 'stuck-job',
+        status: 'paused',
+        message: 'still waiting',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    const result = await mc_overview.execute({}) as unknown as string;
+    const pausedSection = result.split('Paused')[1].split('Questions')[0];
+    expect(pausedSection.match(/stuck-job/g)).toHaveLength(1);
+  });
+});

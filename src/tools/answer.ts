@@ -1,15 +1,12 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { getJobByName } from '../lib/job-state';
-import {
-  findPendingQuestionByJobName,
-  answerPendingQuestion,
-  getPendingQuestionsForJob,
-} from '../lib/question-relay';
+import { createV2Client, v2Prompt } from '../lib/sdk-client';
 import { loadConfig } from '../lib/config';
+import { answerQuestion } from '../orchestrator-cli/forms';
 
 export const mc_answer: ToolDefinition = tool({
   description:
-    'Answer a pending question from a background job. When a serve-mode job\'s agent asks a question via mcp_question, it gets relayed to this session. Use this tool to respond and unblock the agent.',
+    'Answer a pending question from a background job. Checks the live relay first, then the durable sidecar (survives restarts). Unblocks only the asking job; independent fronts keep running.',
   args: {
     name: tool.schema
       .string()
@@ -32,30 +29,14 @@ export const mc_answer: ToolDefinition = tool({
       throw new Error(`Job "${args.name}" is not a serve-mode job or missing session info.`);
     }
 
-    const pending = findPendingQuestionByJobName(args.name);
-    if (!pending) {
-      const allForJob = getPendingQuestionsForJob(job.id);
-      if (allForJob.length === 0) {
-        throw new Error(`No pending question found for job "${args.name}". The question may have already been answered or timed out.`);
-      }
-    }
-
     const config = await loadConfig();
-    const question = pending ?? {
-      jobId: job.id,
-      jobName: job.name,
-      taskSummary: '',
-      partId: 'direct',
-      callID: 'direct',
-      remoteSessionID: job.remoteSessionID,
-      port: job.port,
-      question: '',
-      options: [],
-      detectedAt: Date.now(),
-    };
-
-    await answerPendingQuestion(question, args.response, config.serverPassword);
-
-    return `Answer sent to job "${args.name}": "${args.response}"`;
+    const password = config.serverPassword;
+    // The 2.x server only serves the /api surface: answers travel as a
+    // session text prompt via the v2 client (forms); only permission.*
+    // uses the reply endpoint.
+    return answerQuestion(args.name, args.response, async (port, sessionID, response) => {
+      const client = createV2Client(port, password);
+      await v2Prompt(client, sessionID, response);
+    });
   },
 });
