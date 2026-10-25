@@ -70,7 +70,11 @@ pilots a worker directly.
 
 ```bash
 bun src/orchestrator-cli/index.ts help
-bun src/orchestrator-cli/index.ts follow
+bun src/orchestrator-cli/index.ts start "<NL request>" [--repo R] [--branch B] [--max-parallel N]
+bun src/orchestrator-cli/index.ts complement [--intake ID] <follow-up text>
+bun src/orchestrator-cli/index.ts auto-plan --intake ID --plan-file <model-output.json>
+bun src/orchestrator-cli/index.ts close
+bun src/orchestrator-cli/index.ts follow         # alias: progress
 bun src/orchestrator-cli/index.ts send <large request>
 bun src/orchestrator-cli/index.ts task <name>
 bun src/orchestrator-cli/index.ts pause <name> [--detach]
@@ -83,6 +87,29 @@ bun src/orchestrator-cli/index.ts session <name>   # read-only pointer
 bun src/orchestrator-cli/index.ts log <name>       # last milestone line only
 bun src/orchestrator-cli/index.ts cancel <name>
 ```
+
+### 3.1 Autonomous intake (NL-only public path)
+
+NL in, validated tasks out — the operator never hands over a DAG.
+Full walkthrough with two real model-driven runs in `docs/public-demo.md`:
+
+```bash
+# 1. Capture NL-only intake (persists + prints the planner prompt)
+bun src/orchestrator-cli/index.ts start "Two small helpers with tests plus a README" --repo /tmp/demo/app --branch public/demo-1 --max-parallel 2
+# 2. Feed the printed prompt to the configured model, save strict-JSON answer, validate (fail-closed)
+bun src/orchestrator-cli/index.ts auto-plan --intake <INTAKE> --plan-file /tmp/demo/model-plan.json
+# 3. Dispatch stays with the coordinator loop; watch it read-only
+bun src/orchestrator-cli/index.ts follow      # alias: progress
+bun src/orchestrator-cli/index.ts questions   # pending forms; answer keeps others running
+# 4. Extend the request (same work continues) or detach the view (run continues)
+bun src/orchestrator-cli/index.ts complement --intake <INTAKE> "also handle empty input"
+bun src/orchestrator-cli/index.ts close
+```
+
+Rules: `auto-plan` validates model output (known tasks, existing deps,
+no cycles, repo-relative destinations, no push/publish/deploy) and creates
+nothing on invalid input; a fresh repo without commits fails with the
+minimal preparation instead of guessing a base.
 
 ## 4. Choosing repo, branch, model, and ceiling
 
@@ -206,8 +233,6 @@ Rules that matter:
   transitions without applying (`queued → merged` cannot skip the gate;
   `merged → canceled` cannot un-merge). Only launch-failure recovery
   forces `failed` with an explicit flag.
-- Parallel ceiling is clamped to **4–8**; tmux jobs cannot be
-  paused via session interrupt (use `mc_kill`, code is preserved).
 - Parallel ceiling is clamped to **4–8**; tmux jobs cannot be
   paused via session interrupt (use `mc_kill`, code is preserved).
 - Empty diffs are valid diagnostics: a merge producing

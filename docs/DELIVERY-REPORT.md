@@ -161,5 +161,59 @@ failure pair (`tests/tools/launch.test.ts`, `tests/lib/model-tracker.test.ts`) a
   CLI humana `bun src/orchestrator-cli/index.ts help|follow|send|task|pause|resume|add|answer|questions|order|session|log|cancel`;
   E2E manual em `MANUAL_TEST_PLAN.md` (Nuclear Cleanup antes/depois; `tmc-`; sem push remoto).
 - Evidências locais mantidas em `/tmp/opencode/` (`live-full/`, `live-gaps/`, `final-suite.log`,
-  `final-verify-*.log`, `final-close-*.log`). Sem ZIP obrigatório. Sem perfil global, sem segredos,
+  `final-verify-*.log`, `final-close-*.log`, `public-evidence/`, `final-reconcile-*.log`). Sem ZIP obrigatório. Sem perfil global, sem segredos,
   sem fixtures úteis apagadas.
+
+## 11. Final reconcile (2026-10-25, esta lane — sole writer)
+
+- **O que estava pendente ao abrir a lane**: o lane auto-intake estava
+  inteiro não-commitado — `src/lib/auto-plan.ts`, `src/orchestrator-cli/auto-commands.ts`,
+  3 arquivos de teste e 4 arquivos `src/` modificados (`M coordinator.ts`,
+  `durable-state.ts`, `orchestrator.ts`, `orchestrator-cli/commands.ts`), além do
+  não-rastreado `docs/public-demo.md`. Ou seja: a lacuna central (NL→plano via
+  modelo, validação, replanejamento, persistência, conteúdo-vs-approve/deny,
+  repo sem commit, ciclo completo, 2º pedido) tinha prova viva mas sem commit.
+- **Como foi conectado**: (a) verificado estado (`git status/log/remote`,
+  arquivos intake + `/tmp/opencode/public-evidence/` 74 arquivos presentes);
+  (b) `start|complement|auto-plan|close|follow|progress|questions|order`
+  exercitados via caminhos completos `bun src/orchestrator-cli/index.ts …`
+  com exits capturados sem pipe (válidos 0; intake-inexistente e repo-sem-commit 1,
+  ambos fail-closed com orientação); (c) checks frescos `bun run build` exit 0
+  (`Bundled 222 modules`, `index.js 1.36 MB`) e `bun test` exit 0 (**997 pass,
+  16 skip, 0 fail**, 1013 testes / 65 arquivos — +3 arquivos do lane);
+  sem regressão em `src/`, logo **nenhum `src/` alterado nesta lane**;
+  (d) docs reconciliados honestamente (`matrix-final.md` §20 com REC-1…REC-9,
+  USER-GUIDE §3.1 com comandos copiáveis + remoção de bullet duplicado,
+  public-demo sem formas abreviadas `bun .../`);
+  (e) segredos checados por grep antes dos commits (só `token` como variável
+  local de parsing); (f) 2 commits locais, sem push/PR.
+- **Evidência NL→entrega (exata)**: Caso 1 — pedido NL (`01-start.txt`,
+  intake `2b2851c5-…`) → prompt do planner (`02/02b-planner-prompt*.txt`) →
+  resposta real do modelo (`05/08-generate*.raw.json`, 1ª rejeitada pelo guard
+  `07-autoplan2.txt` exit 1) → plano validado (`09-model-plan.json`,
+  `10-autoplan2.txt` exit 0) → 2 workers tmux + decisão do coordenador
+  (`11-driver.log`, `12-decision-initial.json`) → 3/3 merges (`21-integration-log.txt`)
+  → pós-merge `node --test` 2 pass exit 0 (`21-postmerge-tests.log`) →
+  `mc_report_final` (`22-final-report.md`: `Integrated: 3, Unmet: 0, Unverified: 0`).
+  Caso 2 — pedido distinto (`30-start2.txt`, intake `fa7c436d-…`) → plano
+  distinto (`33-model-plan2.json`, tasks `clamp-helper`/`average-helper`) →
+  plano `48c2ad5f-…`, 2 pass pós-merge (`54-postmerge2.log`), relatório
+  `55-final-report2.md` (`Integrated: 3, Unmet: 1` = trilha do incidente).
+- **Comandos exatos (todos a partir da raiz do produto)**:
+  `bun install` → `bun run build` → `bun test`;
+  `bun src/orchestrator-cli/index.ts start "<NL>" --repo <R> --branch <B> --max-parallel 2` →
+  modelo gera strict-JSON a partir do planner prompt impresso →
+  `bun src/orchestrator-cli/index.ts auto-plan --intake <INTAKE> --plan-file <json>` →
+  `bun src/orchestrator-cli/index.ts follow|progress|questions|order|task|log|session` →
+  `complement|answer|pause|resume|add|cancel|close` (ver `USER-GUIDE.md` §3.1 e
+  `public-demo.md` §Convenção; o produto imprime `Resume with:` absoluto).
+- **Limitações reais**: `auto-plan` não dispara workers (despacho no
+  coordinator loop); recuperação pós-`addJob` exige `resumePlan()` explícito;
+  prompts do modelo nomeando a branch destino podem desviar commits (Caso 2,
+  compensado); `testCommand: none` → `tests skipped` no merge-train (garantia
+  veio do pós-merge); permissões tmux não chegam ao sidecar; retomada do
+  *intake* pós-crash pendente (plano resume validado, intake resume só
+  testado); E2E-E (roteiro fase a fase) segue pendente.
+- **Commits desta lane** (locais, ver `git log`): `8df7cab feat(auto-intake)`
+  (código+testes do lane) e o commit docs deste fechamento (matrix §20 +
+  este §11 + USER-GUIDE + public-demo). Nada publicado.

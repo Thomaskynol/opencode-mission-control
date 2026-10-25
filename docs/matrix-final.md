@@ -228,3 +228,58 @@ tests/lib/coordinator.test.ts tests/lib/reviewer.test.ts` exit 0 —
 **43 pass, 0 fail** (41 na lane targeted +2 guards); `bun run build` exit 0
 (`Bundled 221 modules`); `git status` limpo após commit (só este adendo +
 `docs/targeted-proof.md`); sem push/PR, sem perfil global, sem segredos.
+
+## 20. Adendo final-reconcile (auto-intake + demo pública)
+
+Reconciliação da lacuna central: NL→requisitos/plano/deps/prompts/aceitação
+via modelo, validação runtime, replanejamento adaptativo, persistência+retomada,
+conteúdo vs approve/deny, projeto novo sem commit inicial, ciclo completo
+pedido→workers reais→decisões→verificação/correção→integração→relatório,
+segundo pedido não-codificado.
+
+Código do lane em `8df7cab`
+(`feat(auto-intake)` — `src/lib/auto-plan.ts`, `src/orchestrator-cli/auto-commands.ts`,
+`validateModelDispatch`/`detectGaps` em `coordinator.ts`, intake no sidecar em
+`durable-state.ts`, `startAutonomousPlan`/`complementAutonomousRequest`/`applyModelAdjustment`
+em `orchestrator.ts`, `start|complement|auto-plan|close` em `commands.ts`;
+testes `auto-plan`/`auto-intake`/`auto-commands`). Prova viva em
+`docs/public-demo.md` (evidências numeradas em `/tmp/opencode/public-evidence/`).
+
+| ID | Lacuna | Status | Evidência |
+| --- | --- | --- | --- |
+| REC-1 | NL→requisitos/plano/deps/prompts/aceitação via MODELO (sem DAG prévio) | **Validado** | `buildPlannerPrompt`/`parsePlannerOutput` (`auto-plan.ts`); 2 respostas reais do modelo (`05/32-generate*.raw.json`, sessões `[REDACTED-SESSION-ID]…`) virando 3+3 tasks com deps e acceptance (`06/09/33-model-plan*.json`) |
+| REC-2 | Validação runtime fail-closed (JSON/dep/ciclo/destino/ação) | **Validado** | `parsePlannerOutput`+`assertSafeDestinations`+`assertAuthorizedActions`; Caso 1: eco de "deploy" no prompt rejeitado (`07-autoplan2.txt` exit 1) antes de criar nada; smoke desta rodada: intake desconhecido → exit 1, repo sem commit → exit 1 |
+| REC-3 | Replanejamento adaptativo (decisão do modelo pós-dispatch) | **Verificado** (unidade) + **Validado parcial** (via produto) | `validateRuntimeDecision`/`validateModelDispatch`/`detectGaps`/`applyModelAdjustment` com testes; no ciclo live o replanejamento rodou pela via do produto (`Orchestrator.addJob` p/ `docs-readme-retry` + `reviewJob` PASS `51-*` + merge manual `52-*`); `applyModelAdjustment` puro não foi exercitado de ponta a ponta no ciclo live — segue Verificado, não Validado integral |
+| REC-4 | Persistência + retomada do intake (sidecar, restart-safe) | **Verificado**; retomada pós-crash **Pendente** | `save/load/mutateAutoIntake`, `appendAutoDecision/Question`, `setAutoNextSteps/Status` + `tests/lib/auto-intake.test.ts`; retomada do *plano* pós `kill -9` validada (`live-proof.md` §3), mas retomada do *intake* (`start` → crash → `auto-plan`) não foi exercitada de ponta a ponta — Pendente (não bloqueado) |
+| REC-5 | Conteúdo livre vs approve/deny | **Verificado** + **Validado parcial** | `tests/orchestrator-cli/auto-commands.test.ts` (texto "deny …" em pergunta de conteúdo vai como texto; texto livre em permissão vira `once`+message); caminho permissão validado live (live-gaps G2, form reply); pergunta de conteúdo do intake não teve caso live (questions vazias nos 2 casos) |
+| REC-6 | Projeto novo sem commit inicial | **Validado** | `ensureBaseReady` fail-closed: `03-autoplan-nocommit.txt` exit 1 + preparação mínima `04-init-commit.txt` (`fc7b288`); revalidado no smoke desta rodada (`Repo … has no commits … then retry`, exit 1) |
+| REC-7 | Ciclo completo pedido→workers reais→decisões→verificação/correção→integração→relatório | **Validado** | Caso 1 (`public-demo.md`): intake `2b2851c5-…` → plano `c3325…` → 2 workers tmux + decisão `12-decision-initial.json` → correções (guard + deny + complemento mesma-sessão) → 3/3 merges → pós-merge 2 pass exit 0 → `mc_report_final` `22-final-report.md` (`Integrated: 3, Unmet: 0, Unverified: 0`) → `pre_pr` sem push |
+| REC-8 | Segundo pedido não-codificado (outro domínio, outra decomposição) | **Validado** | Caso 2: clamp/average (`fa7c436d-…` → `48c2ad5f-…`), com 3 incidentes reais recuperados pelo produto (colisão tmux, merge vazio compensado por `reviewJob` PASS, reconciliador parado exigindo `resumePlan()` explícito) |
+| REC-9 | `start\|complement\|auto-plan\|close\|follow\|progress` via caminhos completos | **Verificado** + **Validado** (smoke) | `tests/orchestrator-cli/auto-commands.test.ts` (inclui `not.toContain('.../index.ts')`); smoke desta rodada, todos `bun src/orchestrator-cli/index.ts …`: `start` 0, `complement` 0, `auto-plan` válido 0 / intake-inexistente 1 / repo-sem-commit 1, `close` 0, `follow`/`progress` 0, `questions` 0, `order` 0 |
+
+Limitações reais reafirmadas (não bloqueiam, ficam documentadas):
+1. `auto-plan` (CLI) valida e persiste, mas **não dispara** workers — o
+   despacho continua no coordinator loop (`mc_plan`/driver com os tasks
+   verbatim do plan-file; ponte em `11/41-dispatch-map.json`).
+2. Driver de recuperação precisa de `resumePlan()` explícito após `addJob`
+   (`startReconciler` só roda em `startPlan`) — sem isso, merges não disparam.
+3. Prompts do modelo que nomeiam a branch destino podem levar o worker a
+   commitar nela (Caso 2) — compensado por inspeção da árvore + `reviewJob`
+   independente + merge manual registrado.
+4. Merge-train com `testCommand: none` (teto vindo do modelo) relata
+   `tests skipped` — a garantia funcional veio dos testes pós-merge.
+5. Permissões do TUI em jobs tmux não aparecem no sidecar — resposta foi no
+   TUI do worker (deny + complemento mesma-sessão), registrada em
+   `19-operator-interventions.txt`.
+6. `E2E-E` segue Pendente (roteiro `MANUAL_TEST_PLAN.md` fase a fase não
+   executado; cenários live equivalentes validam no lugar).
+
+Verificação deste fechamento (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`Bundled 222 modules`, `index.js 1.36 MB`,
+`/tmp/opencode/final-reconcile-build.log`); `bun test` → exit 0 —
+**997 pass, 16 skip, 0 fail** (1013 testes / 65 arquivos, +3 arquivos e +28
+pass vs o fechamento anterior pelos testes do lane auto-intake;
+`/tmp/opencode/final-reconcile-test.log`). Smoke CLI acima com exits
+observados um a um (sem pipe mascarando). `git status` limpo após os commits
+deste fechamento; sem push/PR, sem perfil global, sem segredos (grep só acha
+`token` como nome de variável local em `auto-commands.ts`).
