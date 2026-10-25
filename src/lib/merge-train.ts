@@ -2,15 +2,16 @@ import { join } from 'path';
 import { existsSync, lstatSync, rmSync } from 'fs';
 import type { JobSpec } from './plan-types';
 import { gitCommand } from './git';
-import { getIntegrationWorktree } from './integration';
+import { getIntegrationWorktree, withIntegrationLock } from './integration';
 import { extractConflicts } from './utils';
-import { createJobClient, sendPrompt, waitForServer } from './sdk-client';
+import { createV2Client, v2Prompt } from './sdk-client';
+import type { ReviewVerdict } from './reviewer';
 
-export type MergeResult =
-  | { success: true; mergedAt: string; testReport: MergeTestReport }
+export type MergeResult
+  = | { success: true; mergedAt: string; testReport: MergeTestReport }
   | {
       success: false;
-      type: 'conflict' | 'test_failure';
+      type: 'conflict' | 'test_failure' | 'review_blocked';
       files?: string[];
       output?: string;
       testReport?: MergeTestReport;
@@ -31,12 +32,22 @@ export type MergeTestReport = {
   setup: MergeSetupReport;
 };
 
-type MergeTrainConfig = {
+export type MergeTrainConfig = {
   testCommand?: string;
   testTimeout?: number;
   mergeStrategy?: 'squash' | 'ff-only' | 'merge';
   setupCommands?: string[];
   fixBeforeRollbackTimeout?: number;
+  /**
+   * M4: post-integration regression command, run after the main test
+   * command passes. Failure rolls back the merge like a test failure.
+   */
+  regressionCommand?: string;
+  /**
+   * M4: when true, processNext() refuses to merge without an explicit
+   * reviewer verdict=pass. Default false to preserve legacy callers.
+   */
+  requireReviewPass?: boolean;
 };
 
 const DEFAULT_TEST_TIMEOUT_MS = 600000;
@@ -136,6 +147,14 @@ async function rollbackMergeToHead(worktreePath: string, targetHead: string): Pr
   // Reset to the target HEAD
   await gitCommand(['-C', worktreePath, 'reset', '--hard', targetHead]).catch(() => {});
   await gitCommand(['-C', worktreePath, 'clean', '-fd']).catch(() => {});
+}
+
+/**
+ * M5/M7: detect the "nothing to commit" family of git errors. An empty
+ * diff is valid for diagnosis — the merge is a no-op success, not a failure.
+ */
+function isEmptyCommitFailure(output: string): boolean {
+  return /nothing to commit|empty commit|no changes added to commit/i.test(output);
 }
 
 export async function detectTestCommand(worktreePath: string): Promise<string | null> {
@@ -356,7 +375,17 @@ export class MergeTrain {
   }
 
   enqueue(job: JobSpec): void {
+    // M5/M7 wiring: single queue with identifiers — retry/crash must not
+    // duplicate the merge. A job already queued (same id or name) is a no-op.
+    if (this.queue.some((queued) => queued.id === job.id || queued.name === job.name)) {
+      return;
+    }
     this.queue.push(job);
+  }
+
+  /** True when a job with this name is already queued (crash-retry guard). */
+  has(jobName: string): boolean {
+    return this.queue.some((queued) => queued.name === jobName);
   }
 
   getQueue(): JobSpec[] {
@@ -367,7 +396,7 @@ export class MergeTrain {
     this.queue = [];
   }
 
-  async processNext(): Promise<MergeResult> {
+  async processNext(reviewVerdict?: ReviewVerdict | null): Promise<MergeResult> {
     if (this.queue.length === 0) {
       throw new Error('No jobs in queue');
     }
@@ -382,9 +411,131 @@ export class MergeTrain {
       };
     }
 
+    const gateBlock = await this.checkReviewGate(job, reviewVerdict ?? null);
+    if (gateBlock) {
+      return gateBlock;
+    }
+
+    // M4: serialize writers per integration branch; rollback stays inside.
+    return withIntegrationLock(this.integrationWorktree, () =>
+      this.processNextInner(job, reviewVerdict ?? null),
+    );
+  }
+
+  /**
+   * M4 reviewer gate (static part): without verdict=pass there is no merge.
+   * Freshness (job HEAD / integration HEAD vs the reviewed pins) is
+   * re-checked inside the lock in processNextInner.
+   */
+  private async checkReviewGate(job: JobSpec, verdict: ReviewVerdict | null): Promise<MergeResult | null> {
+    if (!verdict) {
+      if (this.config?.requireReviewPass) {
+        return {
+          success: false,
+          type: 'review_blocked',
+          output: `Review blocked: job "${job.name}" requires a reviewer verdict=pass before integration`,
+        };
+      }
+      return null;
+    }
+    if (verdict.verdict !== 'pass' || verdict.blocking) {
+      return {
+        success: false,
+        type: 'review_blocked',
+        output: `Review blocked: job "${job.name}" verdict=fail: ${verdict.reasons.join('; ') || 'no reasons given'}`,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * M4 freshness: an approval pins (reviewedCommit, reviewedBase). Any move
+   * of the job branch or the integration HEAD invalidates it — re-review.
+   * Must run inside the integration lock (TOCTOU otherwise).
+   */
+  private async checkVerdictFreshness(
+    job: JobSpec,
+    verdict: ReviewVerdict,
+    integrationHead: string,
+  ): Promise<MergeResult | null> {
+    if (verdict.verdict !== 'pass' || verdict.blocking) {
+      return {
+        success: false,
+        type: 'review_blocked',
+        output: `Review blocked: job "${job.name}" verdict=fail: ${verdict.reasons.join('; ') || 'no reasons given'}`,
+      };
+    }
+    if (verdict.reviewedBase !== integrationHead) {
+      return {
+        success: false,
+        type: 'review_blocked',
+        output: `Review blocked: job "${job.name}" was approved on base ${verdict.reviewedBase} but integration is now at ${integrationHead} (base moved, re-review required)`,
+      };
+    }
+    if (job.branch) {
+      const jobHead = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', job.branch]);
+      if (jobHead.exitCode === 0 && jobHead.stdout.trim() !== verdict.reviewedCommit) {
+        return {
+          success: false,
+          type: 'review_blocked',
+          output: `Review blocked: job "${job.name}" was approved on commit ${verdict.reviewedCommit} but branch is now at ${jobHead.stdout.trim()} (job moved, re-review required)`,
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * M4 optional post-integration regression: runs after the main test
+   * command passes. Failure rolls back the merge like a test failure.
+   * Returns a blocking MergeResult, or null when green/not configured.
+   */
+  private async runPostIntegrationRegression(
+    timeoutMs: number,
+    headBeforeStr: string,
+  ): Promise<MergeResult | null> {
+    const regressionCommand = this.config?.regressionCommand?.trim();
+    if (!regressionCommand) {
+      return null;
+    }
+    const regression = await runTestCommand(this.integrationWorktree, regressionCommand, timeoutMs);
+    if (regression.success) {
+      return null;
+    }
+    await rollbackMergeToHead(this.integrationWorktree, headBeforeStr);
+    const reason = regression.timedOut
+      ? `Regression timed out after ${timeoutMs}ms`
+      : 'Regression failed';
+    return {
+      success: false,
+      type: 'test_failure',
+      output: regression.output
+        ? `${reason} (${regressionCommand})\n${regression.output}`
+        : `${reason} (${regressionCommand})`,
+      testReport: {
+        status: 'failed',
+        command: regressionCommand,
+        output: regression.output || undefined,
+        timedOut: regression.timedOut || undefined,
+        reason,
+        setup: { status: 'skipped', commands: [] },
+      },
+    };
+  }
+
+  private async processNextInner(job: JobSpec, reviewVerdict: ReviewVerdict | null): Promise<MergeResult> {
+
     // Save the HEAD before the merge so we can rollback if needed
     const headBeforeMerge = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', 'HEAD']);
     const headBeforeStr = headBeforeMerge.stdout.trim();
+
+    // M4: re-validate the verdict pins under the lock (base may have moved).
+    if (reviewVerdict) {
+      const stale = await this.checkVerdictFreshness(job, reviewVerdict, headBeforeStr);
+      if (stale) {
+        return stale;
+      }
+    }
 
     const mergeStrategy = this.config?.mergeStrategy ?? 'squash';
     let mergeResult;
@@ -422,6 +573,20 @@ export class MergeTrain {
       ]);
 
       if (commitResult.exitCode !== 0) {
+        // M5/M7: an empty diff is valid for diagnosis — a merge with no
+        // changes is a no-op success, never an artificial failure.
+        if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
+          await rollbackMerge(this.integrationWorktree);
+          return {
+            success: true,
+            mergedAt: new Date().toISOString(),
+            testReport: {
+              status: 'skipped',
+              reason: 'No changes to merge (empty diff) — treated as no-op success',
+              setup: { status: 'skipped', commands: [] },
+            },
+          };
+        }
         await rollbackMerge(this.integrationWorktree);
         return {
           success: false,
@@ -462,6 +627,20 @@ export class MergeTrain {
       ]);
 
       if (commitResult.exitCode !== 0) {
+        // M5/M7: an empty diff is valid for diagnosis — a merge with no
+        // changes is a no-op success, never an artificial failure.
+        if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
+          await rollbackMerge(this.integrationWorktree);
+          return {
+            success: true,
+            mergedAt: new Date().toISOString(),
+            testReport: {
+              status: 'skipped',
+              reason: 'No changes to merge (empty diff) — treated as no-op success',
+              setup: { status: 'skipped', commands: [] },
+            },
+          };
+        }
         await rollbackMerge(this.integrationWorktree);
         return {
           success: false,
@@ -580,6 +759,10 @@ export class MergeTrain {
           const retestResult = await runTestCommand(this.integrationWorktree, testCommand, timeoutMs);
 
           if (retestResult.success) {
+            const regressionBlock = await this.runPostIntegrationRegression(timeoutMs, headBeforeStr);
+            if (regressionBlock) {
+              return regressionBlock;
+            }
             return {
               success: true,
               mergedAt: new Date().toISOString(),
@@ -616,6 +799,11 @@ export class MergeTrain {
       };
     }
 
+    const regressionBlock = await this.runPostIntegrationRegression(timeoutMs, headBeforeStr);
+    if (regressionBlock) {
+      return regressionBlock;
+    }
+
     return {
       success: true,
       mergedAt: new Date().toISOString(),
@@ -632,12 +820,14 @@ export class MergeTrain {
     };
   }
 
-  async processAll(): Promise<Array<{ job: JobSpec; result: MergeResult }>> {
+  async processAll(
+    verdicts?: Map<string, ReviewVerdict>,
+  ): Promise<Array<{ job: JobSpec; result: MergeResult }>> {
     const results: Array<{ job: JobSpec; result: MergeResult }> = [];
 
     while (this.queue.length > 0) {
       const job = this.queue[0];
-      const result = await this.processNext();
+      const result = await this.processNext(job ? (verdicts?.get(job.name) ?? null) : null);
       results.push({ job, result });
     }
 
@@ -658,15 +848,27 @@ Please fix the failing tests. You have a limited time window to apply fixes befo
   }
 
   private async promptAgentForFix(job: JobSpec, prompt: string): Promise<boolean> {
-    if (!job.port || !job.launchSessionID) {
+    // The fix must reach the REMOTE worker session. launchSessionID is the
+    // local control-center session — prompting it would inject a fix request
+    // into the operator's own session. Without a reachable remote session
+    // the fix is skipped loudly and the merge rolls back.
+    if (!job.port || !job.remoteSessionID) {
+      console.warn(
+        `[MC] fix-before-rollback skipped for job "${job.name}": ` +
+          'no remote worker session (port/remoteSessionID missing), rolling back.',
+      );
       return false;
     }
 
     try {
-      const client = await waitForServer(job.port, { timeoutMs: 10000 });
-      await sendPrompt(client, job.launchSessionID, prompt);
+      const client = createV2Client(job.port);
+      await v2Prompt(client, job.remoteSessionID, prompt);
       return true;
-    } catch {
+    } catch (error) {
+      console.warn(
+        `[MC] fix-before-rollback prompt failed for job "${job.name}": ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
       return false;
     }
   }

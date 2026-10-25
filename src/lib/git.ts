@@ -41,6 +41,38 @@ export async function gitCommand(
 }
 
 /**
+ * Resolve the HEAD commit of a branch or ref.
+ */
+export async function getBranchHead(
+  ref: string,
+  cwd?: string,
+): Promise<{ head: string | null; error?: string }> {
+  const result = await gitCommand(['rev-parse', ref], cwd ? { cwd } : undefined);
+  if (result.exitCode !== 0) {
+    return { head: null, error: result.stderr || `unknown ref ${ref}` };
+  }
+  return { head: result.stdout.trim() || null };
+}
+
+/**
+ * List files changed on `headRef` relative to `baseRef` (triple-dot diff).
+ */
+export async function listChangedFiles(
+  baseRef: string,
+  headRef: string,
+  cwd?: string,
+): Promise<{ files: string[] | null; error?: string }> {
+  const result = await gitCommand(
+    ['diff', '--name-only', `${baseRef}...${headRef}`],
+    cwd ? { cwd } : undefined,
+  );
+  if (result.exitCode !== 0) {
+    return { files: null, error: result.stderr || 'diff failed' };
+  }
+  return { files: result.stdout.split('\n').map((f) => f.trim()).filter(Boolean) };
+}
+
+/**
  * Detect the repository's default branch name.
  * Tries origin/HEAD first (remote default), falls back to checking local main/master.
  */

@@ -88,6 +88,12 @@ export interface JobSpec {
   port?: number;
   serverUrl?: string;
   launchSessionID?: string;
+  /**
+   * Remote worker session on the serve instance (the session that runs the
+   * job). Fix-before-rollback and fork prompts must target THIS session —
+   * never launchSessionID, which is the local control-center session.
+   */
+  remoteSessionID?: string;
   permissionPolicy?: PermissionPolicyConfig;
 }
 
@@ -105,11 +111,12 @@ export const VALID_PLAN_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
 export const VALID_JOB_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
   queued: ['waiting_deps', 'running', 'stopped', 'canceled'],
   waiting_deps: ['running', 'stopped', 'canceled'],
-  running: ['completed', 'failed', 'stopped', 'canceled'],
+  running: ['paused', 'completed', 'failed', 'stopped', 'canceled'],
+  paused: ['running', 'failed', 'stopped', 'canceled'],
   completed: ['ready_to_merge', 'failed', 'stopped', 'canceled'],
   failed: ['ready_to_merge', 'running', 'stopped', 'canceled'],
   ready_to_merge: ['merging', 'needs_rebase', 'stopped', 'canceled'],
-  merging: ['merged', 'conflict', 'stopped', 'canceled'],
+  merging: ['merged', 'failed', 'conflict', 'stopped', 'canceled'],
   merged: ['needs_rebase'],
   conflict: ['ready_to_merge', 'stopped', 'canceled'],
   needs_rebase: ['ready_to_merge', 'stopped', 'canceled'],

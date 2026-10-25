@@ -24,6 +24,7 @@ const ALL_JOB_STATUSES: JobStatus[] = [
   'queued',
   'waiting_deps',
   'running',
+  'paused',
   'completed',
   'failed',
   'ready_to_merge',
@@ -174,6 +175,12 @@ describe('plan-types', () => {
 
     it('should support failed job retry: failed -> ready_to_merge', () => {
       expect(isValidJobTransition('failed', 'ready_to_merge')).toBe(true);
+    });
+
+    it('should support merge failure and kill: merging -> failed, running/paused -> stopped', () => {
+      expect(isValidJobTransition('merging', 'failed')).toBe(true);
+      expect(isValidJobTransition('running', 'stopped')).toBe(true);
+      expect(isValidJobTransition('paused', 'stopped')).toBe(true);
     });
   });
 

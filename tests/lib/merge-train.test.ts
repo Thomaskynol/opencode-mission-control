@@ -533,15 +533,13 @@ describe('fix-before-rollback', () => {
     mock.restore();
   });
 
-  it('serve-mode job: prompts agent on test failure and retests', async () => {
+  it('serve-mode job: prompts the REMOTE worker session on test failure and retests', async () => {
     await createBranchCommit(testRepo.repoDir, 'feature-fix', 'fix.txt', 'fix\n');
 
     const marker = join(testRepo.integrationWorktree, '.retest-pass');
     const testScript = `test -f '${marker}'`;
 
-    const mockClient = { session: {} };
-    spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-    spyOn(sdkClientMod, 'sendPrompt').mockImplementation(async () => {
+    const promptSpy = spyOn(sdkClientMod, 'v2Prompt').mockImplementation(async () => {
       writeFileSync(marker, 'fixed');
     });
 
@@ -552,16 +550,15 @@ describe('fix-before-rollback', () => {
     });
     const job = makeJob('feature-fix');
     job.port = 14100;
-    job.launchSessionID = 'session-abc';
+    job.remoteSessionID = 'session-remote';
     train.enqueue(job);
 
     const result = await train.processNext();
 
     expect(result.success).toBe(true);
-    expect(sdkClientMod.waitForServer).toHaveBeenCalledWith(14100, { timeoutMs: 10000 });
-    expect(sdkClientMod.sendPrompt).toHaveBeenCalledWith(
-      mockClient,
-      'session-abc',
+    expect(promptSpy).toHaveBeenCalledTimes(1);
+    expect(promptSpy.mock.calls[0][1]).toBe('session-remote');
+    expect(promptSpy.mock.calls[0][2]).toEqual(
       expect.stringContaining('Test Failure in Merge Train'),
     );
   });
@@ -575,8 +572,7 @@ describe('fix-before-rollback', () => {
     );
 
     const mockClient = { session: {} };
-    spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-    spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+    spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(mockClient as any);
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       testCommand: 'false',
@@ -585,7 +581,7 @@ describe('fix-before-rollback', () => {
     });
     const job = makeJob('feature-still-broken');
     job.port = 14100;
-    job.launchSessionID = 'session-abc';
+    job.remoteSessionID = 'session-remote';
     train.enqueue(job);
 
     const result = await train.processNext();
@@ -610,7 +606,7 @@ describe('fix-before-rollback', () => {
       testRepo.integrationWorktree,
     );
 
-    const waitSpy = spyOn(sdkClientMod, 'waitForServer');
+    const promptSpy = spyOn(sdkClientMod, 'v2Prompt');
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       testCommand: 'false',
@@ -625,7 +621,7 @@ describe('fix-before-rollback', () => {
     if (!result.success) {
       expect(result.type).toBe('test_failure');
     }
-    expect(waitSpy).not.toHaveBeenCalled();
+    expect(promptSpy).not.toHaveBeenCalled();
 
     const headAfter = await mustExec(
       ['git', 'rev-parse', 'HEAD'],
@@ -642,7 +638,7 @@ describe('fix-before-rollback', () => {
       testRepo.integrationWorktree,
     );
 
-    spyOn(sdkClientMod, 'waitForServer').mockRejectedValue(new Error('connection refused'));
+    spyOn(sdkClientMod, 'v2Prompt').mockRejectedValue(new Error('connection refused'));
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       testCommand: 'false',
@@ -651,7 +647,7 @@ describe('fix-before-rollback', () => {
     });
     const job = makeJob('feature-sdk-fail');
     job.port = 14100;
-    job.launchSessionID = 'session-abc';
+    job.remoteSessionID = 'session-remote';
     train.enqueue(job);
 
     const result = await train.processNext();
@@ -671,9 +667,7 @@ describe('fix-before-rollback', () => {
   it('serve-mode job: prompt includes job name and test output', async () => {
     await createBranchCommit(testRepo.repoDir, 'feature-prompt-check', 'check.txt', 'check\n');
 
-    const mockClient = { session: {} };
-    spyOn(sdkClientMod, 'waitForServer').mockResolvedValue(mockClient as any);
-    const sendSpy = spyOn(sdkClientMod, 'sendPrompt').mockResolvedValue();
+    const sendSpy = spyOn(sdkClientMod, 'v2Prompt').mockResolvedValue(undefined);
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       testCommand: 'echo "assertion failed: expected 3 got 4" && false',
@@ -682,7 +676,7 @@ describe('fix-before-rollback', () => {
     });
     const job = makeJob('feature-prompt-check');
     job.port = 14100;
-    job.launchSessionID = 'session-abc';
+    job.remoteSessionID = 'session-remote';
     train.enqueue(job);
 
     await train.processNext();
@@ -693,7 +687,7 @@ describe('fix-before-rollback', () => {
     expect(promptArg).toContain('assertion failed');
   });
 
-  it('serve-mode job: does not prompt when launchSessionID is missing', async () => {
+  it('serve-mode job: does not prompt when remoteSessionID is missing (never the launch session)', async () => {
     await createBranchCommit(testRepo.repoDir, 'feature-no-session', 'ns.txt', 'ns\n');
 
     const headBefore = await mustExec(
@@ -701,7 +695,7 @@ describe('fix-before-rollback', () => {
       testRepo.integrationWorktree,
     );
 
-    const waitSpy = spyOn(sdkClientMod, 'waitForServer');
+    const promptSpy = spyOn(sdkClientMod, 'v2Prompt');
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       testCommand: 'false',
@@ -710,12 +704,15 @@ describe('fix-before-rollback', () => {
     });
     const job = makeJob('feature-no-session');
     job.port = 14100;
+    // Only the local launch session is known: the fix must be skipped, never
+    // sent to the control-center session.
+    job.launchSessionID = 'session-launch';
     train.enqueue(job);
 
     const result = await train.processNext();
 
     expect(result.success).toBe(false);
-    expect(waitSpy).not.toHaveBeenCalled();
+    expect(promptSpy).not.toHaveBeenCalled();
 
     const headAfter = await mustExec(
       ['git', 'rev-parse', 'HEAD'],

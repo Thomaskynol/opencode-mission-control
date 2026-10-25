@@ -143,3 +143,302 @@ export async function forkJobSession(
 
   return newSessionId;
 }
+
+// ---------------------------------------------------------------------------
+// v2 session API (opencode 2.1.4 `serve`, JSON under the `/api` prefix).
+//
+// The legacy `OpencodeClient` above targets unprefixed paths the 2.x server
+// no longer serves, so the helpers below speak the verified 2.1.4 surface
+// directly over fetch: session.create {model:{providerID,id,variant},
+// agent, location:{directory}, permissions} plus prompt / generate /
+// interrupt / background / wait / log / message / active / fork / move /
+// compact. Additive only: nothing above this line changes.
+// ---------------------------------------------------------------------------
+
+/** Model pin used at session creation: exact providerID/id/variant triple. */
+export interface V2ModelRef {
+  providerID: string;
+  id: string;
+  variant?: string;
+}
+
+/** Permission rule as accepted by the 2.1.4 session endpoints. */
+export interface V2PermissionRule {
+  action: string;
+  resource: string;
+  effect: 'allow' | 'deny' | 'ask';
+}
+
+/** Subset of Session.Info returned by the 2.1.4 server. */
+export interface V2SessionInfo {
+  id: string;
+  projectID: string;
+  agent?: string;
+  model?: V2ModelRef;
+  location: { directory: string };
+  permissions?: V2PermissionRule[];
+  title?: string;
+}
+
+export interface V2CreateSessionBody {
+  id?: string;
+  parentID?: string;
+  title?: string;
+  agent?: string;
+  model?: V2ModelRef;
+  location?: { directory: string };
+  permissions?: V2PermissionRule[];
+}
+
+/** Minimal client for the 2.1.4 `/api` surface (fetch-based, no SDK bump). */
+export interface V2Client {
+  baseUrl: string;
+  headers: Record<string, string>;
+}
+
+export function createV2Client(port: number, password?: string): V2Client {
+  const baseUrl = `http://127.0.0.1:${port}/api`;
+  const headers: Record<string, string> = {};
+
+  if (password) {
+    headers['Authorization'] =
+      'Basic ' + Buffer.from('opencode:' + password).toString('base64');
+  }
+
+  return { baseUrl, headers };
+}
+
+async function v2Request(
+  client: V2Client,
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(client.baseUrl + path, {
+      method,
+      headers: {
+        ...client.headers,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+  } catch (error) {
+    throw new Error(
+      `v2 ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Never echo auth headers or credentials into errors.
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(`v2 ${method} ${path} failed (${response.status}): ${detail}`);
+  }
+
+  const text = await response.text();
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`v2 ${method} ${path} returned non-JSON output`);
+  }
+}
+
+function unwrapData<T>(payload: unknown, what: string): T {
+  if (payload !== null && typeof payload === 'object' && 'data' in payload) {
+    return (payload as { data: T }).data;
+  }
+  throw new Error(`v2 ${what} response is missing the data envelope`);
+}
+
+async function v2RequestText(
+  client: V2Client,
+  method: string,
+  path: string,
+): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(client.baseUrl + path, {
+      method,
+      headers: { ...client.headers },
+    });
+  } catch (error) {
+    throw new Error(
+      `v2 ${method} ${path} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Never echo auth headers or credentials into errors.
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(`v2 ${method} ${path} failed (${response.status}): ${detail}`);
+  }
+
+  return response.text();
+}
+
+export async function v2CreateSession(
+  client: V2Client,
+  body: V2CreateSessionBody,
+): Promise<V2SessionInfo> {
+  const payload = await v2Request(client, 'POST', '/session', body);
+  return unwrapData<V2SessionInfo>(payload, 'create session');
+}
+
+export async function v2GetSession(
+  client: V2Client,
+  sessionID: string,
+): Promise<V2SessionInfo> {
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}`,
+  );
+  return unwrapData<V2SessionInfo>(payload, 'get session');
+}
+
+export async function v2ActiveSessions(client: V2Client): Promise<V2SessionInfo[]> {
+  const payload = await v2Request(client, 'GET', '/session/active');
+  return unwrapData<V2SessionInfo[]>(payload, 'active sessions');
+}
+
+export async function v2Prompt(
+  client: V2Client,
+  sessionID: string,
+  text: string,
+): Promise<unknown> {
+  const payload = await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/prompt`,
+    { text },
+  );
+  return unwrapData<unknown>(payload, 'prompt');
+}
+
+export async function v2Generate(
+  client: V2Client,
+  sessionID: string,
+  prompt: string,
+): Promise<unknown> {
+  // The 2.1.4 server returns the raw generate payload (no data envelope).
+  return v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/generate`,
+    { prompt },
+  );
+}
+
+export async function v2Interrupt(
+  client: V2Client,
+  sessionID: string,
+  resume = false,
+): Promise<unknown> {
+  // The 2.1.4 server returns {"interrupted":bool} (no data envelope).
+  const path =
+    `/session/${encodeURIComponent(sessionID)}/interrupt` + (resume ? '?resume=true' : '');
+  return v2Request(client, 'POST', path);
+}
+
+export async function v2Background(
+  client: V2Client,
+  sessionID: string,
+): Promise<unknown> {
+  // 204 with an empty body on success.
+  return v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/background`,
+  );
+}
+
+export async function v2Wait(client: V2Client, sessionID: string): Promise<unknown> {
+  // 204 with an empty body once the loop is idle.
+  return v2Request(
+    client,
+    'POST',
+    `/experimental/session/${encodeURIComponent(sessionID)}/wait`,
+  );
+}
+
+export async function v2SessionLog(
+  client: V2Client,
+  sessionID: string,
+): Promise<string> {
+  // Server-sent events stream; returned as raw text for the caller to parse.
+  return v2RequestText(
+    client,
+    'GET',
+    `/experimental/session/${encodeURIComponent(sessionID)}/log`,
+  );
+}
+
+export async function v2Messages(
+  client: V2Client,
+  sessionID: string,
+  limit?: number,
+): Promise<unknown> {
+  const query = limit !== undefined ? `?limit=${limit}` : '';
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}/message${query}`,
+  );
+  return unwrapData<unknown>(payload, 'messages');
+}
+
+export async function v2GetMessage(
+  client: V2Client,
+  sessionID: string,
+  messageID: string,
+): Promise<unknown> {
+  const payload = await v2Request(
+    client,
+    'GET',
+    `/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(messageID)}`,
+  );
+  return unwrapData<unknown>(payload, 'message');
+}
+
+export async function v2ForkSession(
+  client: V2Client,
+  sessionID: string,
+  before?: string,
+): Promise<V2SessionInfo> {
+  const payload = await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/fork`,
+    before !== undefined ? { before } : {},
+  );
+  return unwrapData<V2SessionInfo>(payload, 'fork session');
+}
+
+export async function v2MoveSession(
+  client: V2Client,
+  sessionID: string,
+  directory: string,
+): Promise<unknown> {
+  // 204 with an empty body on success.
+  return v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/move`,
+    { directory },
+  );
+}
+
+export async function v2CompactSession(
+  client: V2Client,
+  sessionID: string,
+): Promise<unknown> {
+  const payload = await v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/compact`,
+    {},
+  );
+  return unwrapData<unknown>(payload, 'compact session');
+}
