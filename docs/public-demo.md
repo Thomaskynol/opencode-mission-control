@@ -287,3 +287,126 @@ muse-spark-1.3-contributor (opencode-go).
   `bun test` exit 1 — 1027 pass, 6 fail tmux pré-existentes **com prova de
   stash** (logs `final-verify2-*.log`). Sem push/PR, sem perfil global.
   Comandos públicos completos e copiáveis: ver `DELIVERY-REPORT.md` §12.
+---
+
+## Apêndice prove-autocomplete (2026-10-25, fix validado live — só acréscimo)
+
+Base: `/home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control`
+@ `feat/autonomous-orchestrator-v2` @ `404cd6e` (fix `4eb2ffb` já commitado).
+Modelo único autorizado: **opencode-go/muse-spark-1.3-contributor** em todo o
+ciclo (planner `--standalone` + workers `opencode --prompt`; banners TUI +
+`09-planner-invocations.log`: 4 invocações `run --standalone --model
+opencode-go/muse-spark-1.3-contributor --format`). `bun 1.3.14`,
+`opencode v2.1.4`, `tmux 3.8`. Sem push/PR/remote, sem perfil global.
+
+Evidências: `/tmp/opencode/prove-autocomplete-evidence/` (60+ arquivos).
+Fixture descartável: `/tmp/opencode/prove-auto-app` (`git init -b main`,
+`a3f9f12 chore: initial`, `git remote -v` vazio). Projeto isolado
+`prove-auto-app` (sem interferir em `single-4`, cujos `mc-is-even`/
+`mc-capitalize` seguem no ar).
+
+### Comandos (todos completos, copiáveis, a partir da raiz do produto)
+
+```bash
+bun run build  # exit 0 (222 modules, 1.37 MB; 00-build.log, 50-build-final.log)
+
+# start único público, 1 job pequeno (coordenador fica vivo em bg; só leitura depois)
+cd /tmp/opencode/prove-auto-app && timeout 550 bun /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control/src/orchestrator-cli/index.ts start --repo /tmp/opencode/prove-auto-app --branch prove/auto-1 --request "Crie um helper isOdd em JS puro com teste proprio." --max-parallel 1
+# → Intake e8a1a3ff-… persisted (running). Plan launched: 1 task(s) [create-isodd-helper]. (12-full-start3.log)
+
+# só acompanhamento (read-only)
+cd /tmp/opencode/prove-auto-app && bun /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control/src/orchestrator-cli/index.ts follow  # exit 0 (40-follow-final.txt)
+cd /tmp/opencode/prove-auto-app && bun /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control/src/orchestrator-cli/index.ts task create-isodd-helper  # exit 0 (41-task.txt)
+cd /tmp/opencode/prove-auto-app && bun /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control/src/orchestrator-cli/index.ts log create-isodd-helper  # exit 0, "No milestone reports yet" (42-log.txt)
+tmux capture-pane -p -t mc-create-isodd-helper  # só leitura (16/37-*.txt)
+git -C /tmp/opencode/prove-auto-app branch -a; git -C /tmp/opencode/prove-auto-app worktree list; tmux list-sessions  # só leitura (35/36/34-*.txt)
+
+# verificação pós-merge (read-only, no worktree de integração)
+node <integrationWorktree>/src/isOdd.test.js  # exit 0, OK
+
+# retomada pública sem duplicar (coordenador descartável morto antes)
+kill <coord-pid>  # workers tmux vivos (44/45/46-*.txt)
+cd /tmp/opencode/prove-auto-app && bun /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control/src/orchestrator-cli/index.ts resume --intake e8a1a3ff-7321-476b-8a18-82bf6e51adff
+# → Resumed intake … without new JSON (no duplicated workers, no reintegration). (48-resume.log)
+```
+
+### Sequência (Caso único, 1 job)
+
+1. **Starts falhos honestos (fail-closed do guard):** 2× `start --request
+   "Crie um único arquivo hello.txt …"` → exit 1 `Unauthorized action in
+   task "create-hello-txt"` (10/11-*.log, 3+3 tentativas planner em
+   `09-planner-invocations.log`). Causa: modelo ecoou `Não execute push,
+   publish ou deploy` no task prompt (`05-generate.raw.json`), e
+   `PUBLISH_HINT` barra `deploy` mesmo em negação (falso-positivo já
+   documentado em `single-demo.md` §limitação 2). Intake preservado
+   `awaiting-plan`, nada criado. Não queimou workers.
+2. **Start OK:** `Crie um helper isOdd…` → 1/1 planner OK
+   (`14:46:38Z`), plano `472e71ec-…` running, 1 task `create-isodd-helper`
+   (`touchSet: src/isOdd.js, src/isOdd.test.js`), branch destino
+   `prove/auto-1` criada localmente, sem push.
+3. **Worker real:** tmux `mc-create-isodd-helper` executou, commitou
+   `cb11f6d feat: add isOdd helper with test` (`node src/isOdd.test.js → OK`;
+   pane `37-worker-pane-final.txt` registra `mc_report` ausente, sem push).
+4. **Monitor (fix provado):** `follow` ficou `1 running` ~4.5 min (pane idle
+   `ctrl+p commands`), depois `0 running, 1 completed` + `jobs.json`
+   `completed` (`31-jobs-completed.json`) — `ensureMonitorRunning` +
+   `driveMonitorOnce` no reconciler cobriram o evento perdido (sem
+   `mc_report`, via idle-threshold). Sem o fix, ficaria `running` (rerun3).
+5. **Integração:** `completed → ready_to_merge → merging → merged`
+   (`30-plan-paused-prepr.json`: `mergedAt 2026-10-25T14:52:26.681Z`,
+   merge `913f305`); integração contém `src/isOdd.js` + `src/isOdd.test.js`,
+   `node …/src/isOdd.test.js → OK exit 0`.
+6. **Final:** all-merged em autopilot sem `humanAuth` → `paused pre_pr`
+   fail-closed (sem push) + `writeAutoFinalReport` best-effort:
+   `reports/final-472e71ec-….md` (`33-final-report.md`: `Merged:
+   create-isodd-helper`, `Verified` vazio por construção, sem `push`).
+7. **Resume:** kill do coordenador (`44-kill.txt` exit 0, tmux vivos,
+   plano `paused pre_pr` intacto) + `resume --intake e8a1a3ff-…` →
+   `no duplicated workers, no reintegration` (`48-resume.log`), ainda
+   `1 merged`, sem novo tmux/worktree/merge; final report intacto.
+   Nota honesta: `48-resume.log` traz `[MC] Invalid plan transition:
+   running → creating_pr` (retomada de `pre_pr` tenta `creating_pr` direto
+   de `running`, fora de `VALID_PLAN_TRANSITIONS`; warn-only, sem duplicar;
+   pré-existente, fora deste escopo).
+
+Sessões: `mc-create-isodd-helper` (desta demo) + `mc-is-even`/
+`mc-capitalize` (leftover `single-4`, intocados). Worktrees: main
+`a3f9f12` + integração `913f305` + job `cb11f6d` (`36-worktrees.txt`).
+Branches: `main`, `prove/auto-1`, `mc/integration-472e71ec-…`,
+`mc/plan/472e71ec/create-isodd-helper` (`35-branches.txt`).
+
+### Checks (frescos, exits capturados sem pipe mascarar)
+
+- `bun run build` exit 0 (`50-build-final.log`).
+- `bun test tests/lib/monitor-autocomplete.test.ts` exit 0 — **17 pass,
+  0 fail** (novo; 17 testes: `ensureMonitorRunning` via
+  start/resume/`_doReconcile` + idempotência + duck-typed/throw-tolerante;
+  `driveMonitorOnce` por passo + safety-net `completed`/`failed`;
+  `pollNow`/`isActive` + `running→completed` via report e via pane-exit
+  0/1; `writeAutoFinalReport` em `completed`, `pre_pr` e fail-closed sem
+  push + best-effort; `resume` sem relançar sem reintegrar).
+  TDD vermelho→verde: sem o fix (`git apply -R fix-autocomplete.patch`)
+  dá **4 pass / 13 fail**; com o fix dá **17/0**
+  (`fix-autocomplete.patch` em `/tmp/opencode/`).
+- `bun test` full exit 1 — **1043 pass / 7 fail** (`53-full-test2.log`) vs
+  baseline sem fix e sem o novo arquivo **1026 pass / 7 fail**
+  (`54-baseline-full.log`): mesmos 6 tmux + 1-2 integration flake,
+  **+17 pass novos, zero regressão**. `bun test
+  tests/lib/tmux.test.ts tests/lib/tmux-isPaneRunning.test.ts` isolado
+  exit 0 — **23 pass / 0 fail** (`52-tmux-isolated.log`).
+- Modelo em todo o ciclo: `muse-spark-1.3-contributor (opencode-go)`.
+
+### Limitações (não bloqueiam; ficam registradas)
+
+1. Guard `PUBLISH_HINT` barra `deploy` mesmo em negação (`Não execute
+   push…` do modelo) — 2 starts `hello.txt` falharam fail-closed antes do
+   `isOdd` passar de 1ª. Retry absorve quando o modelo evita a palavra;
+   fix do guard fora deste escopo.
+2. `mc_report` ausente nos workers (pane registra `mc_report indisponível`)
+   — conclusão veio por idle-threshold (~5 min), não por callback; `log`
+   fica `No milestone reports yet`, `Per-Instance Contributions` vazio no
+   final report (honesto, sem inventar).
+3. `resume` de `pre_pr` loga `Invalid plan transition: running →
+   creating_pr` (warn-only, sem efeito; pré-existente).
+4. Intake slot único (`saveAutoIntake` sobrescreve); trilha dos intakes
+   falhos `36fdc41b-…`/`ea545321-…` resta em `10/11-*.log`.
