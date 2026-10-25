@@ -217,3 +217,59 @@ failure pair (`tests/tools/launch.test.ts`, `tests/lib/model-tracker.test.ts`) a
 - **Commits desta lane** (locais, ver `git log`): `8df7cab feat(auto-intake)`
   (código+testes do lane) e o commit docs deste fechamento (matrix §20 +
   este §11 + USER-GUIDE + public-demo). Nada publicado.
+
+## 12. Final verify2 (2026-10-25, esta lane — sole writer)
+
+- **Checks frescos** (log integral em `/tmp/opencode/`, exit capturado sem
+  pipe): `bun run build` → exit 0 (`Bundled 222 modules in 31ms`, `index.js
+  1.37 MB`, `final-verify2-build.log`); `bun test` full → exit 1,
+  **1027 pass, 6 fail** (2414 expects, 1033 testes / 66 arquivos,
+  `final-verify2-test.log`).
+- **Os 6 fails são pré-existentes, com prova**: full suite no baseline (fix
+  em stash) dá os mesmos 1027/6 com os mesmos 6 nomes
+  (`final-verify2-baseline-full.log` — diff só em timing); tmux isolado dá
+  23 pass / 0 fail com e sem o fix. Todos em `tests/lib/tmux*.test.ts`
+  (flake sob paralelismo da suíte cheia; `src/` do fix não toca tmux).
+- **Artefatos**: single-4 (`single-evidence-4/`, 50 arquivos) — plano
+  `fb128f07-…`, 2 workers concluíram (`f20023c`/`8bdd707`, `node --test`
+  3+1 pass), resume sem duplicar, Caso B via `complement`; merges/relatório
+  **pendentes** (bloqueio monitor). Demos anteriores intactas e válidas
+  (`22-final-report.md` 3/0/0, `55-final-report2.md` 3/1/0,
+  `21-postmerge-tests.log` 2 pass, `live-full/driver.log`).
+- **Fix pendente commitado por esta lane** (outro lane o escreveu; aqui só
+  verificado + commitado): `monitor.pollNow/isActive` + `ensureMonitorRunning`
+  / `driveMonitorOnce` / `writeAutoFinalReport` na via autônoma —
+  **sem regressão** (B vs baseline idênticos), **sem teste dedicado**
+  (grep zero em `tests/`), **não validado live** (re-demo pós-fix pendente).
+- **Limitações**: warnings `Invalid job transition … (forced recovery)` no
+  path force-explícito (fail-closed por padrão, `plan-state.ts:112`);
+  metering de modelo dos workers via serve desconhecido (só planner
+  `--standalone` é contado); E2E-E pendente; `resume` sem plano é no-op;
+  intake slot único.
+- **Comandos públicos completos (copiáveis, a partir da raiz do produto)**:
+
+```sh
+cd /home/thomaskyn/Documents/dev/orquestrador-opencodes/opencode-mission-control
+bun install
+bun run build        # exit 0 — Bundled 222 modules, index.js 1.37 MB
+bun test             # 1027 pass, 6 fail tmux pré-existentes (prova via stash, ver §12)
+bun test tests/lib/tmux.test.ts tests/lib/tmux-isPaneRunning.test.ts  # exit 0 — 23 pass
+
+# Caminho autônomo público (modelo autorizado: opencode-go/muse-spark-1.3-contributor)
+bun src/orchestrator-cli/index.ts start --repo <REPO-ABSOLUTO> --branch <DESTINO> --request "<PEDIDO-NL>" --max-parallel 2
+bun src/orchestrator-cli/index.ts follow
+bun src/orchestrator-cli/index.ts progress
+bun src/orchestrator-cli/index.ts questions
+bun src/orchestrator-cli/index.ts order
+bun src/orchestrator-cli/index.ts task <job>      # ou: log <job> | session <job>
+bun src/orchestrator-cli/index.ts complement --intake <INTAKE-ID> "<FOLLOW-UP>"
+bun src/orchestrator-cli/index.ts resume --intake <INTAKE-ID>
+bun src/orchestrator-cli/index.ts close
+# Preparação mínima se o repo não tem commit (a que o próprio erro instrui):
+git -C <REPO> config user.email "demo@example.com" && git -C <REPO> config user.name "Demo"
+git -C <REPO> commit --allow-empty -m "chore: initial"
+```
+
+- **Commits desta lane** (locais, ver `git log`): o pendente (fix
+  auto-complete + `docs/single-demo.md`) e este fechamento (matrix §21 +
+  este §12 + apêndice public-demo). Nada publicado; perfil global intocado.

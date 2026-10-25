@@ -265,3 +265,25 @@ git status --short
 Sessões: tmux `mc-*` dos dois casos (a limpar no teardown); serves: nenhum
 (modo TUI); sem push/PR/remote. Modelo o tempo todo
 muse-spark-1.3-contributor (opencode-go).
+
+---
+
+## Apêndice final-verify2 (2026-10-25, só acréscimo — nada acima reescrito)
+
+- **Demo mínima single-4** (documentada em `docs/single-demo.md` rerun3,
+  `/tmp/opencode/single-evidence-4/`, 50 arquivos): `start` único público →
+  planner OK (retry absorve auth-fail + extract-flake) → plano `fb128f07-…`
+  (3 tasks) → 2 workers concluíram e commitaram (`f20023c`/`8bdd707`,
+  `node --test` 3+1 pass, verificação read-only) → **parou em `2 running`**:
+  a via autônoma CLI nunca chamava `monitor.start()`, `complete` nunca
+  disparou, `reports/` vazio. Kill + `resume --intake` sem duplicar e
+  `complement` Caso B funcionaram pela via pública. Leftover: tmux
+  `mc-capitalize`/`mc-is-even` (workers da demo, encerrada) seguem no ar.
+- **Fix commitado (não validado live)**: `ensureMonitorRunning` /
+  `driveMonitorOnce` / `writeAutoFinalReport` na via autônoma CLI —
+  implementado, sem regressão (full suite 1027/6 idêntica ao baseline em
+  stash; tmux isolado 23/0), sem teste dedicado, re-demo pós-fix pendente.
+- **Checks desta lane**: `bun run build` exit 0 (222 modules, 1.37 MB);
+  `bun test` exit 1 — 1027 pass, 6 fail tmux pré-existentes **com prova de
+  stash** (logs `final-verify2-*.log`). Sem push/PR, sem perfil global.
+  Comandos públicos completos e copiáveis: ver `DELIVERY-REPORT.md` §12.

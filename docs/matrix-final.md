@@ -283,3 +283,79 @@ pass vs o fechamento anterior pelos testes do lane auto-intake;
 observados um a um (sem pipe mascarando). `git status` limpo após os commits
 deste fechamento; sem push/PR, sem perfil global, sem segredos (grep só acha
 `token` como nome de variável local em `auto-commands.ts`).
+
+## 21. Adendo final-verify2 (caminho autônomo completo + consolidação)
+
+Escopo: checks frescos + prova de pré-existência dos fails + validação de
+artefatos (demo mínima single-4 + demos live anteriores) + commit local do
+pendente. Sem push/PR, sem perfil global, modelo autorizado.
+
+### 21.1 Checks frescos (log integral, exit capturado sem pipe)
+
+| # | Comando | Resultado | Evidência |
+| --- | --- | --- | --- |
+| A | `bun run build` | **exit 0** — `Bundled 222 modules in 31ms`, `index.js 1.37 MB` | `/tmp/opencode/final-verify2-build.log` |
+| B | `bun test` (full, com o fix pendente aplicado) | **exit 1** — **1027 pass, 6 fail**, 2414 expects, 1033 testes / 66 arquivos | `/tmp/opencode/final-verify2-test.log` |
+| C | `bun test` (full, baseline com fix em stash) | **exit 1** — **1027 pass, 6 fail**, mesmos 6 nomes, mesmos totais | `/tmp/opencode/final-verify2-baseline-full.log` |
+| D | `bun test tests/lib/tmux.test.ts tests/lib/tmux-isPaneRunning.test.ts` (com fix) | **exit 0** — **23 pass, 0 fail** | `/tmp/opencode/final-verify2-tmux-withchanges.log` |
+| E | idem D (baseline em stash) | **exit 0** — **23 pass, 0 fail** | `/tmp/opencode/final-verify2-baseline-tmux.log` |
+
+Os 6 fails são **pré-existentes e ambientais, com prova** (não classificados
+por ausência): B vs C diferem só em timing (nomes dos 6 idênticos, totais
+idênticos 1027/6/2414/1033/66); D e E verdes isolados, com e sem o fix —
+flake sob paralelismo da suíte cheia (tmux server compartilhado; todos em
+`tests/lib/tmux*.test.ts`: 4× `isPaneRunning`, 1× `capturePane` inválido,
+1× `tmux.test.ts isPaneRunning`). `src/` do fix não toca tmux; stash prova
+que o fix nada introduz. Nenhum teste cobre o comportamento novo do fix
+(grep `pollNow|ensureMonitorRunning|writeAutoFinalReport` em `tests/`: zero)
+— registrado como lacuna, não como verde.
+
+### 21.2 Status do fix pendente (auto-complete, não-commitado ao abrir a lane)
+
+`src/lib/monitor.ts` (+10: `pollNow`, `isActive`) + `src/lib/orchestrator.ts`
+(+126: `ensureMonitorRunning`, `driveMonitorOnce`, `writeAutoFinalReport`,
+chamadas em `startPlan`/`resumePlan`/`_doReconcile`/caminhos `completed` e
+`pre_pr`) — responde direto ao bloqueante do rerun3 (`single-demo.md` §rerun3:
+via autônoma CLI nunca chamava `monitor.start()`, jobs presos em `running`,
+sem relatório final). Status honesto: **Implementado + sem regressão
+(B vs C idênticos), sem teste dedicado, NÃO Validado** (nenhum re-demo live
+após o fix; validar = repetir single do zero e chegar a merges + relatório).
+
+### 21.3 Artefatos validados (existem, lidos)
+
+- Demo mínima single-4 (`/tmp/opencode/single-evidence-4/`, 50 arquivos):
+  plano `fb128f07-…` (`17-plan.json`, 3 tasks `is-even`/`capitalize` paralelas
+  + `readme` dependente), 2 workers concluíram (`f20023c`/`8bdd707`,
+  `node --test` 3+1 pass em `30-verify-*.txt` EXIT=0), kill + `resume
+  --intake` sem duplicar (`23-resume.log`), `complement` Caso B (`21-*`).
+  Merges/testes pós-merge/relatório final: **não executados** (bloqueio
+  monitor, §21.2). Nível: plano/workers/completions **Validados** (trabalho
+  real + testes verdes); merges/relatório **Pendentes**.
+- Demos live anteriores (`/tmp/opencode/public-evidence/` + `live-full/` +
+  `live-gaps/`): `22-final-report.md` (`Integrated: 3, Unmet: 0,
+  Unverified: 0`), `55-final-report2.md` (`Integrated: 3, Unmet: 1` trilha do
+  incidente), `21-postmerge-tests.log` (2 pass exit 0), `live-full/driver.log`.
+  Nível: **Validados** (inalterados por esta lane).
+- Leftover: sessões tmux `mc-capitalize`/`mc-is-even` (workers da single-4,
+  demo encerrada) seguem no ar — não são do usuário, não foram tocadas aqui.
+
+### 21.4 Limitações registradas (ficam documentadas)
+
+1. Warning de transição de plano: recovery paths com `{ force: true }`
+   aplicam e logam `[MC] Invalid job transition: … (forced recovery)`
+   (`src/lib/plan-state.ts:112`; observado na suíte: `queued → failed (job:
+   fix-login)`). Fail-closed por padrão; force é explícito e visível — por
+   desenho, não silencioso.
+2. Metering desconhecido: chamadas dos workers via serve não passam pelo
+   wrapper `OPENCODE_BIN` (só o planner `--standalone` é contado); consumo
+   total de modelo das demos é desconhecido (cf. `single-demo.md` rerun3 §6).
+3. `E2E-E` segue Pendente (roteiro fase a fase não executado; cenários live
+   equivalentes validam no lugar). `resume --intake` sem plano segue no-op
+   por desenho. Intake segue slot único (sobrescreve; trilha em `01-*.txt`).
+
+### 21.5 Commits (locais, sem push/PR)
+
+Branch `feat/autonomous-orchestrator-v2` sobre base `6db667e`. Esta lane
+commita o pendente (fix §21.2 + `docs/single-demo.md` do lane anterior) e em
+seguida este fechamento (matrix §21 + DELIVERY §12 + public-demo apêndice).
+Nada publicado; perfil global intocado; sem segredos.
