@@ -205,3 +205,26 @@ Sem perfil global modificado, sem segredos, sem push/PR, sem fixtures úteis apa
 
 Verificação: `bun run build` exit 0; `bun test` exit 0 —
 **963 pass, 16 skip, 0 fail** (62 arquivos; +10 vs 953).
+
+## 19. Adendo targeted-close (autonomia pontual + revisão funcional)
+
+| ID | Critério | Resultado | Evidência |
+| --- | --- | --- | --- |
+| AUT-1 | Só NL vira tarefas+deps+prompts (sem DAG prévio) | Pass no recorte pontual | `docs/targeted-proof.md` Caso A: `caseA-send.txt` (só embrulha) + `caseA-order.txt` (`No active plan`) + `caseA-decide.log` (`ELIGIBLE-INITIAL` 2 paralelas, docs `waiting_deps`) |
+| AUT-2 | Coordenador decide ordem/paralelismo (2 workers) | Pass no recorte pontual | `decideNextJobs` + `buildWorkerPrompt` puras (`caseA-decide.ts/.log`, `PROMPT-HAS-SLUG:true`); ciclo full com workers LLM vivos coberto por `docs/live-proof.md`, não repetido aqui |
+| REV-F1 | Entrega in-scope + verde mas incompleta falha no gate | Pass | `caseB-test1.log` 1 pass + `caseB-verdict1.txt` FAIL `REQ-EMPTY` (`reviewJob` do produto) |
+| REV-F2 | Correção pedida + reverificação passa | Pass | `1254110` diff + `caseB-test2.log` 2 pass + `caseB-verdict2.txt` PASS (`reviewedCommit 1254110`) |
+| GUA-1..4 | Reafirmado sem mudança de `src/` | Pass | §18 + `docs/guards-proof.md` + `/tmp/opencode/guards-test.log` (963 pass) |
+
+Limitação honesta (AUT): `send` só embrulha com guards; a decomposição
+NL→DAG neste proof foi decidida pelo coordenador (modelo, esta sessão) e
+exercida via funções puras do produto (`decideNextJobs`/`buildWorkerPrompt`);
+o ciclo full com modelo vivo continua coberto por `docs/live-proof.md`.
+**Sem pipeline LLM dedicado de NL→DAG provado de ponta a ponta nesta
+branch** — marcado como limitação, não como Pass integral.
+
+Verificação desta rodada (só docs, sem tocar `src/`): `bun test
+tests/lib/coordinator.test.ts tests/lib/reviewer.test.ts` exit 0 —
+**43 pass, 0 fail** (41 na lane targeted +2 guards); `bun run build` exit 0
+(`Bundled 221 modules`); `git status` limpo após commit (só este adendo +
+`docs/targeted-proof.md`); sem push/PR, sem perfil global, sem segredos.
