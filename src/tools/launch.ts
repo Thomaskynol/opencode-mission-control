@@ -14,6 +14,7 @@ import {
   isTmuxAvailable,
 } from '../lib/tmux';
 import { loadConfig } from '../lib/config';
+import { buildWorktreePermissions } from '../lib/permission-policy';
 import { detectOMO } from '../lib/omo';
 import { copyPlansToWorktree } from '../lib/plan-copier';
 import { resolvePostCreateHook } from '../lib/worktree-setup';
@@ -52,13 +53,17 @@ The "completed" call is MANDATORY — it signals Mission Control that your job i
 
 If your work needs human review before it can proceed: mc_report(status: "needs_review", message: "<what needs review>")`;
 
+const WORKTREE_LOCAL_SUFFIX = `
+
+WORKTREE SCOPE: Work only inside your current worktree and branch with relative paths — never \`cd\` outside, never reference absolute origin paths. Your session directory is your project root.`;
+
 function buildFullPrompt(opts: {
   prompt: string;
   mode: string;
   planFile?: string;
   autoCommit?: boolean;
 }): string {
-  let prompt = opts.prompt + MC_REPORT_SUFFIX;
+  let prompt = opts.prompt + WORKTREE_LOCAL_SUFFIX + MC_REPORT_SUFFIX;
   if (opts.autoCommit !== false) {
     prompt += AUTO_COMMIT_SUFFIX;
   }
@@ -316,6 +321,9 @@ export const mc_launch: ToolDefinition = tool({
             ? { providerID: modelInfo.providerID, id: modelInfo.modelID }
             : undefined,
           location: { directory: worktreePath },
+          // Allow-inside ruleset: reads/writes/shell within the worktree
+          // never ask; anything outside stays under the default policy.
+          permissions: buildWorktreePermissions(worktreePath),
         });
         remoteSessionId = created.id;
         await v2Prompt(client, remoteSessionId, fullPrompt);

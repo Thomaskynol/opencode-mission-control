@@ -258,9 +258,14 @@ export function redactSecrets(text: string): string {
 
 /**
  * Assemble the worker prompt: request, constraints, prior decisions,
- * git base, acceptance criteria, plus the standing guards (local-only,
- * report discipline). No conversation history is attached — corrections
- * continue the same session, distinct tasks start a new one.
+ * git base, acceptance criteria, plus the standing guards (worktree-local,
+ * local-only, report discipline). No conversation history is attached —
+ * corrections continue the same session, distinct tasks start a new one.
+ *
+ * Never emits absolute origin paths or destination branches as write
+ * instructions: the worker runs with its cwd inside its own worktree, so
+ * only relative paths are valid — anything absolute reads as an external
+ * directory and blocks on permission.
  */
 export function buildWorkerPrompt(input: WorkerPromptInput): string {
   const lines = [
@@ -272,6 +277,9 @@ export function buildWorkerPrompt(input: WorkerPromptInput): string {
     ``,
     `## Prior decisions (do not relitigate)`,
     ...(input.decisions.length > 0 ? input.decisions.map((d) => `- ${redactSecrets(d)}`) : ['- (none)']),
+    ``,
+    `## Worktree scope`,
+    `Work only inside your current worktree and branch with relative paths — never \`cd\` outside, never reference absolute origin paths.`,
     ``,
     `## Git base`,
     `Branch from \`${redactSecrets(input.baseRef)}\`. Local commits and branches only — never push, publish, or touch the global config.`,

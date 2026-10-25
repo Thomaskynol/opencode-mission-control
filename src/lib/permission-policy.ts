@@ -1,4 +1,5 @@
 import { resolve } from 'path';
+import type { V2PermissionRule } from './sdk-client.js';
 
 export type PermissionPolicyDecision = 'auto-approve' | 'deny' | 'ask-user';
 
@@ -196,6 +197,23 @@ export function requiresHumanAuth(permissionRequest: PermissionPolicyRequest): b
   if (isGitPushText(haystack)) return true;
   const lower = haystack.toLowerCase();
   return PUBLISH_PATTERNS.some((pattern) => pattern.test(lower));
+}
+
+/**
+ * Session ruleset for one worker: allow read/write/shell inside its own
+ * worktree so internal paths never ask; anything outside stays under the
+ * default policy (ask-user/deny via the monitor). Pass to
+ * `session.create` as `permissions`.
+ */
+const WORKTREE_RULE_ACTIONS = ['read', 'edit', 'write', 'bash'] as const;
+
+export function buildWorktreePermissions(worktreePath: string): V2PermissionRule[] {
+  const base = worktreePath.endsWith('/') ? worktreePath.slice(0, -1) : worktreePath;
+  return WORKTREE_RULE_ACTIONS.map((action) => ({
+    action,
+    resource: `${base}/**`,
+    effect: 'allow' as const,
+  }));
 }
 
 export class PermissionPolicy {

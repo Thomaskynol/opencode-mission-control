@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   PermissionPolicy,
+  buildWorktreePermissions,
   isGitPushText,
   requiresHumanAuth,
   type PermissionPolicyConfig,
@@ -221,6 +222,24 @@ describe('PermissionPolicy', () => {
           { worktreePath: WORKTREE },
         ),
       ).toBe('ask-user');
+    }
+  });
+
+  it('builds an allow-inside ruleset scoped to the worktree', () => {
+    const rules = buildWorktreePermissions('/tmp/mc-worktrees/test-job');
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      expect(rule.effect).toBe('allow');
+      expect(rule.resource.startsWith('/tmp/mc-worktrees/test-job')).toBe(true);
+    }
+    const actions = rules.map((r) => r.action);
+    for (const needed of ['read', 'edit', 'write', 'bash']) {
+      expect(actions).toContain(needed);
+    }
+    // No blanket allow: nothing outside the worktree is covered.
+    for (const rule of rules) {
+      expect(rule.resource).not.toBe('/**');
+      expect(rule.resource).not.toBe('*');
     }
   });
 });

@@ -656,6 +656,36 @@ describe('mc_launch', () => {
       );
     });
 
+    it('should pin an allow-inside ruleset scoped to the worktree', async () => {
+      await mc_launch.execute(
+        { name: 'serve-job', prompt: 'Do task' },
+        mockContext,
+      );
+
+      expect(mockV2CreateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        expect.objectContaining({
+          location: { directory: '/tmp/mc-worktrees/test-job' },
+          permissions: expect.arrayContaining([
+            expect.objectContaining({
+              resource: '/tmp/mc-worktrees/test-job/**',
+              effect: 'allow',
+            }),
+          ]),
+        }),
+      );
+      const body = mockV2CreateSession.mock.calls[0][1] as {
+        permissions: Array<{ action: string; resource: string; effect: string }>;
+      };
+      const actions = body.permissions.map((p) => p.action);
+      for (const needed of ['read', 'edit', 'write', 'bash']) {
+        expect(actions).toContain(needed);
+      }
+      for (const p of body.permissions) {
+        expect(p.resource.startsWith('/tmp/mc-worktrees/test-job')).toBe(true);
+      }
+    });
+
     it('should store port, serverUrl and the remote worker session on the job record', async () => {
       await mc_launch.execute(
         { name: 'serve-job', prompt: 'Do task' },

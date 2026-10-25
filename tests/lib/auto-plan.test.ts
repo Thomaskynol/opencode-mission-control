@@ -8,6 +8,8 @@ import {
   extractPlannerText,
   assertSafeDestinations,
   assertAuthorizedActions,
+  assertLocalWorkerPrompts,
+  sanitizeWorkerPrompt,
   validateRuntimeDecision,
   requiresUserReview,
   nextStepsFor,
@@ -288,6 +290,76 @@ describe('runtime decision validation (adaptive loop guard)', () => {
     const steps = nextStepsFor({ ...validDraft(), questions: ['Which backoff?'] });
     expect(steps.join('\n')).toMatch(/Which backoff\?/);
     expect(steps.join('\n')).toMatch(/add-retry/);
+  });
+});
+
+describe('prompt-permission-fix (worktree-local worker prompts)', () => {
+  // Real leak from single-3 evidence (jobs.json): the planner echoed the
+  // absolute origin repo + destination branch into the task prompt, so the
+  // worker tried to write /tmp/opencode/single-3/* from its own worktree
+  // and blocked on "Access external directory".
+  const LEAKED = 'No repo /tmp/opencode/single-3, branch single/demo-3: criar src/isEven.js com function isEven(numero) em JS puro (retorna numero % 2 === 0)';
+
+  it('planner prompt marks repo/branch as context-only and demands relative-only tasks', () => {
+    const prompt = buildPlannerPrompt({
+      request: 'Add retry',
+      repo: '/tmp/demo',
+      targetBranch: 'feat/retry',
+    });
+    expect(prompt).toMatch(/context-only|do not copy/i);
+    expect(prompt).toMatch(/relative.*only|relative paths only/i);
+    expect(prompt).toMatch(/never.*absolute/i);
+  });
+
+  it('sanitizes the leaked origin/branch prefix into a worktree-local prompt', () => {
+    const clean = sanitizeWorkerPrompt(LEAKED, '/tmp/opencode/single-3');
+    expect(clean).not.toContain('/tmp/opencode/single-3');
+    expect(clean).not.toMatch(/branch single\/demo-3:\s*criar/i);
+    expect(clean).toContain('src/isEven.js');
+    expect(clean).toMatch(/current worktree|relative paths/i);
+  });
+
+  it('strips stray absolute paths and outside-worktree cd', () => {
+    const clean = sanitizeWorkerPrompt('Write /etc/config.json then cd /tmp/other and cd .. up');
+    expect(clean).not.toContain('/etc/config.json');
+    expect(clean).not.toContain('/tmp/other');
+    expect(clean).not.toMatch(/cd \.\./);
+    expect(clean).toMatch(/current worktree|relative paths/i);
+  });
+
+  it('rejects surviving absolute paths before they become work', () => {
+    const bad = validDraft();
+    bad.tasks[0].prompt = 'Edit /tmp/demo/src/a.ts now';
+    expect(() => assertLocalWorkerPrompts(bad)).toThrow(/absolute|worktree-local/i);
+    expect(() => assertLocalWorkerPrompts(validDraft())).not.toThrow();
+  });
+
+  it('runAutoIntake never lets an absolute repo path reach the draft', async () => {
+    const { draft } = await runAutoIntake(
+      { request: 'Add retry', repo: '/tmp/demo', targetBranch: 'feat/retry' },
+      async () => {
+        const d = validDraft();
+        d.tasks[0].prompt = 'No repo /tmp/demo, branch feat/retry: implement retry in src/sync.ts';
+        return JSON.stringify(d);
+      },
+    );
+    expect(draft.tasks[0].prompt).not.toContain('/tmp/demo');
+    expect(draft.tasks[0].prompt).toContain('src/sync.ts');
+    expect(() => assertLocalWorkerPrompts(draft)).not.toThrow();
+  });
+
+  it('runtime add_task with an absolute path fails closed', () => {
+    const ctx = { taskNames: ['a'], mergedTasks: [] as string[] };
+    expect(() =>
+      validateRuntimeDecision(
+        {
+          action: 'add_task',
+          task: { name: 'x', prompt: 'Edit /tmp/demo/src/a.ts', acceptance: ['done'] },
+          reason: 'gap',
+        },
+        ctx,
+      ),
+    ).toThrow(/absolute|worktree-local/i);
   });
 });
 

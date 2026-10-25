@@ -100,12 +100,13 @@ export function buildPlannerPrompt(intake: AutoIntakeInput): string {
     ' "decisions":[strings],"questions":[strings for the user],"nextSteps":[strings]}.',
     'Rules: names are unique slugs; dependsOn names existing tasks; no cycles;',
     ' task prompts are concrete and self-contained; every task lists acceptance criteria;',
+    ' task prompts are worktree-local: relative paths only, never absolute paths, never `cd` outside the worktree;',
     ' touchSet holds repo-relative paths only, never absolute or ../ escapes;',
     ' never push, publish, deploy, approve permissions, or touch the global config;',
     ' user-visible scope changes go to "questions", routine technique stays autonomous.',
     `Request: ${intake.request}`,
-    `Repo: ${intake.repo ?? '(current worktree)'}`,
-    `Destination branch: ${intake.targetBranch ?? '(keep current)'}`,
+    `Repo (context-only background — do not copy this path into tasks): ${intake.repo ?? '(current worktree)'}`,
+    `Destination branch (context-only — never push or write outside the worktree): ${intake.targetBranch ?? '(keep current)'}`,
     `Ceilings: maxParallel=${intake.ceiling?.maxParallel ?? 'default'} testCommand=${intake.ceiling?.testCommand ?? 'none'}`,
     `Optional docs:\n${docs}`,
   ].join('\n');
@@ -234,6 +235,60 @@ function describeTouchSet(touchSet: string[] | undefined): string[] {
   return touchSet ?? [];
 }
 
+/**
+ * Standing guard appended to every worker prompt: the worker runs with its
+ * cwd inside its own worktree, so absolute origin paths / `cd` escapes only
+ * trigger "Access external directory" permission blocks (single-3 evidence).
+ */
+export const WORKTREE_LOCAL_FOOTER =
+  'Work only inside your current worktree and branch with relative paths — never `cd` outside, never reference absolute origin paths, never push.';
+
+const LEADING_ORIGIN_PREFIX = /^(?:(?:no|em|in|on)\s+(?:o\s+|the\s+)?(?:repo|repository|repositório)[^:\n]*:\s*)/i;
+const LEFTOVER_WORKTREE_PREFIX = /^(?:(?:no|em|in|on)\s+your worktree[^:\n]*:\s*)/i;
+// Absolute POSIX paths under well-known roots (origin repos, system dirs).
+const ABS_PATH = /\/(?:tmp|home|Users|var|etc|opt|srv|mnt|data|repo|workspace|workspaces|git|projects?|code|dev|app|root)\/[^\s"'`,;]*/g;
+const ABS_PATH_TEST = /\/(?:tmp|home|Users|var|etc|opt|srv|mnt|data|repo|workspace|workspaces|git|projects?|code|dev|app|root)\//;
+const OUTSIDE_CD = /\bcd\s+(?:\.\.[^\s]*|\/[^\s]*)/g;
+const OUTSIDE_CD_TEST = /\bcd\s+(?:\.\.\b|\/)/;
+
+/**
+ * Strip origin leaks from a model-written worker prompt: the absolute repo
+ * path, the "No repo X, branch Y:" prefix, stray absolute paths and
+ * outside-worktree `cd`, then append the worktree-local guard.
+ * Idempotent: re-running never duplicates the footer.
+ */
+export function sanitizeWorkerPrompt(prompt: string, repo?: string): string {
+  let out = prompt.trim();
+  if (repo) {
+    const escaped = repo.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (escaped) out = out.replace(new RegExp(escaped, 'g'), 'your worktree');
+  }
+  out = out.replace(LEADING_ORIGIN_PREFIX, '');
+  out = out.replace(OUTSIDE_CD, 'stay in your worktree');
+  out = out.replace(ABS_PATH, 'your worktree');
+  out = out.replace(LEFTOVER_WORKTREE_PREFIX, '');
+  out = out.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  if (!out.includes(WORKTREE_LOCAL_FOOTER)) out += `\n\n${WORKTREE_LOCAL_FOOTER}`;
+  return out;
+}
+
+/** Fail-closed: no absolute path or outside-worktree cd may reach a worker. */
+export function assertLocalWorkerPrompts(draft: AutoPlanDraft): void {
+  for (const t of draft.tasks) {
+    if (ABS_PATH_TEST.test(t.prompt) || OUTSIDE_CD_TEST.test(t.prompt)) {
+      throw new Error(
+        `Task "${t.name}" references an absolute path or outside-worktree cd — worker prompts must stay worktree-local with relative paths.`,
+      );
+    }
+  }
+}
+
+function sanitizeDraftPrompts(draft: AutoPlanDraft, repo?: string): void {
+  for (const t of draft.tasks) {
+    t.prompt = sanitizeWorkerPrompt(t.prompt, repo);
+  }
+}
+
 /** Destination allowlist: repo-relative paths only, no absolutes or escapes. */
 export function assertSafeDestinations(draft: AutoPlanDraft): void {
   for (const t of draft.tasks) {
@@ -325,6 +380,13 @@ export function validateRuntimeDecision(
       nextSteps: [],
     });
     assertAuthorizedActions({
+      requirements: [],
+      tasks: [{ ...t, name }],
+      decisions: [],
+      questions: [],
+      nextSteps: [],
+    });
+    assertLocalWorkerPrompts({
       requirements: [],
       tasks: [{ ...t, name }],
       decisions: [],
@@ -475,8 +537,10 @@ export async function runAutoIntake(
   const plannerPrompt = buildPlannerPrompt({ ...input, request });
   const raw = await generate(plannerPrompt);
   const draft = parsePlannerOutput(raw);
+  sanitizeDraftPrompts(draft, input.repo);
   assertSafeDestinations(draft);
   assertAuthorizedActions(draft);
+  assertLocalWorkerPrompts(draft);
   return {
     intake: {
       id: randomUUID(),
@@ -543,8 +607,10 @@ export async function runAutoIntakeWithRetry(
     try {
       const raw = await generate(plannerPrompt);
       const draft = parsePlannerOutput(raw);
+      sanitizeDraftPrompts(draft, input.repo);
       assertSafeDestinations(draft);
       assertAuthorizedActions(draft);
+      assertLocalWorkerPrompts(draft);
       return {
         intake: {
           id: randomUUID(),

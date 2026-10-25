@@ -169,6 +169,20 @@ describe('redactSecrets', () => {
 });
 
 describe('buildWorkerPrompt', () => {
+  it('scopes the worker to its own worktree with relative paths only', () => {
+    const prompt = buildWorkerPrompt({
+      request: 'Add retry to sync tool',
+      constraints: ['touch only src/tools/sync.ts'],
+      decisions: [],
+      baseRef: 'HEAD',
+      acceptance: ['bun test passes'],
+    });
+    expect(prompt).toMatch(/current worktree/i);
+    expect(prompt).toMatch(/relative paths/i);
+    expect(prompt).toMatch(/never.*cd.*outside|never `cd` outside/i);
+    expect(prompt).not.toMatch(/\/tmp\//);
+  });
+
   it('carries request, constraints, decisions, base and acceptance — no history dump', () => {
     const prompt = buildWorkerPrompt({
       request: 'Add retry to sync tool',
