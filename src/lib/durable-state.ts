@@ -72,6 +72,30 @@ export interface RuntimeSnapshot {
   accumulators: Record<string, AccumulatorSnapshot>;
   sseCursor: Record<string, { lastActivityAt: number; lastEventId?: string }>;
   autoIntake: AutoIntakeRecord | null;
+  /**
+   * F09: conserved merge/test evidence per job (product-observed).
+   * Keyed by job name; survives restarts so the final report can list
+   * real commands, outputs, commits and changed files instead of empties.
+   */
+  mergeEvidence: Record<string, MergeEvidenceRecord>;
+}
+
+/**
+ * F09: product-observed integration evidence for one job.
+ * Persisted right after a successful merge; read back by the final
+ * report (never invented, never dropped silently).
+ */
+export interface MergeEvidenceRecord {
+  jobName: string;
+  mergedAt: string;
+  reviewedCommit?: string;
+  reviewedBase?: string;
+  changedFiles?: string[];
+  testCommand?: string;
+  testStatus: 'passed' | 'failed' | 'skipped';
+  testOutput?: string;
+  setupCommands?: string[];
+  setupStatus?: 'passed' | 'failed' | 'skipped';
 }
 
 export interface ReconcileReport {
@@ -95,6 +119,7 @@ function emptySnapshot(): RuntimeSnapshot {
     accumulators: {},
     sseCursor: {},
     autoIntake: null,
+    mergeEvidence: {},
   };
 }
 
@@ -147,6 +172,7 @@ export async function persistPendingQuestion(q: PendingQuestion): Promise<void> 
     accumulators: current.accumulators ?? {},
     sseCursor: current.sseCursor ?? {},
     autoIntake: current.autoIntake ?? null,
+    mergeEvidence: current.mergeEvidence ?? {},
   }));
 }
 
@@ -161,6 +187,7 @@ export async function dropPersistedQuestion(jobId: string, partId: string): Prom
     accumulators: current.accumulators ?? {},
     sseCursor: current.sseCursor ?? {},
     autoIntake: current.autoIntake ?? null,
+    mergeEvidence: current.mergeEvidence ?? {},
   }));
 }
 
@@ -383,6 +410,7 @@ export async function saveAutoIntake(record: AutoIntakeRecord): Promise<void> {
     accumulators: current.accumulators ?? {},
     sseCursor: current.sseCursor ?? {},
     autoIntake: record,
+    mergeEvidence: current.mergeEvidence ?? {},
   }));
 }
 
@@ -410,6 +438,7 @@ async function mutateAutoIntake(
       accumulators: current.accumulators ?? {},
       sseCursor: current.sseCursor ?? {},
       autoIntake: updated,
+      mergeEvidence: current.mergeEvidence ?? {},
     };
   });
   return updated!;
@@ -439,4 +468,29 @@ export async function setAutoNextSteps(id: string, nextSteps: string[]): Promise
 /** Advance the intake lifecycle without rebuilding the request. */
 export async function setAutoIntakeStatus(id: string, status: AutoIntakeStatus): Promise<void> {
   await mutateAutoIntake(id, (record) => ({ ...record, status }));
+}
+
+// ---------------------------------------------------------------------------
+// F09: conserved merge/test evidence (product-observed, never invented).
+// Written right after each successful merge; read back by the final
+// report so tests/verified/files carry real commands, outputs, commits
+// and changed files instead of empties.
+// ---------------------------------------------------------------------------
+
+/** Persist (or replace) one job's merge evidence. */
+export async function saveMergeEvidence(record: MergeEvidenceRecord): Promise<void> {
+  await updateRuntimeSnapshot((current) => ({
+    pendingQuestions: current.pendingQuestions ?? [],
+    messageBus: current.messageBus ?? {},
+    accumulators: current.accumulators ?? {},
+    sseCursor: current.sseCursor ?? {},
+    autoIntake: current.autoIntake ?? null,
+    mergeEvidence: { ...(current.mergeEvidence ?? {}), [record.jobName]: record },
+  }));
+}
+
+/** Load all conserved merge evidence (empty when none persisted yet). */
+export async function loadMergeEvidence(): Promise<Record<string, MergeEvidenceRecord>> {
+  const snapshot = await loadRuntimeSnapshot().catch(() => null);
+  return snapshot?.mergeEvidence ?? {};
 }

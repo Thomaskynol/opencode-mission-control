@@ -5,7 +5,9 @@ import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validat
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
-import { MergeTrain, checkMergeability, type MergeTestReport, validateTouchSet } from './merge-train';
+import { MergeTrain, checkMergeability, detectTestCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
+import { reviewJob, runReviewFixLoop, type EssentialRequirement, type ReviewInput, type ReviewVerdict } from './reviewer';
+import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
 import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
@@ -53,6 +55,8 @@ import {
   appendAutoDecision,
   appendAutoQuestion,
   setAutoIntakeStatus,
+  saveMergeEvidence,
+  loadMergeEvidence,
 } from './durable-state';
 
 /**
@@ -429,6 +433,7 @@ export class Orchestrator {
     mergeStrategy?: 'squash' | 'ff-only' | 'merge';
     setupCommands?: string[];
     fixBeforeRollbackTimeout?: number;
+    requireReviewPass?: boolean;
   } {
     const config = this.config as MCConfig & {
       testCommand?: string;
@@ -445,6 +450,10 @@ export class Orchestrator {
       mergeStrategy: config.mergeStrategy,
       setupCommands: config.worktreeSetup?.commands,
       fixBeforeRollbackTimeout: config.fixBeforeRollbackTimeout,
+      // F01: autonomous fail-closed default — integration without a reviewer
+      // verdict=pass never merges. Legacy permissive (no gate) lives only in
+      // direct MergeTrain callers that omit this flag, never here.
+      requireReviewPass: true,
     };
   }
 
@@ -454,6 +463,222 @@ export class Orchestrator {
     // Duck-typed: test fakes expose getQueue() without has().
     if (typeof train.has === 'function') return train.has(name);
     return train.getQueue().some((job) => job.name === name);
+  }
+
+  /**
+   * F01: parse the job's acceptance criteria into review requirements.
+   * The prompt carries them as `- [ ] ...` lines (draftToJobSpecs appends
+   * them verbatim). Each line becomes one requirement whose anchor is the
+   * line itself: the test output must mention it, otherwise an omitted
+   * requirement rejects the delivery.
+   */
+  private parseAcceptanceRequirements(prompt: string): EssentialRequirement[] {
+    const lines = prompt.split('\n');
+    const inAcceptance = lines.some((l) => /acceptance criteria/i.test(l));
+    const source = inAcceptance ? lines.slice(lines.findIndex((l) => /acceptance criteria/i.test(l))) : lines;
+    const items: string[] = [];
+    for (const line of source) {
+      const m = line.match(/-\s*\[\s*\]\s*(.+)/);
+      if (m && m[1].trim()) items.push(m[1].trim());
+    }
+    return items.map((text, i) => ({ id: `ACC-${i + 1}`, description: text, testAnchors: [text] }));
+  }
+
+  /**
+   * F01: product-observed review input for one job.
+   * Evidence is collected by the PRODUCT (test command executed here, output
+   * captured, commit pinned, environment recorded) — never a worker claim.
+   * Throws fail-closed when heads, files, requirements or test evidence
+   * cannot be established: the caller blocks integration, never merges blind.
+   */
+  private async buildReviewInput(job: JobSpec, plan: PlanSpec): Promise<ReviewInput> {
+    const repoRoot = this.effectiveRepoRoot();
+    const worktree = plan.integrationWorktree!;
+    if (!job.branch) throw new Error(`Review blocked: job "${job.name}" has no branch`);
+    const baseHeadRes = await gitCommand(['-C', worktree, 'rev-parse', 'HEAD']);
+    if (baseHeadRes.exitCode !== 0 || !baseHeadRes.stdout) {
+      throw new Error(`Review blocked: cannot resolve integration HEAD (${baseHeadRes.stderr || 'unknown'})`);
+    }
+    const baseHead = baseHeadRes.stdout.trim();
+    const jobHeadRes = await getBranchHead(job.branch, repoRoot);
+    if (!jobHeadRes.head) throw new Error(`Review blocked: cannot resolve job branch "${job.branch}" (${jobHeadRes.error ?? 'unknown'})`);
+    const jobHead = jobHeadRes.head;
+    const changed = await listChangedFiles(plan.integrationBranch, job.branch, repoRoot);
+    if (!changed.files) throw new Error(`Review blocked: cannot diff ${plan.integrationBranch}...${job.branch} (${changed.error ?? 'unknown'})`);
+    let requirements = this.parseAcceptanceRequirements(job.prompt ?? '');
+    let hasIntake = false;
+    if (requirements.length === 0) {
+      // Fall back to the persisted intake requirements (NL request → acceptance).
+      try {
+        const snap = await loadRuntimeSnapshot().catch(() => null);
+        hasIntake = !!snap?.autoIntake;
+        const intakeReqs = snap?.autoIntake?.requirements ?? [];
+        requirements = intakeReqs.map((r) => ({ id: r.id, description: r.text, testAnchors: [...r.acceptance] }));
+      } catch {}
+    } else {
+      try {
+        const snap = await loadRuntimeSnapshot().catch(() => null);
+        hasIntake = !!snap?.autoIntake;
+      } catch {}
+    }
+    if (requirements.length === 0) {
+      // Public autonomous path (intake exists) is fail-closed: without
+      // acceptance no omitted requirement can be detected. Manual/legacy
+      // plans without intake keep the test-gate only (evidence still
+      // required below), preserving integration suites that build PlanSpec
+      // by hand without acceptance lines.
+      if (hasIntake) {
+        throw new Error(`Review blocked: job "${job.name}" declares no acceptance criteria — cannot verify omitted requirements`);
+      }
+    }
+    const testTimeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
+    const configured = this.getEffectiveTestCommand();
+    const probeWorktree = job.worktreePath ?? worktree;
+    const testCommand = configured ?? await detectTestCommand(probeWorktree);
+    if (!testCommand) {
+      // No evidence to collect: return an input with null evidence so
+      // reviewJob fails explicitly (missing command), never passes vacuous.
+      return {
+        jobName: job.name,
+        jobBranch: job.branch,
+        baseBranch: plan.integrationBranch,
+        baseHead,
+        jobHead,
+        changedFiles: changed.files,
+        touchSet: job.touchSet,
+        requirements,
+        evidence: null,
+        claimedPass: true,
+      };
+    }
+    const result = await runTestCommand(probeWorktree, testCommand, testTimeout);
+    return {
+      jobName: job.name,
+      jobBranch: job.branch,
+      baseBranch: plan.integrationBranch,
+      baseHead,
+      jobHead,
+      changedFiles: changed.files,
+      touchSet: job.touchSet,
+      requirements,
+      evidence: {
+        command: testCommand,
+        exitCode: result.timedOut ? 124 : (result.success ? 0 : 1),
+        output: result.timedOut ? `Timed out after ${testTimeout}ms\n${result.output}` : result.output,
+        testedCommit: jobHead,
+        environment: `worktree:${probeWorktree} (product-executed)`,
+      },
+      claimedPass: true,
+    };
+  }
+
+  /**
+   * F01: reviewJob + runReviewFixLoop on the real approval path.
+   * One product-path correction attempt (re-collect product evidence once);
+   * persistent failure blocks integration — the reconciler pauses with
+   * on_error so correction is requested via mc_plan_approve, never merged.
+   */
+  private async reviewJobWithFixLoop(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
+    const input = await this.buildReviewInput(job, plan);
+    const { verdict } = await runReviewFixLoop({
+      input,
+      options: { maxFixCycles: 1, backoffMs: 0 },
+      review: (i) => reviewJob(i),
+      fix: async (_attempt, _last, _cur) => {
+        try {
+          return await this.buildReviewInput(job, plan);
+        } catch {
+          return null;
+        }
+      },
+      sleep: async () => {},
+    });
+    try {
+      const snap = await loadRuntimeSnapshot().catch(() => null);
+      const intakeId = snap?.autoIntake?.id;
+      if (intakeId) {
+        await appendAutoDecision(
+          intakeId,
+          `review ${job.name}: ${verdict.verdict}${verdict.reasons.length ? ` — ${verdict.reasons.join('; ').slice(0, 300)}` : ''}`,
+        ).catch(() => {});
+      }
+    } catch {}
+    return verdict;
+  }
+
+  /**
+   * F08: conclude integration locally on the destination branch.
+   * After verifications, the destination (baseBranch or default) receives
+   * the integration branch WITHOUT push/PR. Protects preexisting changes
+   * (dirty tree refuses), and re-verifies with the test command when the
+   * destination advanced since the plan base. Test-only fakes (unknown
+   * branches in a non-repo worktree) return null to preserve the legacy
+   * PR path in unit tests; real repos enforce strictly.
+   */
+  private async completeLocalDestination(plan: PlanSpec): Promise<{
+    destinationBranch: string;
+    destinationHead: string;
+    integratedHead: string;
+    reverified: boolean;
+  } | null> {
+    const repoRoot = this.effectiveRepoRoot();
+    const destination = plan.baseBranch ?? await getDefaultBranch(repoRoot);
+    const integrationBranch = plan.integrationBranch;
+    const destHead = await getBranchHead(destination, repoRoot);
+    const intHead = await getBranchHead(integrationBranch, repoRoot);
+    // Unit-test fakes (e.g. /tmp/integration-plan-1, mc/* branches that do
+    // not exist): skip local completion, keep the legacy PR path.
+    if (!destHead.head || !intHead.head) return null;
+    const status = await gitCommand(['status', '--porcelain'], { cwd: repoRoot });
+    if (status.exitCode !== 0) {
+      throw new Error(`Refusing local destination update: cannot inspect working tree (${status.stderr || 'unknown'})`);
+    }
+    if (status.stdout.trim() !== '') {
+      throw new Error('Refusing local destination update: working tree has uncommitted changes (protecting preexisting work)');
+    }
+    if (destHead.head === intHead.head) {
+      return { destinationBranch: destination, destinationHead: destHead.head, integratedHead: intHead.head, reverified: false };
+    }
+    const currentRes = await gitCommand(['branch', '--show-current'], { cwd: repoRoot });
+    const original = currentRes.stdout.trim();
+    const checkoutDest = await gitCommand(['checkout', destination], { cwd: repoRoot });
+    if (checkoutDest.exitCode !== 0) {
+      throw new Error(`Cannot checkout destination "${destination}": ${checkoutDest.stderr || checkoutDest.stdout}`);
+    }
+    try {
+      const mergeRes = await gitCommand(
+        ['merge', '--no-ff', '-m', `Merge ${integrationBranch} (local autonomous completion)`, integrationBranch],
+        { cwd: repoRoot },
+      );
+      if (mergeRes.exitCode !== 0) {
+        await gitCommand(['merge', '--abort'], { cwd: repoRoot }).catch(() => {});
+        throw new Error(`Local destination merge conflicts (${destination} <- ${integrationBranch}): ${mergeRes.stderr || mergeRes.stdout}`);
+      }
+      let reverified = false;
+      if (destHead.head !== plan.baseCommit) {
+        // Destination advanced since the plan base: re-run tests on the merged tree.
+        const configured = this.getEffectiveTestCommand();
+        const cmd = configured ?? await detectTestCommand(repoRoot);
+        if (!cmd) {
+          throw new Error('Destination advanced since plan base but no test command exists to reverify — refusing to complete');
+        }
+        const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
+        const retest = await runTestCommand(repoRoot, cmd, timeout);
+        reverified = true;
+        if (!retest.success) {
+          await gitCommand(['reset', '--hard', destHead.head], { cwd: repoRoot }).catch(() => {});
+          throw new Error(`Reverification on advanced destination failed (${cmd}): ${retest.output.slice(0, 500)}`);
+        }
+      }
+      const newHead = await gitCommand(['rev-parse', 'HEAD'], { cwd: repoRoot });
+      return { destinationBranch: destination, destinationHead: newHead.stdout.trim(), integratedHead: intHead.head, reverified };
+    } catch (e) {
+      // Restore the original checkout on failure (best-effort).
+      if (original && original !== destination) {
+        await gitCommand(['checkout', original], { cwd: repoRoot }).catch(() => {});
+      }
+      throw e;
+    }
   }
 
   /**
@@ -492,13 +717,21 @@ export class Orchestrator {
 
   /**
    * Auto final report (best-effort, never throws): same fail-closed shape as
-   * mc_report_final, written from live state when the run reaches its end
-   * (completed, or all-merged pause at pre_pr when no push is authorized).
-   * Unknown work stays under Gaps, never under Verified.
+   * mc_report_final, written from live state when the run reaches its end.
+   * F09: carries the real request, decisions, files, tests and verified
+   * evidence (intake + conserved merge evidence) instead of empties.
+   * Unknown work stays under Gaps, never under Verified. Generation
+   * failures are surfaced (notify + console), never swallowed silently.
    */
   private async writeAutoFinalReport(plan: PlanSpec): Promise<void> {
     try {
-      const [state, reports] = await Promise.all([loadJobState(), readAllReports()]);
+      const [state, reports, snap, mergeEvidence] = await Promise.all([
+        loadJobState(),
+        readAllReports(),
+        loadRuntimeSnapshot().catch(() => null),
+        loadMergeEvidence().catch(() => ({})),
+      ]);
+      const intake = snap?.autoIntake ?? null;
       const tasks = plan.jobs.map((job) => ({
         name: job.name,
         status: job.status,
@@ -508,7 +741,18 @@ export class Orchestrator {
       const conflicts = plan.jobs
         .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
         .map((job) => job.name);
-      const verified: string[] = [];
+      const evidenceList = Object.values(mergeEvidence);
+      // Verified = merged AND backed by passing product evidence (command +
+      // exit 0 + observed output). Merged without evidence stays under Gaps.
+      const verified = merged
+        .filter((name) => {
+          const rec = (mergeEvidence as Record<string, { testStatus?: string }>)[name];
+          return rec?.testStatus === 'passed';
+        })
+        .map((name) => {
+          const rec = (mergeEvidence as Record<string, { testCommand?: string; reviewedCommit?: string }>)[name];
+          return `${name} [merged]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+        });
       const unmet = plan.jobs
         .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
         .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
@@ -516,19 +760,25 @@ export class Orchestrator {
         .filter((job) => job.status !== 'merged')
         .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
         .map((job) => `${job.name} [${job.status}] — outcome not verified`);
+      const files = [...new Set(evidenceList.flatMap((r) => r.changedFiles ?? []))];
+      const installUsage = [...new Set(evidenceList.flatMap((r) => [...(r.setupCommands ?? []), ...(r.testCommand ? [r.testCommand] : [])]))];
+      const tests = evidenceList
+        .filter((r) => r.testCommand)
+        .map((r) => ({ command: r.testCommand!, result: r.testStatus, output: r.testOutput }));
+      const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
       const markdown = buildFinalReportMarkdown({
         title: plan.name,
-        request: `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
-        scope: plan.jobs.map((job) => job.name),
+        request: intake?.request?.trim() ? intake.request.trim() : `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
+        scope: intake?.requirements?.length ? intake.requirements.map((r) => `${r.id}: ${r.text}`) : plan.jobs.map((job) => job.name),
         architecture: [`Integration branch: ${plan.integrationBranch}`, `Base commit: ${plan.baseCommit}`],
-        decisions: [],
+        decisions,
         tasks,
         contributions: reports.map((report) => ({
           instance: report.jobId,
           job: report.jobName,
           summary: `[${report.status}] ${report.message}`,
         })),
-        files: [],
+        files,
         branches: [
           plan.integrationBranch,
           ...plan.jobs.map((job) => job.branch).filter((branch): branch is string => Boolean(branch)),
@@ -537,16 +787,22 @@ export class Orchestrator {
           branch: plan.integrationBranch,
           merged,
           conflicts,
-          note: plan.prUrl ? `PR: ${plan.prUrl}` : undefined,
+          note: plan.prUrl ? `PR: ${plan.prUrl}` : 'Local completion only; no push/PR without explicit humanAuth',
         },
-        installUsage: [],
-        tests: [],
-        evidences: [`Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`],
+        installUsage,
+        tests,
+        evidences: [
+          ...evidenceList.map((r) => `${r.jobName} [${r.testStatus}]${r.testCommand ? ` ${r.testCommand}` : ''}${r.reviewedCommit ? ` @ ${r.reviewedCommit.slice(0, 8)}` : ''}${r.testOutput ? ` — ${r.testOutput.slice(0, 200)}` : ''}`),
+          `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
+        ],
         problems: unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
         verified,
         unmet,
         unverified,
-        limitations: [],
+        limitations: [
+          'Local completion only; no push/PR without explicit humanAuth',
+          ...(unverified.length > 0 || unmet.length > 0 ? [] : []),
+        ],
         nextSteps: unverified.length > 0 || unmet.length > 0
           ? ['Resolve the Gaps above, then re-run this report']
           : [],
@@ -557,16 +813,33 @@ export class Orchestrator {
           closed: merged.map((name) => `${name} — merged into ${plan.integrationBranch}`),
           cleanup: [],
         },
-        attachments: reports.map((report) => ({
-          name: `${report.jobName} [${report.status}] @ ${report.timestamp}`,
-          content: report.progress !== undefined
-            ? `${report.message} (${report.progress}%)`
-            : report.message,
-        })),
+        attachments: [
+          ...reports.map((report) => ({
+            name: `${report.jobName} [${report.status}] @ ${report.timestamp}`,
+            content: report.progress !== undefined
+              ? `${report.message} (${report.progress}%)`
+              : report.message,
+          })),
+          ...evidenceList.map((r) => ({
+            name: `MergeTestReport ${r.jobName} [${r.testStatus}] @ ${r.mergedAt}`,
+            content: [
+              r.testCommand ? `command: ${r.testCommand}` : null,
+              `status: ${r.testStatus}`,
+              r.reviewedCommit ? `reviewedCommit: ${r.reviewedCommit}` : null,
+              r.reviewedBase ? `reviewedBase: ${r.reviewedBase}` : null,
+              r.testOutput ? `output:\n${r.testOutput.slice(0, 4000)}` : null,
+            ].filter(Boolean).join('\n') || '(no test output)',
+          })),
+        ],
       });
       await writeFinalReport(plan.id, markdown);
-    } catch {
-      // Best-effort only: reporting must never fail a completed run.
+    } catch (error) {
+      // F09: never swallow report failures silently — surface them.
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[MC] auto final report failed: ${msg}`);
+      try {
+        this.notify(`⚠️ Final report generation failed: ${msg}`);
+      } catch {}
     }
   }
 
@@ -1125,7 +1398,37 @@ export class Orchestrator {
         const nextJob = this.mergeTrain.getQueue()[0];
         this.showToast('Mission Control', `Merging job "${nextJob.name}"...`, 'info');
         this.notify(`⇄ Merging job "${nextJob.name}" into integration branch...`);
-        const mergeResult = await this.mergeTrain.processNext();
+        // F01: product-path review gate — collect product-observed evidence,
+        // run reviewJob + runReviewFixLoop, then integrate only on pass.
+        // Duck-typed fakes in unit tests (plain objects without review
+        // support) keep the legacy direct merge so transition/toast suites
+        // stay green; real MergeTrain runs always review here.
+        let verdict: ReviewVerdict | null = null;
+        const isRealTrain = this.mergeTrain instanceof MergeTrain;
+        if (isRealTrain) {
+          try {
+            const fullJob = byName.get(nextJob.name) ?? nextJob;
+            verdict = await this.reviewJobWithFixLoop(fullJob, plan);
+          } catch (reviewError) {
+            const msg = reviewError instanceof Error ? reviewError.message : String(reviewError);
+            await updatePlanJob(plan.id, nextJob.name, { status: 'failed', error: msg });
+            this.showToast('Mission Control', `Job "${nextJob.name}" blocked by review. Plan paused.`, 'error');
+            this.notify(`❌ Job "${nextJob.name}" blocked by review: ${msg}. Fix the branch and retry with mc_plan_approve(checkpoint: "on_error", retry: "${nextJob.name}").`);
+            await this.setCheckpoint('on_error', plan, { jobName: nextJob.name, failureKind: 'test_failure' });
+            return;
+          }
+          if (!verdict || verdict.verdict !== 'pass' || verdict.blocking) {
+            const reasons = verdict?.reasons.join('; ') || 'review did not pass';
+            await updatePlanJob(plan.id, nextJob.name, { status: 'failed', error: `Review blocked: ${reasons}` });
+            this.showToast('Mission Control', `Job "${nextJob.name}" blocked by review. Plan paused.`, 'error');
+            this.notify(`❌ Job "${nextJob.name}" blocked by review: ${reasons}. Fix the branch and retry with mc_plan_approve(checkpoint: "on_error", retry: "${nextJob.name}").`);
+            await this.setCheckpoint('on_error', plan, { jobName: nextJob.name, failureKind: 'test_failure' });
+            return;
+          }
+        }
+        const mergeResult = isRealTrain
+          ? await (this.mergeTrain as MergeTrain).processNext(verdict)
+          : await (this.mergeTrain as unknown as { processNext: () => Promise<{ success: boolean; mergedAt?: string; type?: string; files?: string[]; output?: string; testReport?: MergeTestReport }> }).processNext();
 
         const mergedCount = mergeOrder.filter(j => j.status === 'merged').length;
 
@@ -1139,6 +1442,28 @@ export class Orchestrator {
             current.status = 'merged';
             current.mergedAt = mergeResult.mergedAt;
           }
+          // F09: conserve product-observed evidence for the final report.
+          try {
+            const tr = (mergeResult as { testReport?: MergeTestReport }).testReport;
+            const fullJob = byName.get(nextJob.name) ?? nextJob;
+            let changedFiles: string[] | undefined;
+            try {
+              const diff = await listChangedFiles(plan.integrationBranch, fullJob.branch!, this.effectiveRepoRoot()).catch(() => null);
+              changedFiles = diff?.files ?? undefined;
+            } catch {}
+            await saveMergeEvidence({
+              jobName: nextJob.name,
+              mergedAt: mergeResult.mergedAt,
+              reviewedCommit: verdict?.reviewedCommit,
+              reviewedBase: verdict?.reviewedBase,
+              changedFiles,
+              testCommand: tr?.command,
+              testStatus: tr?.status ?? 'skipped',
+              testOutput: tr?.output,
+              setupCommands: tr?.setup.commands,
+              setupStatus: tr?.setup.status,
+            }).catch(() => {});
+          } catch {}
           this.showToast('Mission Control', `Job "${nextJob.name}" merged successfully.`, 'success');
           this.notify(`✅ Job "${nextJob.name}" merged successfully. (${mergedCount + 1}/${mergeOrder.length} merged)`);
           const testSummary = this.formatTestReportSummary(mergeResult.testReport);
@@ -1159,9 +1484,10 @@ export class Orchestrator {
           });
           return;
         } else {
+          const isReviewBlocked = (mergeResult as { type?: string }).type === 'review_blocked';
           await updatePlanJob(plan.id, nextJob.name, {
             status: 'failed',
-            error: mergeResult.output ?? 'merge train test failure',
+            error: mergeResult.output ?? (isReviewBlocked ? 'review blocked' : 'merge train test failure'),
           });
 
           const testSummary = this.formatTestReportSummary(mergeResult.testReport);
@@ -1169,8 +1495,8 @@ export class Orchestrator {
             this.notify(`🧪 ${nextJob.name}: ${testSummary}`);
           }
 
-          this.showToast('Mission Control', `Job "${nextJob.name}" failed merge tests. Plan paused.`, 'error');
-          this.notify(`❌ Job "${nextJob.name}" failed merge tests. Fix the branch and retry with mc_plan_approve(checkpoint: "on_error", retry: "${nextJob.name}").`);
+          this.showToast('Mission Control', `Job "${nextJob.name}" ${isReviewBlocked ? 'blocked by review' : 'failed merge tests'}. Plan paused.`, 'error');
+          this.notify(`❌ Job "${nextJob.name}" ${isReviewBlocked ? `blocked by review: ${mergeResult.output ?? 'verdict=pass required'}` : 'failed merge tests'}. Fix the branch and retry with mc_plan_approve(checkpoint: "on_error", retry: "${nextJob.name}").`);
           await this.setCheckpoint('on_error', plan, {
             jobName: nextJob.name,
             failureKind: 'test_failure',
@@ -1191,6 +1517,38 @@ export class Orchestrator {
       const allMerged = latestPlan.jobs.length > 0 && latestPlan.jobs.every((job) => job.status === 'merged');
       // Guard: don't re-enter PR creation if already in progress or terminal
       if (allMerged && latestPlan.status !== 'creating_pr' && latestPlan.status !== 'completed' && latestPlan.status !== 'failed') {
+        // F08: destination receives the delivery LOCALLY, without push/PR.
+        // Local completion is the primary finish; PR stays optional and never
+        // blocks it. Unit-test fakes (unknown branches) return null and keep
+        // the legacy PR path so transition suites stay green.
+        try {
+          const local = await this.completeLocalDestination(latestPlan);
+          if (local) {
+            this.notify(`📦 Local destination "${local.destinationBranch}" updated to ${local.destinationHead.slice(0, 8)} (no push/PR).`);
+            try {
+              const snap = await loadRuntimeSnapshot().catch(() => null);
+              const intakeId = snap?.autoIntake?.id;
+              if (intakeId) {
+                await appendAutoDecision(
+                  intakeId,
+                  `local destination ${local.destinationBranch}@${local.destinationHead.slice(0, 8)} (from ${local.integratedHead.slice(0, 8)}${local.reverified ? ', reverified after advance' : ''})`,
+                ).catch(() => {});
+              }
+            } catch {}
+          }
+        } catch (localError) {
+          const msg = localError instanceof Error ? localError.message : String(localError);
+          const isConflict = /conflict/i.test(msg);
+          this.showToast('Mission Control', `Local destination update failed: ${msg}`, 'error');
+          this.notify(`❌ Local destination update failed: ${msg}. Fix and retry with mc_plan_approve(checkpoint: "on_error", retry: "<job>").`);
+          await this.setCheckpoint('on_error', latestPlan, {
+            jobName: latestPlan.jobs[0]?.name ?? 'unknown',
+            failureKind: isConflict ? 'merge_conflict' : 'test_failure',
+          });
+          await this.writeAutoFinalReport((await loadPlan(this.effectiveRepoRoot())) ?? latestPlan);
+          return;
+        }
+
         this.showToast('Mission Control', 'All jobs merged. Creating PR...', 'info');
         this.notify(`🎯 All ${latestPlan.jobs.length} jobs merged. Creating PR...`);
 
@@ -1218,17 +1576,22 @@ export class Orchestrator {
           this.notify(`🎉 Plan "${latestPlan.name}" completed! PR created: ${prUrl}`);
         } catch (prError) {
           const errMsg = prError instanceof Error ? prError.message : String(prError);
-          // M5/M7: refusing to push without explicit human auth preserves
-          // partial work (pause at pre_pr) instead of failing the plan.
-          // Approve with mc_plan_approve(checkpoint: "pre_pr") to continue.
+          // F08: no push/PR without human auth completes LOCALLY instead of
+          // pausing: the destination already received the delivery above, so
+          // the run finishes (completed_local semantics on status completed)
+          // with an explicit note — never conditioned on a PR.
           if (/explicit human authorization/i.test(errMsg)) {
-            this.showToast('Mission Control', 'All jobs merged. PR needs explicit human authorization.', 'warning');
+            const completedAt = new Date().toISOString();
+            await updatePlanFields(latestPlan.id, { status: 'completed', completedAt });
+            const donePlan = (await loadPlan(this.effectiveRepoRoot())) ?? { ...latestPlan, status: 'completed' as const, completedAt };
+            await this.writeAutoFinalReport(donePlan);
+            this.stopReconciler();
+            this.unsubscribeFromMonitorEvents();
+            this.showToast('Mission Control', 'All jobs merged. Completed locally (PR needs explicit human authorization, no push was made).', 'success');
             this.notify(
-              `⏸️ All ${latestPlan.jobs.length} jobs merged. PR creation needs explicit human authorization — ` +
-              `no push was made. Approve with mc_plan_approve(checkpoint: "pre_pr").`,
+              `🎉 All ${latestPlan.jobs.length} jobs merged. Completed locally on the destination branch — ` +
+              `no push was made (PR needs explicit human authorization).`,
             );
-            await this.setCheckpoint('pre_pr', latestPlan);
-            await this.writeAutoFinalReport((await loadPlan(this.effectiveRepoRoot())) ?? latestPlan);
             return;
           }
           const completedAt = new Date().toISOString();

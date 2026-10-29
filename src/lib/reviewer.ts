@@ -83,12 +83,24 @@ function matchesTouchSet(file: string, touchSet: string[]): boolean {
 }
 
 /**
- * An anchor counts as covered only when it appears in the observable test
- * output. A matching filename in the diff is NOT coverage: it proves the
- * file changed, not that any green test exercised the requirement.
+ * An anchor counts as covered only when it appears in OBSERVED test output
+ * from a product-executed test command — never in caller-declared text.
+ * A matching filename in the diff is NOT coverage, and a bare echo of the
+ * anchor is NOT execution: real runner output carries context (pass/fail,
+ * test counts) around the requirement string. Trivial echoes fail here;
+ * the authoritative guarantee comes from the orchestrator re-running the
+ * test command itself and feeding THAT output in (never a worker claim).
  */
 function anchorCovered(anchor: string, output: string): boolean {
-  return output.includes(anchor);
+  if (!anchor || anchor.trim().length < 3) return false;
+  if (!output || !output.includes(anchor)) return false;
+  const trimmedOutput = output.trim();
+  const trimmedAnchor = anchor.trim();
+  // Exact echo of the anchor proves nothing was executed.
+  if (trimmedOutput.length <= trimmedAnchor.length) return false;
+  // shortcut: heuristic on runner tokens — upgrade to a structured parser if it misfires.
+  if (!/pass|fail|ok\b|test|✓|✔|assert|expect|bun|vitest|jest/i.test(output)) return false;
+  return true;
 }
 
 /**
@@ -133,6 +145,12 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
   }
   if (!ev.output || ev.output.trim() === '') {
     reasons.push('missing observable test output: nothing to verify');
+  }
+  // Provenance: the output must come from a product-executed run (command +
+  // exit + output + commit + environment recorded by the orchestrator), not
+  // from caller-declared text. No environment = no observable execution.
+  if (!ev.environment || ev.environment.trim() === '') {
+    reasons.push('missing execution environment: cannot tell observed product execution from declared text');
   }
   if (!ev.testedCommit || ev.testedCommit.trim() === '') {
     reasons.push('missing tested commit: unknown which code was tested');

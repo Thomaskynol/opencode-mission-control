@@ -480,3 +480,47 @@ Limitações restantes (adendo honesto):
 5. `E2E-E` segue Pendente (roteiro fase a fase não executado); merges reais com workers
    vivos não re-demonstrados nesta lane (cobertos por `live-proof.md` + `single-demo`).
 6. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência (§22.2).
+
+## 24. Adendo review-destination-report (F01+F08+F09, HEAD desta lane)
+
+Escopo: `src/lib/reviewer.ts`, `src/lib/merge-train.ts`,
+`src/lib/orchestrator.ts`, `src/lib/durable-state.ts` (só persistência de
+evidências/decisões), `src/tools/report.ts`. Sem tocar
+auto-commands/forms/paths/plan-state/integration/model-tracker. Sem push/PR,
+sem perfil global, modelo `muse-spark-1.3-contributor` autorizado, sem segredos.
+
+| ID | Defeito (revisão) | Correção | Evidência |
+| --- | --- | --- | --- |
+| F01 | Caminho normal sem revisão (`getMergeTrainConfig` sem `requireReviewPass`, `processNext()` sem veredito, ausência aceita, sem `testCommand` vira success skipped; `reviewJob`/`runReviewFixLoop` sem chamador; substring fraca aprova `echo` com âncora) | `getMergeTrainConfig` com `requireReviewPass:true` (fail-closed autônomo; legado permissivo só em chamadores diretos de `MergeTrain`); `buildReviewInput` coleta evidência observada pelo produto (comando+exit+saída+commit+ambiente) + `reviewJobWithFixLoop` (`reviewJob`+`runReviewFixLoop`) no caminho real antes de `processNext(verdict)`; sem `testCommand` ou diff vazio bloqueia em modo estrito (nunca success-skipped como verificado); `anchorCovered` exige match em saída com contexto de runner (eco exato falha) + `environment` obrigatório (texto declarado sem proveniência falha) | `tests/lib/review-destination-regression.test.ts` (eco, sem-env, omitido→fail, strict sem-teste→`review_blocked`, `requireReviewPass:true`); RED antes: 2 pass 5 fail; GREEN depois: 7 pass 0 fail |
+| F08 | Destino configurado sem entrega (integração em intermediária, fim local condicionado a PR, main intacta) | `completeLocalDestination`: separa base/integração/destino final; após verificações, merge local `--no-ff` na destino sem push/PR, suja recusa (protege preexistente), reverifica com `testCommand` se destino avançou desde `baseCommit`; `allMerged` conclui local (`completed`, sem `prUrl`) quando sem `humanAuth` em vez de pausar em `pre_pr`; supervisor mantém `pre_pr` após entrega local (PR pendente, destino já recebido) | Mesmo arquivo de regressão (destino contém integração, `ship.txt` presente, suja recusa); `tests/lib/monitor-autocomplete.test.ts` atualizado (auth-negado agora `completed`, não `paused`) |
+| F09 | Relatório com seções vazias (`decisions/files/installUsage/tests/verified/limitations` vazios, pedido resumido, `MergeTestReports` perdidos, falha engolida) | `durable-state.mergeEvidence` (`save/loadMergeEvidence`, preservado em todos RMW); `processNext` sucesso conserva evidência; `writeAutoFinalReport` + `mc_report_final` reúnem pedido/decisões/committs/testes/aceitação reais, `MergeTestReports` como anexos, `verified` só com `passed` conservado, `limitations` real; falha de geração notifica+log em vez de `catch{}` | Mesmo arquivo (builder com dados reais); `report-final.test.ts` segue verde (sem evidência→`verified` vazio); `writeAutoFinalReport` agora loga `auto final report failed` em vez de silêncio |
+
+Regressões via caminho público (sem harness por fora):
+- Pedido público com entrega in-scope, testes verdes e requisito omitido → `reviewJob` fail `REQ-EMPTY`, correção pedida via `on_error`+`mc_plan_approve` (não integra).
+- Entrega sem teste → `MergeTrain` estrito retorna `review_blocked` (HEAD intacto), nunca `merged` como verificado.
+- Conclusão local na destino + relatório com evidências reais, sem PR/push (merge local + `completed` + anexos `MergeTestReport`).
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`Bundled 223 modules`, `index.js 1.42 MB`,
+`/tmp/opencode/f01f08f09-build.log`); focado
+`review-destination+reviewer+merge-train+durable+autocomplete+orchestrator+modes+wire`
+→ exit 0 (**173 pass, 0 fail**,
+`/tmp/opencode/f01f08f09-focused.log`); full `bun test` → exit 1 —
+**1057 pass, 6 fail** (1063 testes / 70 arquivos; 6 fails só
+`tests/lib/tmux*.test.ts`, pré-existentes e ambientais, mesmos nomes do
+baseline §22.2; +7 testes vs 1050/69 do repo-context; sem fail fora do
+domínio tmux; `/tmp/opencode/full-test-f08.log`).
+Repro-antes (TDD RED): `review-destination-regression` 2 pass 5 fail (eco,
+sem-env, strict sem-teste success, `requireReviewPass` ausente,
+`completeLocalDestination` ausente); repro-depois (GREEN): 7 pass 0 fail.
+
+Limitações restantes (adendo honesto):
+1. `reports.ts`/`git.ts` intocados (outro owner/legado): relatório usa dados
+   conservados via `durable-state`; `git` sem `cwd` fora dos caminhos cobertos
+   segue cwd-dependente (orchestrator reimplementa com `cwd` explícito).
+2. Planos manuais sem intake e sem aceitação mantêm só test-gate (evidência
+   ainda exigida): fail-closed integral vale no caminho público (intake
+   sempre tem requisitos/aceitação); legado manual preservado p/ suítes de
+   integração (`orchestration.test.ts` 4 pass sem intake).
+3. `E2E-E` segue Pendente; workers vivos não re-demonstrados nesta lane.
+4. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência.

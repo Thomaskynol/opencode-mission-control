@@ -523,8 +523,11 @@ describe('monitor-autocomplete: writeAutoFinalReport best-effort (completed + pr
 
     await (orchestrator as any)._doReconcile();
 
-    expect(planState?.status).toBe('paused');
-    expect(planState?.checkpoint).toBe('pre_pr');
+    // F08: no push/PR without human auth completes LOCALLY instead of
+    // pausing — the destination already received the delivery, so the run
+    // finishes (completed) with an explicit note, never conditioned on a PR.
+    expect(planState?.status).toBe('completed');
+    expect(planState?.checkpoint ?? null).toBeNull();
     expect(writeSpy).toHaveBeenCalledTimes(1);
   });
 

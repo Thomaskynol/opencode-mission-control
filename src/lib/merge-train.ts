@@ -575,7 +575,22 @@ export class MergeTrain {
       if (commitResult.exitCode !== 0) {
         // M5/M7: an empty diff is valid for diagnosis — a merge with no
         // changes is a no-op success, never an artificial failure.
+        // F01: in strict (requireReviewPass) mode an empty diff is NOT
+        // verifiable delivery — block instead of succeeding skipped.
         if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
+          if (this.config?.requireReviewPass) {
+            await rollbackMerge(this.integrationWorktree);
+            return {
+              success: false,
+              type: 'review_blocked',
+              output: `Review blocked: job "${job.name}" has no changes (empty diff) — nothing to verify`,
+              testReport: {
+                status: 'skipped',
+                reason: 'No changes to merge (empty diff) — blocked in strict mode, never verified',
+                setup: { status: 'skipped', commands: [] },
+              },
+            };
+          }
           await rollbackMerge(this.integrationWorktree);
           return {
             success: true,
@@ -629,7 +644,22 @@ export class MergeTrain {
       if (commitResult.exitCode !== 0) {
         // M5/M7: an empty diff is valid for diagnosis — a merge with no
         // changes is a no-op success, never an artificial failure.
+        // F01: in strict (requireReviewPass) mode an empty diff is NOT
+        // verifiable delivery — block instead of succeeding skipped.
         if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
+          if (this.config?.requireReviewPass) {
+            await rollbackMerge(this.integrationWorktree);
+            return {
+              success: false,
+              type: 'review_blocked',
+              output: `Review blocked: job "${job.name}" has no changes (empty diff) — nothing to verify`,
+              testReport: {
+                status: 'skipped',
+                reason: 'No changes to merge (empty diff) — blocked in strict mode, never verified',
+                setup: { status: 'skipped', commands: [] },
+              },
+            };
+          }
           await rollbackMerge(this.integrationWorktree);
           return {
             success: true,
@@ -678,7 +708,25 @@ export class MergeTrain {
       ? this.config.testCommand
       : await detectTestCommand(this.integrationWorktree);
 
+    // F01: without test evidence there is no verification. Strict
+    // (requireReviewPass) mode blocks instead of succeeding skipped;
+    // legacy callers keep the permissive no-op success.
     if (!testCommand) {
+      if (this.config?.requireReviewPass) {
+        return {
+          success: false,
+          type: 'review_blocked',
+          output: `Review blocked: job "${job.name}" has no test command — missing test evidence (never integrate untested as verified)`,
+          testReport: {
+            status: 'skipped',
+            reason: 'No test command configured or detected — blocked in strict mode',
+            setup: {
+              status: 'skipped',
+              commands: [],
+            },
+          },
+        };
+      }
       console.warn(
         `No test command configured or detected in ${this.integrationWorktree}. Skipping test gating.`,
       );

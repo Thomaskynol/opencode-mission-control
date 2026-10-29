@@ -99,7 +99,16 @@ export const mc_report_final: ToolDefinition = tool({
     if (!plan) {
       throw new Error('No active plan to report on');
     }
-    const [state, reports] = await Promise.all([loadJobState(), readAllReports()]);
+    // F09: never throw on missing sidecar — an absent intake/evidence file
+    // means "no conserved evidence yet", not a report failure. Real data is
+    // used when present; empties below only reflect genuinely missing input.
+    const [state, reports, snap, mergeEvidence] = await Promise.all([
+      loadJobState(),
+      readAllReports(),
+      import('../lib/durable-state').then((m) => m.loadRuntimeSnapshot().catch(() => null)),
+      import('../lib/durable-state').then((m) => m.loadMergeEvidence().catch(() => ({}))),
+    ]);
+    const intake = (snap as { autoIntake?: { request?: string; requirements?: Array<{ id: string; text: string }>; decisions?: string[]; questions?: string[] } | null } | null)?.autoIntake ?? null;
     const withAttachments = args.includeAttachments ?? true;
 
     const tasks = plan.jobs.map((job) => ({
@@ -113,12 +122,17 @@ export const mc_report_final: ToolDefinition = tool({
       .map((job) => job.name);
     // Fail-closed, two distinct claims:
     // - integrated = merged into the integration branch (a merge happened).
-    // - verified = merged AND backed by recorded test evidence.
-    // A merge alone does not prove functioning, and no per-job test
-    // evidence is persisted at report time — so nothing is claimed
-    // verified here. Merges are listed under Integration; unknown work
-    // stays under Gaps, never under Verified.
-    const verified: string[] = [];
+    // - verified = merged AND backed by conserved product test evidence.
+    // A merge alone does not prove functioning; without conserved evidence
+    // nothing is claimed verified. Merges are listed under Integration;
+    // unknown work stays under Gaps, never under Verified.
+    const evidenceRecs = Object.values(mergeEvidence as Record<string, { testStatus?: string; testCommand?: string; reviewedCommit?: string }>);
+    const verified = merged
+      .filter((name) => (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed')
+      .map((name) => {
+        const rec = (mergeEvidence as Record<string, { testCommand?: string; reviewedCommit?: string }>)[name];
+        return `${name} [merged]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+      });
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
       .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
@@ -130,20 +144,32 @@ export const mc_report_final: ToolDefinition = tool({
       .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
       .map((job) => `${job.name} [${job.status}] — outcome not verified`);
     const notes = args.notes?.trim() ? [args.notes.trim()] : [];
+    const files = [...new Set(evidenceRecs.flatMap((r) => (r as { changedFiles?: string[] }).changedFiles ?? []))];
+    const installUsage = [...new Set(evidenceRecs.flatMap((r) => {
+      const rec = r as { setupCommands?: string[]; testCommand?: string };
+      return [...(rec.setupCommands ?? []), ...(rec.testCommand ? [rec.testCommand] : [])];
+    }))];
+    const tests = evidenceRecs
+      .filter((r) => (r as { testCommand?: string }).testCommand)
+      .map((r) => {
+        const rec = r as { testCommand?: string; testStatus?: string; testOutput?: string };
+        return { command: rec.testCommand!, result: rec.testStatus ?? 'skipped', output: rec.testOutput };
+      });
+    const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
 
     const markdown = buildFinalReportMarkdown({
       title: plan.name,
-      request: `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
-      scope: plan.jobs.map((job) => job.name),
+      request: intake?.request?.trim() ? intake.request.trim() : `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
+      scope: intake?.requirements?.length ? intake.requirements.map((r) => `${r.id}: ${r.text}`) : plan.jobs.map((job) => job.name),
       architecture: [`Integration branch: ${plan.integrationBranch}`, `Base commit: ${plan.baseCommit}`],
-      decisions: [],
+      decisions,
       tasks,
       contributions: reports.map((report) => ({
         instance: report.jobId,
         job: report.jobName,
         summary: `[${report.status}] ${report.message}`,
       })),
-      files: [],
+      files,
       branches: [
         plan.integrationBranch,
         ...plan.jobs.map((job) => job.branch).filter((branch): branch is string => Boolean(branch)),
@@ -152,16 +178,23 @@ export const mc_report_final: ToolDefinition = tool({
         branch: plan.integrationBranch,
         merged,
         conflicts,
-        note: plan.prUrl ? `PR: ${plan.prUrl}` : undefined,
+        note: plan.prUrl ? `PR: ${plan.prUrl}` : 'Local completion only; no push/PR without explicit humanAuth',
       },
-      installUsage: [],
-      tests: [],
-      evidences: [...notes, `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`],
+      installUsage,
+      tests,
+      evidences: [
+        ...evidenceRecs.map((r) => {
+          const rec = r as { jobName?: string; testStatus?: string; testCommand?: string; reviewedCommit?: string; testOutput?: string };
+          return `${rec.jobName ?? 'job'} [${rec.testStatus ?? 'skipped'}]${rec.testCommand ? ` ${rec.testCommand}` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}${rec.testOutput ? ` — ${rec.testOutput.slice(0, 200)}` : ''}`;
+        }),
+        ...notes,
+        `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
+      ],
       problems: unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
       verified,
       unmet,
       unverified,
-      limitations: [],
+      limitations: ['Local completion only; no push/PR without explicit humanAuth'],
       nextSteps: unverified.length > 0 || unmet.length > 0
         ? ['Resolve the Gaps above, then re-run this report']
         : [],
@@ -173,12 +206,27 @@ export const mc_report_final: ToolDefinition = tool({
         cleanup: [],
       },
       attachments: withAttachments
-        ? reports.map((report) => ({
-          name: `${report.jobName} [${report.status}] @ ${report.timestamp}`,
-          content: report.progress !== undefined
-            ? `${report.message} (${report.progress}%)`
-            : report.message,
-        }))
+        ? [
+          ...reports.map((report) => ({
+            name: `${report.jobName} [${report.status}] @ ${report.timestamp}`,
+            content: report.progress !== undefined
+              ? `${report.message} (${report.progress}%)`
+              : report.message,
+          })),
+          ...evidenceRecs.map((r) => {
+            const rec = r as { jobName?: string; testStatus?: string; mergedAt?: string; testCommand?: string; reviewedCommit?: string; reviewedBase?: string; testOutput?: string };
+            return {
+              name: `MergeTestReport ${rec.jobName ?? 'job'} [${rec.testStatus ?? 'skipped'}] @ ${rec.mergedAt ?? 'unknown'}`,
+              content: [
+                rec.testCommand ? `command: ${rec.testCommand}` : null,
+                `status: ${rec.testStatus ?? 'skipped'}`,
+                rec.reviewedCommit ? `reviewedCommit: ${rec.reviewedCommit}` : null,
+                rec.reviewedBase ? `reviewedBase: ${rec.reviewedBase}` : null,
+                rec.testOutput ? `output:\n${rec.testOutput.slice(0, 4000)}` : null,
+              ].filter(Boolean).join('\n') || '(no test output)',
+            };
+          }),
+        ]
         : [],
     });
 
