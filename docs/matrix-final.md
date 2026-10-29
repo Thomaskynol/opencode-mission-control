@@ -594,3 +594,47 @@ execução real das 21 tools via V2 com LLM vivo **não validada** (probe isolad
 sem auth; validar = projeto com auth + `mc_status` via V2); `command.execute.before`
 /`config` sem equivalente V2 mapeado (pendente, documentado no código); V1
 preservado via named `MissionControl` (testes usam named; `default` agora é V2).
+
+## 27. Adendo final-findings (consolidação F01–F12, HEAD desta lane)
+
+Consolidação dos achados F01–F12 das lanes pós-`56656a6`. Nível por achado:
+**Corrigido** (fix + regressão verde + sem regressão no full) /
+**Parcial** (fix prova um recorte; resto pendente explícito). Nenhum
+Pendente integral: todos têm correção commitada e regressão verde.
+
+| ID | Achado | Status | Teste regressivo | Commit |
+| --- | --- | --- | --- | --- |
+| F01 | Caminho normal sem revisão (merge sem veredito, sem-teste virava success-skipped, âncora fraca) | **Corrigido** | `tests/lib/review-destination-regression.test.ts` (7 pass; RED 2 pass 5 fail antes) | `0b958cc` |
+| F02 | `--repo` ignorado (Orchestrator/integração/paths no cwd, `getProjectId` só basename) | **Corrigido** | `tests/lib/repo-context-regression.test.ts` (RED 2 fail antes, GREEN depois) | `c5ede03` |
+| F03 | Complement só salvava texto (plano intocado) | **Corrigido** | `tests/lib/f03f05f06f07-regression.test.ts` (RED 1 pass 9 fail, GREEN 10 pass) | `5b46991` |
+| F04 | Ceiling guardado mas não aplicado (teto 1 reinterpretado p/ 4–8, merge sem `testCommand`) | **Corrigido** | `tests/lib/ceiling-context-regression.test.ts` (RED 3 fail antes) | `c5ede03` |
+| F05 | `answerViaPermission` aprovava por omissão ("não autorizo"→once) | **Corrigido** | mesmo `f03f05f06f07` (deny/clarify PT+EN; legado free-text→once atualizado p/ fail-closed) | `5b46991` |
+| F06 | Modelo efetivo divergente (fallback fixo, unknown/unknown silencioso, variant perdida) | **Corrigido** (limites §25.1–3: sem InstanceManager no caminho tmux; TUI `-m` sem variant) | mesmo `f03f05f06f07` (planner==coordinator, nunca unknown silencioso) | `5b46991` |
+| F07 | Resume sem retomada real (awaiting-plan vazio, merging preso, `reconcileOnBoot` sem chamador) | **Corrigido** | mesmo `f03f05f06f07` (awaiting-plan gera plano; kill-9 simulado reconcilia) | `5b46991` |
+| F08 | Destino configurado sem entrega (fim local condicionado a PR) | **Corrigido** | mesmo `review-destination` (`completeLocalDestination`, suja recusa) | `0b958cc` |
+| F09 | Relatório com seções vazias, `MergeTestReports` perdidos, falha engolida | **Corrigido** | mesmo `review-destination` + `report-final.test.ts` verde | `0b958cc` |
+| F10 | Plugin só V1 (`default` função rejeitada pelo host 2.1.4) | **Parcial**: carga V2 provada (loader aceita, setup sem erro); execução real das 21 tools via V2 com LLM vivo **pendente** | `tests/plugin-init.test.ts` (V1 named + V2 `default.id/setup`); probes `/tmp/opencode/f10-v2-load2.log` + `ctx-dump.json` | `c765364` |
+| F11 | `--context` só path no prompt, sem leitura nem persistência | **Corrigido** | mesmo `ceiling-context` (conteúdo inline no prompt, intake+resume preservam) | `c5ede03` |
+| F12 | Lock quebrado por idade com holder vivo (setup/teste > 660s) | **Corrigido** | `tests/lib/file-lock.test.ts` (RED invasão antes, `TIMED_OUT` sem invasão depois) | `a91cd3e` |
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`Bundled 223 modules`, `index.js 1.44 MB`,
+`/tmp/opencode/final-findings-build.log`); full `bun test` → exit 1 —
+**1069 pass, 7 fail** (`/tmp/opencode/final-findings-test.log`, 1076 testes /
+71 arquivos — totais idênticos aos da lane F12+F10, §26). Os 7 fails são os
+mesmos nomes/arquivos do baseline documentado (§22.2 + §§25–26): 6×
+`tests/lib/tmux*.test.ts` (4 `isPaneRunning`, 1 `capturePane` inválido, 1
+`tmux.test.ts isPaneRunning`) + 1× `wire-report createPR` (ambiental, mesmo
+padrão F03). Prova de isolamento (ambos exit 0): tmux isolado **23 pass**
+(`/tmp/opencode/final-findings-tmux-isolated.log`); wire isolado **11 pass**
+(`/tmp/opencode/final-findings-wire-isolated.log`). **Nenhum fail fora do
+conjunto baseline ⇒ nenhuma regressão ⇒ `src/` intocado nesta lane.**
+
+Revalidação live: `src/` mudou em todas as lanes F01–F12 após os ciclos live
+(`live-proof.md`, `public-demo.md` Casos 1/2, `single-demo` single-4), logo
+**revalidação live ponta-a-ponta dos caminhos alterados (gate estrito,
+`completeLocalDestination`, complement via modelo, permissão fail-closed,
+lease do lock, execução V2) segue pendente** — nenhuma cobertura live nova é
+alegada aqui. Evidências live anteriores valem onde o caminho segue
+inalterado desde a demo (coordenador juiz único, kill-9/resume do plano,
+teto com compensação, TUI pause/resume e forms G1/G2, triplo G3).

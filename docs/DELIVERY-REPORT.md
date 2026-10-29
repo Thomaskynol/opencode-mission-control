@@ -345,3 +345,45 @@ bun src/orchestrator-cli/index.ts close
   ou mutação remota; branch sem upstream; `origin`/`upstream` intocados;
   perfil global OpenCode intocado; sem segredos (grep pré-commit só acha
   `ask-user` como string de política).
+
+## 14. Final findings (2026-10-29, esta lane — sole writer, verificação pós-F01–F12)
+
+O que mudou desde `56656a6` (mission-close): 5 lanes de correção + 1 docs,
+6 commits locais, nenhum push/PR:
+
+- `c5ede03` fix(repo-context-config) — F02+F04+F11 (repo explícito fim-a-fim,
+  ceiling efetivo, `--context` carregado);
+- `0b958cc` fix(review-destination) — F01+F08+F09 (gate fail-closed, destino
+  local, relatórios com evidência);
+- `5b46991` fix(replan-auth-model-resume) — F03+F05+F06+F07 (complement real,
+  permissão fail-closed, modelo único, resume recuperável);
+- `a91cd3e` fix(lock) — F12 (lease com heartbeat);
+- `c765364` fix(plugin) — F10 (adaptador V2, V1 preservado como named);
+- `45df62b` docs(matrix-final) — adendo lock-plugin F12+F10.
+
+Consolidação honesta por achado em `matrix-final.md` §27: F01–F09, F11–F12
+**Corrigidos**; F10 **Parcial** (carga V2 provada, execução das tools via V2
+com LLM vivo pendente). Limites de cada lane preservados nas §§23–26, sem
+re-escrita.
+
+- **Checks frescos desta lane** (log integral, exit capturado sem pipe):
+  `bun run build` → exit 0 (`Bundled 223 modules`, `index.js 1.44 MB`,
+  `/tmp/opencode/final-findings-build.log`); `bun test` full → exit 1 —
+  **1069 pass, 7 fail** (1076 testes / 71 arquivos,
+  `/tmp/opencode/final-findings-test.log`; totais idênticos à lane F12+F10).
+  Os 7 = mesmos nomes/arquivos do baseline (§22.2 + §§25–26): 6 tmux +
+  1 `wire-report createPR` ambiental. Isolados verdes (exit 0): tmux
+  **23 pass** (`final-findings-tmux-isolated.log`), wire **11 pass**
+  (`final-findings-wire-isolated.log`). Nenhum fail fora do baseline ⇒
+  nenhuma regressão ⇒ `src/` intocado aqui.
+- **Matriz ligada**: `matrix-final.md` §§1–27 (Anexo A + E2E + REC-1…9 +
+  F01–F12 consolidados no §27). Nenhum upgrade de nível nesta lane.
+- **Revalidação live pendente**: `src/` mudou em todas as lanes F01–F12 após
+  os ciclos live, logo o ponta-a-ponta dos caminhos alterados segue pendente
+  (detalhe no §27); nenhuma cobertura live nova alegada.
+- **Segredos**: grep por chaves/tokens em `src/` só acha `ask-user` como
+  string de política (falso positivo de `sk-`) e `${password}` interpolado
+  (serve-auth por env, sem valor hardcoded). Nada a expurgar.
+- **Estado de alterações**: ao abrir a lane a árvore estava limpa
+  (`45df62b`, stash vazio, sem untracked); esta lane só acrescenta docs
+  (matrix §27 + este §14) + 1 commit local. Sem push/PR, sem perfil global.
