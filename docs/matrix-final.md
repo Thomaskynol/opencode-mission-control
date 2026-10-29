@@ -785,3 +785,28 @@ tmpdir (sem LLM/tmux); "live" = modelo vivo + tmux + worktrees reais.
 → `a48000f` fix(gate-resume-approve) → `d6d0d73` fix(baseBranch) →
 `c2759a1` docs(v2-validation). Todos locais em
 `feat/autonomous-orchestrator-v2`, HEAD `c2759a1a27cad6417966c9830e47ec8b88aa7049`.
+
+## 30. Adendo dest-live (F08-destino: Validado live, 2026-10-29)
+
+Prova live com destino explícita pós-fix `d6d0d73` (fecha §29.3 item 3).
+Plugin HEAD `f30e6f5c5220eb74a5a286425120e27a340655ae`. Sem push/PR,
+sem perfil global, modelo `opencode-go/muse-spark-1.3-contributor`.
+
+| Item | Resultado | Evidência |
+| --- | --- | --- |
+| Veredito | **PASS** — `--branch demo/dest-check` chegou ao destino (fix `d6d0d73`) | `/tmp/opencode/dest-live/12-veredito.log` |
+| Plano | `7da749ad-4f9a-4f82-9bfb-b67ac05cf740` [completed], `baseBranch=demo/dest-check` preservado no round-trip, intake `targetBranch` igual, 3/3 merged | `08-plan-final.json`, `08-final-state.json.log` (`baseBranch`, `mergedAt` 3×) |
+| Destino | `demo/dest-check@df06519f` (de `1e9bfb81`) com `helpers/slugify.js` + `helpers/isEven.js` + `README.md`; `node check.mjs` **PASS** (exit 0) | `09-destination.log`, `10-verify-check.log` |
+| `main` intacta | `f467f8d` sem helpers, `check.mjs` **FAIL esperado** (exit 1) | `09-destination.log`, `10-verify-check.log` |
+| Gate/pausa | sem gate/pausa (sem approve; checkpoint sempre null) | `11-final-report.log` (intervenções + approve) |
+
+Intervenções: 2 (planner gerou 1 task → restart com request Task1/2/3;
+cleanup só de recursos próprios `repo-f447141c6c31`, branches de auditoria
+preservadas no repo descartável) — `interventions.log`.
+
+Ressalva (não bloqueante, follow-up): warning pós-conclusão local
+`[MC] Invalid plan transition: running → creating_pr` em
+`01-start2.log:10` — plano já `completed` com destino entregue; transição
+espúria p/ `creating_pr` rejeitada sem efeito. Registrar como follow-up
+(máquina de estados: não tentar `creating_pr` após entrega local sem
+`humanAuth`).
