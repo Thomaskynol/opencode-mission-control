@@ -638,3 +638,54 @@ lease do lock, execução V2) segue pendente** — nenhuma cobertura live nova �
 alegada aqui. Evidências live anteriores valem onde o caminho segue
 inalterado desde a demo (coordenador juiz único, kill-9/resume do plano,
 teto com compensação, TUI pause/resume e forms G1/G2, triplo G3).
+
+## 28. Adendo v2-validation (F10: carga × registro × execução, HEAD desta lane)
+
+Escopo: validação V2 completa em 3 camadas separadas, sem tocar `src/`
+(nenhum gap bloqueante encontrado → adaptador intocado), sem push/PR, sem
+perfil global. Base `d6d0d73`. Modelo: nenhum chamado (zero custo; consumo
+desconhecido = 0 nesta lane — só leitura/status via harness local).
+
+| Camada | O que foi provado | Como | Evidência |
+| --- | --- | --- | --- |
+| 1. Carga | Plugin carrega no loader V2 real 2.1.4, por projeto (`.opencode/plugins`, sem tocar perfil global), **0 `failed to load plugin`** | `opencode run --standalone --print-logs` em `/tmp/opencode/v2/proj` com `dist/index.js` fresco copiado p/ `.opencode/plugins/mc-v2/index.js` (timeout 25s; exit 1 só pelo `User not found` do probe sem auth, sem relação com o plugin) | `/tmp/opencode/v2/load.log` (22 `loading plugin`, 2× `mc-v2`, 0 failed; erro único `AI.Error.Authentication: User not found`) + `/tmp/opencode/v2/run-load-probe.sh` |
+| 2. Registro | As 21 tools registradas via `default.setup` → `tool.transform`: nome + descrição + input objeto + `execute` função, **por tool**; `input.properties` == chaves de `args` V1 por tool; sem nenhuma chamada LLM (validação contra o adaptador + harness local) | `tests/v2-contract.test.ts` (novo): `registers exactly the 21 expected tools` + `it.each(21)` forma + `input properties match v1 args keys` | `bun test tests/v2-contract.test.ts` → exit 0, **26 pass, 0 fail** (`/tmp/opencode/v2/` não guarda este log; reproduzível via comando) |
+| 3. Execução | Execução real representativa via plugin carregado no V2 (bundle `dist`, `setup` **sem `client`** = caminho shim do host real): `mc_overview` + `mc_jobs` + `mc_plan_status` retornam `{content:[{type:'text',text}]}` com conteúdo correto | harness `/tmp/opencode/v2/v2-exec.mjs` + `/tmp/opencode/v2/v2-exec-detail.mjs` (timeout 60s, cwd `/tmp/opencode/v2/exec-probe`, estado vazio) | `/tmp/opencode/v2/exec.log` (21 tools, 3 ok), `exec-mc_overview.txt` (`Mission Control Dashboard`, 436 chars), `exec-mc_jobs.txt` (`No jobs found`), `exec-mc_plan_status.txt` (`No active plan`), `registered-21.json`, `schema-*.json` |
+
+Gaps registrados (degradação graceful, nenhum bloqueia execução):
+1. `config`/`command.execute.before` V1 sem equivalente mapeado no V2
+   (slash-commands indisponíveis via V2; tools/eventos/prompt/compactação
+   mapeados). Pendente documentado desde §26, inalterado.
+2. `sessionID:''` no contexto de `execute` do adaptador: `mc_launch`/`mc_plan`
+   usam `context?.sessionID` só p/ `launchSessionID` + `getCurrentModel`
+   (optional chaining → fallback, sem crash). Leitura/status não usam sessão.
+3. Shim V2 (`session.list→[]`, `config.get→{}`, `tui.showToast→no-op`,
+   `session.prompt→no-op` com `catch{}`): setup nunca falha por superfície
+   ausente; monitor/notificações sobem sobre o shim sem erro (carga com 0
+   failed prova).
+4. `directory/worktree` do `execute` = `process.cwd()` no momento da chamada
+   (não o `location.directory` de setup): correto no host real (cwd = projeto)
+   e no harness (chdir p/ probe).
+5. Não executado via LLM vivo: `mc_launch` descartável / dry-run real e as 17
+   tools com side effects (kill/merge/cleanup/answer/…). Via LLM exigiria
+   modelo autorizado + tmux/worktrees — fora do recorte sem-custo desta lane,
+   segue pendente explícito (F10 abaixo).
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`Bundled 222 modules`, `index.js 1.43 MB`,
+`/tmp/opencode/v2/build.log`); `bun test tests/v2-contract.test.ts` → exit 0
+(**26 pass, 0 fail**); full `bun test` → exit 1 — **1113 pass, 7 fail**
+(1120 testes / 77 arquivos, `/tmp/opencode/v2/full-test.log`): 6×
+`tests/lib/tmux*.test.ts` + 1× `wire-report createPR` — mesmo conjunto
+ambiental do baseline (§22.2 + §§25–27), nenhum fail fora do domínio
+conhecido. Isolamentos ambos exit 0: tmux **23 pass**
+(`/tmp/opencode/v2/tmux-isolated.log`); wire **11 pass**
+(`/tmp/opencode/v2/wire-isolated.log`). `src/` intocado (só `tests/` novo +
+este adendo) ⇒ nenhuma regressão introduzida. Perfil global intocado
+(só `/tmp/opencode/v2/proj/.opencode/plugins/mc-v2/`); sem segredos; sem
+push/PR.
+
+Status F10 após esta lane: **Parcial-alta** — carga (0 failed loads) +
+registro (21 contratos) + execução representativa sem-custo (overview/jobs/
+plan_status via V2) comprovados; execução das 17 tools com side effects via
+LLM vivo segue pendente e não alegada.
