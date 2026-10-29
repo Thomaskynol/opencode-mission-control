@@ -217,8 +217,9 @@ export function integrationLockPath(worktreePath: string): string {
  * Run `fn` holding the per-integration-branch file lock.
  * Merge-train integration must go through here so concurrent processes
  * cannot interleave merges into the same branch.
- * Uses INTEGRATION_STALE_MS (not the 15s default): merge+test runs hold
- * the lock for minutes, and a stale break mid-run would corrupt the branch.
+ * Uses INTEGRATION_STALE_MS (not the 15s default) with lease heartbeat:
+ * merge+test runs hold the lock for minutes and keep renewing, so only
+ * a dead holder (no heartbeat progress) is ever broken.
  */
 export async function withIntegrationLock<T>(
   worktreePath: string,

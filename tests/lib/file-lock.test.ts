@@ -119,4 +119,70 @@ describe('file-lock', () => {
     expect(fs.existsSync(lock)).toBe(true);
     expect(fs.readFileSync(lock, 'utf8')).toBe('someone-else-token');
   });
+
+  it('should not break a live holder with heartbeat during a long operation (2 processes)', async () => {
+    const lock = join(testDir, 'lease.lock');
+    const marker = join(testDir, 'holder-done.txt');
+    const invaded = join(testDir, 'invaded.txt');
+    const repoRoot = new URL('../../', import.meta.url).pathname;
+    const workerImport = JSON.stringify(join(repoRoot, 'src/lib/file-lock.ts'));
+
+    const holderPath = join(testDir, 'lease-holder.ts');
+    const contenderPath = join(testDir, 'lease-contender.ts');
+    await Bun.write(
+      holderPath,
+      `import { withFileLock } from ${workerImport};\n` +
+        `const lock = process.env.MC_LOCK!;\n` +
+        `const marker = process.env.MC_MARKER!;\n` +
+        `await withFileLock(lock, async () => {\n` +
+        `  await new Promise((r) => setTimeout(r, 3000));\n` +
+        `  await Bun.write(marker, 'holder-done');\n` +
+        `}, { staleMs: 2000, heartbeatMs: 200, timeoutMs: 10000 });\n`,
+    );
+    await Bun.write(
+      contenderPath,
+      `import { withFileLock } from ${workerImport};\n` +
+        `const lock = process.env.MC_LOCK!;\n` +
+        `const invaded = process.env.MC_INVADED!;\n` +
+        `try {\n` +
+        `  await withFileLock(lock, async () => {\n` +
+        `    await Bun.write(invaded, 'invaded');\n` +
+        `  }, { staleMs: 2000, heartbeatMs: 200, timeoutMs: 1500, retryMs: 50 });\n` +
+        `  console.log('ACQUIRED');\n` +
+        `} catch (e) {\n` +
+        `  console.log('TIMED_OUT:' + (e as Error).message);\n` +
+        `}\n`,
+    );
+
+    const holderEnv = { MC_LOCK: lock, MC_MARKER: marker };
+    const contenderEnv = { MC_LOCK: lock, MC_INVADED: invaded };
+    const holder = Bun.spawn([process.execPath, holderPath], {
+      env: holderEnv,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    // Let the holder acquire first, then contend mid-hold (past staleMs).
+    await new Promise((r) => setTimeout(r, 500));
+    const contender = Bun.spawn([process.execPath, contenderPath], {
+      env: contenderEnv,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [holderExit, contenderExit] = await Promise.all([holder.exited, contender.exited]);
+    const [holderErr, contenderOut, contenderErr] = await Promise.all([
+      new Response(holder.stderr).text(),
+      new Response(contender.stdout).text(),
+      new Response(contender.stderr).text(),
+    ]);
+    expect(`${holderErr}${contenderErr}`).toBe('');
+    expect(holderExit).toBe(0);
+    expect(contenderExit).toBe(0);
+    // Live holder was never broken: contender timed out, holder completed.
+    expect(contenderOut).toContain('TIMED_OUT');
+    expect(contenderOut).not.toContain('ACQUIRED');
+    const fs = await import('fs');
+    expect(fs.readFileSync(marker, 'utf8')).toBe('holder-done');
+    expect(fs.existsSync(invaded)).toBe(false);
+    expect(fs.existsSync(lock)).toBe(false);
+  });
 });

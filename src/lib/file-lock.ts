@@ -1,16 +1,22 @@
 /**
- * Inter-process file lock for serializing read-modify-write cycles.
+ * Inter-process lock for serializing read-modify-write cycles.
  *
  * The in-process GitMutex (see git-mutex.ts) cannot protect against races
  * between separate processes (e.g. mc_plan_cancel and mc_cleanup from
  * different sessions). This module provides mutual exclusion across
- * processes using an atomic lockfile (O_EXCL creation), plus a per-path
- * in-process mutex so same-process callers don't spin on the filesystem.
+ * processes using an atomic lockfile (O_EXCL creation) with a lease,
+ * plus a per-path in-process mutex so same-process callers don't spin on
+ * the filesystem.
+ *
+ * This is a lockfile with a lease — not flock(2). The holder renews the
+ * lease with a heartbeat (mtime touch) while it is alive; a lock is only
+ * broken when its mtime shows NO heartbeat progress for longer than
+ * `staleMs` (i.e. the holder is dead, e.g. kill -9). A live holder is
+ * never broken by age alone.
  *
  * Lockfile layout: `<state-file>.lock` containing `<pid>:<ts>:<rand>` token.
- * A lock whose mtime is older than `staleMs` is treated as left behind by a
- * dead process (kill -9) and broken. Release only unlinks when the token
- * still matches, so a holder never deletes another process's lock.
+ * Release only unlinks when the token still matches, so a holder never
+ * deletes another process's lock.
  *
  * Not reentrant: do not nest withFileLock on the same path.
  */
@@ -23,8 +29,17 @@ export interface FileLockOptions {
   timeoutMs?: number;
   /** Delay between acquisition attempts. Default 20ms. */
   retryMs?: number;
-  /** Lock age after which a lock is considered orphaned. Default 15000ms. */
+  /**
+   * Lease duration without heartbeat progress after which a lock is
+   * considered orphaned. Default 15000ms. A live holder renews the lease
+   * via heartbeat (see `heartbeatMs`), so this only fires for dead holders.
+   */
   staleMs?: number;
+  /**
+   * Heartbeat interval for lease renewal while holding the lock.
+   * Default: `min(max(1000, floor(staleMs/3)), 30000)`.
+   */
+  heartbeatMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -34,12 +49,12 @@ const DEFAULT_STALE_MS = 15_000;
 /**
  * Stale threshold for the integration-branch lock (see integration.ts).
  * Merge-train test runs hold the lock for up to 600s
- * (DEFAULT_TEST_TIMEOUT_MS in merge-train.ts), so the default 15s stale
- * break would delete a live holder's lock mid-merge and let a second
- * process interleave into the same branch. 11 minutes covers the longest
- * legitimate hold with margin; a kill -9'd holder is still reaped.
- * Wait timeout is intentionally NOT raised: a second merger that arrives
- * while the lock is legitimately held fails fast instead of blocking.
+ * (DEFAULT_TEST_TIMEOUT_MS in merge-train.ts); with the lease heartbeat
+ * (default 30s for this stale window) a live holder keeps renewing, so a
+ * second process never breaks it mid-merge. A kill -9'd holder stops
+ * heartbeating and is still reaped after 11 minutes. Wait timeout is
+ * intentionally NOT raised: a second merger that arrives while the lock
+ * is legitimately held fails fast instead of blocking.
  */
 export const INTEGRATION_STALE_MS = 660_000;
 
@@ -72,8 +87,22 @@ function lockAgeMs(lockPath: string): number | null {
 }
 
 /**
+ * Effective heartbeat interval for a given stale window.
+ * Kept small relative to staleMs so a live holder always renews in time;
+ * capped at 30s so the 660s integration lease does not wake every 3 minutes.
+ */
+export function heartbeatMsFor(staleMs: number, explicit?: number): number {
+  if (explicit !== undefined) return explicit;
+  return Math.min(Math.max(1000, Math.floor(staleMs / 3)), 30_000);
+}
+
+/**
  * Acquire the lock, returning an idempotent async release function.
  * Throws after `timeoutMs` when another live holder keeps the lock.
+ *
+ * While held, the owner renews the lease via heartbeat (mtime touch every
+ * `heartbeatMs`); contenders only break a lock whose mtime shows NO
+ * heartbeat progress for longer than `staleMs`.
  */
 export async function acquireFileLock(
   lockPath: string,
@@ -82,6 +111,7 @@ export async function acquireFileLock(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retryMs = opts.retryMs ?? DEFAULT_RETRY_MS;
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
+  const heartbeatMs = heartbeatMsFor(staleMs, opts.heartbeatMs);
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const deadline = Date.now() + timeoutMs;
 
@@ -95,9 +125,25 @@ export async function acquireFileLock(
       }
 
       let released = false;
+      // Lease heartbeat: keep mtime fresh while we are alive so a
+      // contender never mistakes a live holder for a stale lock.
+      const heartbeat = setInterval(() => {
+        try {
+          if (readToken(lockPath) !== token) {
+            clearInterval(heartbeat);
+            return;
+          }
+          const now = new Date();
+          fs.utimesSync(lockPath, now, now);
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, heartbeatMs);
+      (heartbeat as unknown as { unref?: () => void }).unref?.();
       return async () => {
         if (released) return;
         released = true;
+        clearInterval(heartbeat);
         // Only unlink our own lock — never another holder's.
         try {
           if (readToken(lockPath) === token) {
@@ -111,9 +157,26 @@ export async function acquireFileLock(
       if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
         throw error;
       }
-      // Lock exists: break it when orphaned (e.g. holder got kill -9).
+      // Lock exists: break it only when orphaned (no heartbeat progress
+      // for longer than staleMs, e.g. holder got kill -9). A live holder
+      // keeps touching mtime, so age alone never breaks it.
       const age = lockAgeMs(lockPath);
       if (age !== null && age > staleMs) {
+        // Re-stat immediately before breaking: the holder may have
+        // heartbeated between open-fail and stat.
+        const freshAge = lockAgeMs(lockPath);
+        if (freshAge === null) {
+          // Vanished in the meantime: retry immediately.
+          continue;
+        }
+        if (freshAge <= staleMs) {
+          // Heartbeat progressed: live holder, not stale.
+          if (Date.now() >= deadline) {
+            throw new Error(`Timed out acquiring file lock: ${lockPath} after ${timeoutMs}ms`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, retryMs));
+          continue;
+        }
         try {
           fs.unlinkSync(lockPath);
         } catch {
@@ -134,8 +197,8 @@ export async function acquireFileLock(
 }
 
 /**
- * Run `fn` with the lock held (in-process mutex + inter-process lockfile).
- * The lock is always released, even when `fn` throws.
+ * Run `fn` with the lock held (in-process mutex + inter-process lockfile
+ * with lease heartbeat). The lock is always released, even when `fn` throws.
  */
 export async function withFileLock<T>(
   lockPath: string,
