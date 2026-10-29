@@ -5,7 +5,7 @@ import { formatReportLine } from '../lib/reports';
 import { mc_attach } from '../tools/attach';
 import { getDashboard, queryTask, readLatestReport } from './coordinator-client';
 import { listPersistedQuestions, renderQuestionForm } from './forms';
-import { applyModelPlan, closeFollow, complementIntake, resumeIntake, splitCommandArgs, startIntake, type AutoCommandDeps } from './auto-commands';
+import { applyModelPlan, approveIntake, closeFollow, complementIntake, resumeIntake, splitCommandArgs, startIntake, type AutoCommandDeps } from './auto-commands';
 
 /**
  * M6 human lane: conversational dispatcher for the separate human TUI.
@@ -28,6 +28,7 @@ export const HELP = [
   '  start <request> [--repo R] [--branch B] [--max-parallel N] — capture NL-only intake, persist it, print the planner prompt (legacy two-step)',
   '  complement [--intake ID] <text> — extend the persisted request (same work continues)',
   '  resume [--intake ID] — retake without new JSON (no duplicated workers, no reintegration)',
+  '  approve [--intake ID] [--retry <job> | --relaunch <job>] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume',
   '  auto-plan --intake ID --plan-file F — advanced diagnostic only, never required for start',
   '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
@@ -206,6 +207,10 @@ async function dispatchTokens(
       const wait = rest.includes('--wait');
       const message = rest.slice(1).filter((w) => w !== '--wait').join(' ') || undefined;
       return controls.resume(name, { message, waitForIdle: wait });
+    }
+
+    case 'approve': {
+      return approveIntake(rest, autoDeps);
     }
 
     case 'cancel': {

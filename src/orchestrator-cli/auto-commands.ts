@@ -461,6 +461,210 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
 }
 
 /**
+ * `approve [--intake ID] [--retry <job> | --relaunch <job>] [--checkpoint <type>]`
+ * Public CLI equivalent of `mc_plan_approve` (which is MCP-only): clears an
+ * `on_error` (or supervisor) pause so `resume --intake` can proceed, or
+ * approves a retry/relaunch after a manual/agent fix. Same validation and
+ * authorization as the MCP path: retry/relaunch are mutually exclusive,
+ * the target must exist and be in a retryable state, touchSet relaunch is
+ * restricted to touchSet failures, and manual-fix retries re-validate the
+ * touchSet before proceeding. Fail-closed: unknown intake, missing plan,
+ * or a non-paused plan throws explicitly — never a silent success.
+ */
+export async function approveIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
+  void deps;
+  const { flags } = parseFlags(args);
+  const retry = flags.get('retry');
+  const relaunch = flags.get('relaunch');
+  const checkpointFlag = flags.get('checkpoint');
+  if (retry !== undefined && retry !== '' && relaunch !== undefined && relaunch !== '') {
+    throw new Error('Cannot specify both "retry" and "relaunch". Use "retry" for manual fixes (re-validates) or "relaunch" to spawn an agent to fix violations.');
+  }
+  const record = await resolveIntake(flags);
+  const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
+  return await withRepoRoot(repoRoot, async () => {
+    const [{ loadPlan, savePlan }, { loadConfig }, { validateTouchSet }] = await Promise.all([
+      import('../lib/plan-state'),
+      import('../lib/config'),
+      import('../lib/merge-train'),
+    ]);
+    const plan = await loadPlan(repoRoot);
+    if (!plan) {
+      throw new Error('No active plan to approve');
+    }
+    const targetJobName = (retry !== undefined && retry !== '' ? retry : undefined) ?? (relaunch !== undefined && relaunch !== '' ? relaunch : undefined);
+    if (targetJobName) {
+      const job = plan.jobs.find((j) => j.name === targetJobName);
+      if (!job) {
+        throw new Error(`Job "${targetJobName}" not found in plan`);
+      }
+      if (job.status !== 'failed' && job.status !== 'conflict' && job.status !== 'needs_rebase') {
+        throw new Error(`Job "${targetJobName}" is not in a retryable state (current: ${job.status}). Only failed, conflict, or needs_rebase jobs can be retried.`);
+      }
+    }
+
+    if (plan.status === 'paused' && plan.checkpoint) {
+      const checkpoint = (checkpointFlag || plan.checkpoint) as 'pre_merge' | 'on_error' | 'pre_pr';
+      const config = await loadConfig();
+
+      if (relaunch !== undefined && relaunch !== '') {
+        const ctx = plan.checkpointContext;
+        if (!ctx || ctx.failureKind !== 'touchset') {
+          throw new Error(`Job "${relaunch}" was not failed due to a touchSet violation — use "retry" instead.`);
+        }
+        if (ctx.jobName !== relaunch) {
+          throw new Error(`Checkpoint was set for job "${ctx.jobName}", not "${relaunch}".`);
+        }
+        plan.status = 'running';
+        plan.checkpoint = null;
+        plan.checkpointContext = null;
+        await savePlan(plan, repoRoot);
+        const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+          import('../lib/orchestrator'),
+          import('../lib/monitor'),
+          import('../lib/model-tracker'),
+        ]);
+        const orchestrator = new Orchestrator(new JobMonitor(), config);
+        (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+        try {
+          orchestrator.setPlanModelSnapshot(getCurrentModel());
+        } catch {}
+        await (orchestrator as unknown as {
+          relaunchJobForCorrection: (name: string, violations: string[], patterns: string[]) => Promise<void>;
+          resumePlan: (repoRoot?: string) => Promise<void>;
+        }).relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
+        await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+        return [
+          `Checkpoint "${checkpoint}" cleared. Job "${relaunch}" relaunched with correction prompt.`,
+          '',
+          `  ID:   ${plan.id}`,
+          `  Mode: ${plan.mode}`,
+          '',
+          'The agent will fix touchSet violations in the existing worktree.',
+          'Use follow to monitor progress.',
+        ].join('\n');
+      }
+
+      if (retry !== undefined && retry !== '') {
+        const job = plan.jobs.find((j) => j.name === retry)!;
+        const ctx = plan.checkpointContext;
+        if (ctx?.failureKind === 'touchset' && ctx.jobName === retry) {
+          if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
+            const validation = await validateTouchSet(job.branch, plan.integrationBranch, job.touchSet);
+            if (!validation.valid && validation.violations) {
+              throw new Error(
+                `Job "${retry}" still has touchSet violations after manual fix:\n` +
+                `  Violations: ${validation.violations.join(', ')}\n` +
+                `  Allowed: ${job.touchSet.join(', ')}\n` +
+                `Fix the remaining violations and retry again.`,
+              );
+            }
+          }
+        }
+        const retryJob = plan.jobs.find((j) => j.name === retry)!;
+        retryJob.status = 'ready_to_merge';
+        retryJob.error = undefined;
+        plan.status = 'running';
+        plan.checkpoint = null;
+        plan.checkpointContext = null;
+        await savePlan(plan, repoRoot);
+        const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+          import('../lib/orchestrator'),
+          import('../lib/monitor'),
+          import('../lib/model-tracker'),
+        ]);
+        const orchestrator = new Orchestrator(new JobMonitor(), config);
+        (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+        try {
+          orchestrator.setPlanModelSnapshot(getCurrentModel());
+        } catch {}
+        await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+        return [
+          `Checkpoint "${checkpoint}" cleared. Job "${retry}" reset to ready_to_merge.`,
+          '',
+          `  ID:   ${plan.id}`,
+          `  Mode: ${plan.mode}`,
+          '',
+          'Use follow to monitor progress.',
+        ].join('\n');
+      }
+
+      const ctx = plan.checkpointContext;
+      if (ctx?.failureKind === 'touchset') {
+        const job = plan.jobs.find((j) => j.name === ctx.jobName);
+        if (job && job.status === 'failed') {
+          job.status = 'ready_to_merge';
+          job.error = undefined;
+        }
+      }
+      plan.status = 'running';
+      plan.checkpoint = null;
+      plan.checkpointContext = null;
+      await savePlan(plan, repoRoot);
+      const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+        import('../lib/orchestrator'),
+        import('../lib/monitor'),
+        import('../lib/model-tracker'),
+      ]);
+      const orchestrator = new Orchestrator(new JobMonitor(), config);
+      (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+      try {
+        orchestrator.setPlanModelSnapshot(getCurrentModel());
+      } catch {}
+      await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+      const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
+      return [
+        `Checkpoint "${checkpoint}" cleared.${acceptMsg} Plan "${plan.name}" resuming (intake ${record.id}).`,
+        '',
+        `  ID:   ${plan.id}`,
+        `  Mode: ${plan.mode}`,
+        '',
+        'Use follow to monitor progress.',
+      ].join('\n');
+    }
+
+    if (plan.status !== 'pending') {
+      throw new Error(`Plan "${plan.name}" is not pending or paused (current status: ${plan.status})`);
+    }
+
+    const [{ loadConfig: loadCfg }, { createIntegrationBranch }, { resolvePostCreateHook }] = await Promise.all([
+      import('../lib/config'),
+      import('../lib/integration'),
+      import('../lib/worktree-setup'),
+    ]);
+    const config = await loadCfg();
+    const integrationPostCreate = resolvePostCreateHook(config.worktreeSetup);
+    const integration = plan.baseBranch
+      ? await createIntegrationBranch(plan.id, integrationPostCreate, plan.baseBranch)
+      : await createIntegrationBranch(plan.id, integrationPostCreate);
+    plan.integrationBranch = integration.branch;
+    plan.integrationWorktree = integration.worktreePath;
+    plan.status = 'running';
+    await savePlan(plan, repoRoot);
+    const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+      import('../lib/orchestrator'),
+      import('../lib/monitor'),
+      import('../lib/model-tracker'),
+    ]);
+    const orchestrator = new Orchestrator(new JobMonitor(), config);
+    (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+    try {
+      orchestrator.setPlanModelSnapshot(getCurrentModel());
+    } catch {}
+    await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+    return [
+      `Plan "${plan.name}" approved and started (intake ${record.id}).`,
+      '',
+      `  ID:   ${plan.id}`,
+      `  Mode: ${plan.mode}`,
+      `  Jobs: ${plan.jobs.length}`,
+      '',
+      'Use follow to monitor progress.',
+    ].join('\n');
+  });
+}
+
+/**
  * `resume [--intake ID]` — public retake without new JSON. A disposable
  * coordinator process may be killed; this resumes from persisted
  * intake + plan, never duplicates workers and never reintegrates merged

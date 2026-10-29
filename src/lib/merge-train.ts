@@ -396,7 +396,7 @@ export class MergeTrain {
     this.queue = [];
   }
 
-  async processNext(reviewVerdict?: ReviewVerdict | null): Promise<MergeResult> {
+  async processNext(reviewVerdict?: ReviewVerdict | null, opts?: { skipTest?: boolean }): Promise<MergeResult> {
     if (this.queue.length === 0) {
       throw new Error('No jobs in queue');
     }
@@ -416,9 +416,9 @@ export class MergeTrain {
       return gateBlock;
     }
 
-    // M4: serialize writers per integration branch; rollback stays inside.
+    // M5/M7: serialize writers per integration branch; rollback stays inside.
     return withIntegrationLock(this.integrationWorktree, () =>
-      this.processNextInner(job, reviewVerdict ?? null),
+      this.processNextInner(job, reviewVerdict ?? null, opts),
     );
   }
 
@@ -523,7 +523,7 @@ export class MergeTrain {
     };
   }
 
-  private async processNextInner(job: JobSpec, reviewVerdict: ReviewVerdict | null): Promise<MergeResult> {
+  private async processNextInner(job: JobSpec, reviewVerdict: ReviewVerdict | null, opts?: { skipTest?: boolean }): Promise<MergeResult> {
 
     // Save the HEAD before the merge so we can rollback if needed
     const headBeforeMerge = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', 'HEAD']);
@@ -702,6 +702,25 @@ export class MergeTrain {
           files: conflicts.length > 0 ? conflicts : undefined,
         };
       }
+    }
+
+    // Gap1: scoped tasks defer the repo-wide gate to the final integration
+    // verification (post-merge, all siblings present). Merge now without a
+    // per-merge repo-wide run; the orchestrator runs the gate once after all
+    // merges (fail-closed there, never success-skipped).
+    if (opts?.skipTest) {
+      return {
+        success: true,
+        mergedAt: new Date().toISOString(),
+        testReport: {
+          status: 'skipped',
+          reason: 'Deferred to final integration verification (scoped task; repo-wide gate runs post-merge)',
+          setup: {
+            status: 'skipped',
+            commands: [],
+          },
+        },
+      };
     }
 
     const testCommand = this.config?.testCommand
