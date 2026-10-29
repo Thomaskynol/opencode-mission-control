@@ -130,6 +130,7 @@ export const PlanSpecSchema = z.object({
   integrationBranch: z.string(),
   integrationWorktree: z.string().optional(),
   baseCommit: z.string(),
+  baseBranch: z.string().optional(),
   createdAt: z.string(),
   completedAt: z.string().optional(),
   prUrl: z.string().optional(),
