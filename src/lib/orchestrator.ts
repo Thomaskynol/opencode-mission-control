@@ -6,7 +6,7 @@ import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
-import { reviewJob, runReviewFixLoop, type EssentialRequirement, type ReviewInput, type ReviewVerdict } from './reviewer';
+import { type ReviewVerdict } from './reviewer';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
@@ -318,7 +318,7 @@ export class Orchestrator {
   }
 
   /** F04: validate + apply ceiling to this execution's config (used by all components). */
-  private applyCeiling(ceiling?: { maxParallel?: number; testCommand?: string }): void {
+  applyCeiling(ceiling?: { maxParallel?: number; testCommand?: string }): void {
     const valid = validateCeiling(ceiling);
     if (valid.maxParallel !== undefined) {
       (this.config as MCConfig & { maxParallel?: number }).maxParallel = valid.maxParallel;
@@ -468,143 +468,16 @@ export class Orchestrator {
   }
 
   /**
-   * Gap1: does this job's own acceptance reference the global testCommand?
-   * Scoped tasks (e.g. helpers/* with `node --check`) do NOT mention the
-   * repo-wide gate (e.g. `node check.mjs`): their isolated worktree can
-   * never satisfy it (siblings live elsewhere). They merge on structural
-   * grounds (diff + touchSet + worker completion) and the repo-wide gate
-   * runs once in the integration worktree post-merge, where all siblings
-   * are present. Jobs that DO reference the global gate keep full
-   * product-observed verification. Unknown/empty commands stay conservative
-   * (require verification, never skip).
-   */
-  private jobReferencesGlobalTest(job: JobSpec, testCommand?: string): boolean {
-    if (!testCommand?.trim()) return true;
-    const prompt = job.prompt ?? '';
-    const cmd = testCommand.trim();
-    if (prompt.includes(cmd)) return true;
-    const lastToken = cmd.split(/\s+/).pop() ?? cmd;
-    const baseName = lastToken.split('/').pop() ?? lastToken;
-    if (baseName.length >= 3 && prompt.includes(baseName)) return true;
-    return false;
-  }
-
-  /**
-   * F01: parse the job's acceptance criteria into review requirements.
-   * The prompt carries them as `- [ ] ...` lines (draftToJobSpecs appends
-   * them verbatim). Each line becomes one requirement whose anchor is the
-   * line itself: the test output must mention it, otherwise an omitted
-   * requirement rejects the delivery.
-   */
-  private parseAcceptanceRequirements(prompt: string): EssentialRequirement[] {
-    const lines = prompt.split('\n');
-    const inAcceptance = lines.some((l) => /acceptance criteria/i.test(l));
-    const source = inAcceptance ? lines.slice(lines.findIndex((l) => /acceptance criteria/i.test(l))) : lines;
-    const items: string[] = [];
-    for (const line of source) {
-      const m = line.match(/-\s*\[\s*\]\s*(.+)/);
-      if (m && m[1].trim()) items.push(m[1].trim());
-    }
-    return items.map((text, i) => ({ id: `ACC-${i + 1}`, description: text, testAnchors: [text] }));
-  }
-
-  /**
-   * F01: product-observed review input for one job.
-   * Evidence is collected by the PRODUCT (test command executed here, output
-   * captured, commit pinned, environment recorded) — never a worker claim.
-   * Throws fail-closed when heads, files, requirements or test evidence
-   * cannot be established: the caller blocks integration, never merges blind.
-   */
-  private async buildReviewInput(job: JobSpec, plan: PlanSpec): Promise<ReviewInput> {
-    const repoRoot = this.effectiveRepoRoot();
-    const worktree = plan.integrationWorktree!;
-    if (!job.branch) throw new Error(`Review blocked: job "${job.name}" has no branch`);
-    const baseHeadRes = await gitCommand(['-C', worktree, 'rev-parse', 'HEAD']);
-    if (baseHeadRes.exitCode !== 0 || !baseHeadRes.stdout) {
-      throw new Error(`Review blocked: cannot resolve integration HEAD (${baseHeadRes.stderr || 'unknown'})`);
-    }
-    const baseHead = baseHeadRes.stdout.trim();
-    const jobHeadRes = await getBranchHead(job.branch, repoRoot);
-    if (!jobHeadRes.head) throw new Error(`Review blocked: cannot resolve job branch "${job.branch}" (${jobHeadRes.error ?? 'unknown'})`);
-    const jobHead = jobHeadRes.head;
-    const changed = await listChangedFiles(plan.integrationBranch, job.branch, repoRoot);
-    if (!changed.files) throw new Error(`Review blocked: cannot diff ${plan.integrationBranch}...${job.branch} (${changed.error ?? 'unknown'})`);
-    let requirements = this.parseAcceptanceRequirements(job.prompt ?? '');
-    let hasIntake = false;
-    if (requirements.length === 0) {
-      // Fall back to the persisted intake requirements (NL request → acceptance).
-      try {
-        const snap = await loadRuntimeSnapshot().catch(() => null);
-        hasIntake = !!snap?.autoIntake;
-        const intakeReqs = snap?.autoIntake?.requirements ?? [];
-        requirements = intakeReqs.map((r) => ({ id: r.id, description: r.text, testAnchors: [...r.acceptance] }));
-      } catch {}
-    } else {
-      try {
-        const snap = await loadRuntimeSnapshot().catch(() => null);
-        hasIntake = !!snap?.autoIntake;
-      } catch {}
-    }
-    if (requirements.length === 0) {
-      // Public autonomous path (intake exists) is fail-closed: without
-      // acceptance no omitted requirement can be detected. Manual/legacy
-      // plans without intake keep the test-gate only (evidence still
-      // required below), preserving integration suites that build PlanSpec
-      // by hand without acceptance lines.
-      if (hasIntake) {
-        throw new Error(`Review blocked: job "${job.name}" declares no acceptance criteria — cannot verify omitted requirements`);
-      }
-    }
-    const testTimeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
-    const configured = this.getEffectiveTestCommand();
-    // Gap1: the merge gate runs where it can pass — the INTEGRATION worktree
-    // (post-merge, all siblings present), never the isolated task worktree
-    // (where repo-wide siblings deterministically do not exist).
-    const probeWorktree = worktree;
-    const testCommand = configured ?? await detectTestCommand(probeWorktree);
-    if (!testCommand) {
-      // No evidence to collect: return an input with null evidence so
-      // reviewJob fails explicitly (missing command), never passes vacuous.
-      return {
-        jobName: job.name,
-        jobBranch: job.branch,
-        baseBranch: plan.integrationBranch,
-        baseHead,
-        jobHead,
-        changedFiles: changed.files,
-        touchSet: job.touchSet,
-        requirements,
-        evidence: null,
-        claimedPass: true,
-      };
-    }
-    const result = await runTestCommand(probeWorktree, testCommand, testTimeout);
-    return {
-      jobName: job.name,
-      jobBranch: job.branch,
-      baseBranch: plan.integrationBranch,
-      baseHead,
-      jobHead,
-      changedFiles: changed.files,
-      touchSet: job.touchSet,
-      requirements,
-      evidence: {
-        command: testCommand,
-        exitCode: result.timedOut ? 124 : (result.success ? 0 : 1),
-        output: result.timedOut ? `Timed out after ${testTimeout}ms\n${result.output}` : result.output,
-        testedCommit: jobHead,
-        environment: `worktree:${probeWorktree} (product-executed, integration-context)`,
-      },
-      claimedPass: true,
-    };
-  }
-
-  /**
-   * Gap1 structural pins without test execution (scoped tasks).
-   * Collects the same heads/diff as buildReviewInput but runs NO test
-   * command: scoped tasks cannot satisfy a repo-wide gate in isolation,
-   * so they merge on structural grounds and the repo-wide gate runs once
-   * post-merge in integration (final verification, fail-closed).
+   * Per-task gate pins without test execution (structural-only).
+   * The pre-merge gate NEVER runs the repo-wide test command: probing the
+   * integration worktree WITHOUT the job's own change fails deterministically
+   * for aggregator tasks, and acceptance anchors can never match runner
+   * stdout verbatim (the runner prints its own lines, not acceptance text).
+   * Tasks conclude per-task via worker completion (reports/idle already drove
+   * the job to completed) + diff + touchSet (validated before ready_to_merge).
+   * The repo-wide gate runs ONCE post-all-merged in integration (final
+   * verification, fail-closed). Anchors only apply to evidence observed by the
+   * product in the correct context — never to verbatim stdout here.
    */
   private async buildStructuralPins(job: JobSpec, plan: PlanSpec): Promise<{
     baseHead: string;
@@ -626,70 +499,39 @@ export class Orchestrator {
   }
 
   /**
-   * F01: reviewJob + runReviewFixLoop on the real approval path.
-   * One product-path correction attempt (re-collect product evidence once);
-   * persistent failure blocks integration — the reconciler pauses with
-   * on_error so correction is requested via mc_plan_approve, never merged.
+   * Per-task gate on the real approval path: structural-only (diff pins).
+   * No repo-wide probe pre-merge (it fails deterministically without the
+   * job's own change); no verbatim acceptance anchors on runner stdout.
+   * The global test runs once post-all-merged (final verification,
+   * fail-closed). Persistent structural failure (empty diff) blocks
+   * integration — the reconciler pauses with on_error so correction is
+   * requested via mc_plan_approve, never merged.
    */
   private async reviewJobWithFixLoop(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
-    // Gap1: scoped tasks (acceptance never mentions the repo-wide gate)
-    // conclude per-task via worker completion (reports/idle already drove
-    // the job to completed) + structural pins — never a repo-wide test run
-    // in an isolated worktree where siblings deterministically miss. The
-    // repo-wide gate runs once post-merge in integration (final
-    // verification, fail-closed). Empty diffs still block (nothing to verify).
-    const globalTest = this.getEffectiveTestCommand();
-    if (!this.jobReferencesGlobalTest(job, globalTest)) {
-      const pins = await this.buildStructuralPins(job, plan);
-      if (pins.changedFiles.length === 0) {
-        return {
-          verdict: 'fail',
-          blocking: true,
-          reasons: [`Review blocked: job "${job.name}" has no changes (empty diff) — nothing to verify`],
-          jobName: job.name,
-          reviewedCommit: pins.jobHead,
-          reviewedBase: pins.baseHead,
-        };
-      }
-      const verdict: ReviewVerdict = {
-        verdict: 'pass',
-        blocking: false,
-        reasons: [],
+    const pins = await this.buildStructuralPins(job, plan);
+    if (pins.changedFiles.length === 0) {
+      return {
+        verdict: 'fail',
+        blocking: true,
+        reasons: [`Review blocked: job "${job.name}" has no changes (empty diff) — nothing to verify`],
         jobName: job.name,
         reviewedCommit: pins.jobHead,
         reviewedBase: pins.baseHead,
       };
-      try {
-        const snap = await loadRuntimeSnapshot().catch(() => null);
-        const intakeId = snap?.autoIntake?.id;
-        if (intakeId) {
-          await appendAutoDecision(intakeId, `review ${job.name}: pass (structural, scoped task; repo-wide gate deferred to final integration verification)`).catch(() => {});
-        }
-      } catch {}
-      return verdict;
     }
-    const input = await this.buildReviewInput(job, plan);
-    const { verdict } = await runReviewFixLoop({
-      input,
-      options: { maxFixCycles: 1, backoffMs: 0 },
-      review: (i) => reviewJob(i),
-      fix: async (_attempt, _last, _cur) => {
-        try {
-          return await this.buildReviewInput(job, plan);
-        } catch {
-          return null;
-        }
-      },
-      sleep: async () => {},
-    });
+    const verdict: ReviewVerdict = {
+      verdict: 'pass',
+      blocking: false,
+      reasons: [],
+      jobName: job.name,
+      reviewedCommit: pins.jobHead,
+      reviewedBase: pins.baseHead,
+    };
     try {
       const snap = await loadRuntimeSnapshot().catch(() => null);
       const intakeId = snap?.autoIntake?.id;
       if (intakeId) {
-        await appendAutoDecision(
-          intakeId,
-          `review ${job.name}: ${verdict.verdict}${verdict.reasons.length ? ` — ${verdict.reasons.join('; ').slice(0, 300)}` : ''}`,
-        ).catch(() => {});
+        await appendAutoDecision(intakeId, `review ${job.name}: pass (structural pre-merge; repo-wide gate deferred to final integration verification)`).catch(() => {});
       }
     } catch {}
     return verdict;
@@ -1248,6 +1090,24 @@ export class Orchestrator {
     this.isRunning = false;
   }
 
+  /**
+   * One-shot CLI hygiene: shut down ONLY the loops/listeners THIS instance
+   * started (reconciler timer, monitor polling, event subscriptions) so the
+   * CLI process can exit instead of lingering as a secondary coordinator.
+   * Never kills tmux sessions/panes, worktrees, branches or anyone else's
+   * process — stopping a view/driver loop is not canceling work.
+   */
+  shutdown(): void {
+    this.stopReconciler();
+    this.unsubscribeFromMonitorEvents();
+    try {
+      const monitor = this.monitor as unknown as { stop?: () => void };
+      if (typeof monitor.stop === 'function') monitor.stop();
+    } catch {
+      // Best-effort: never fail a CLI return because of loop teardown.
+    }
+  }
+
   private async setCheckpoint(type: CheckpointType, plan: PlanSpec, context?: CheckpointContext): Promise<void> {
     this.checkpoint = type;
     await updatePlanFields(plan.id, {
@@ -1506,8 +1366,11 @@ export class Orchestrator {
         const nextJob = this.mergeTrain.getQueue()[0];
         this.showToast('Mission Control', `Merging job "${nextJob.name}"...`, 'info');
         this.notify(`⇄ Merging job "${nextJob.name}" into integration branch...`);
-        // F01: product-path review gate — collect product-observed evidence,
-        // run reviewJob + runReviewFixLoop, then integrate only on pass.
+        // Per-task gate is structural-only (diff pins via
+        // reviewJobWithFixLoop) — never a repo-wide probe pre-merge
+        // (deterministic fail without the job's own change; anchors can
+        // never match runner stdout verbatim). The repo-wide gate runs once
+        // post-all-merged (final verification, fail-closed).
         // Duck-typed fakes in unit tests (plain objects without review
         // support) keep the legacy direct merge so transition/toast suites
         // stay green; real MergeTrain runs always review here.
@@ -1537,13 +1400,11 @@ export class Orchestrator {
         const mergeResult = isRealTrain
           ? await (this.mergeTrain as MergeTrain).processNext(
               verdict,
-              // Gap1: scoped tasks defer the repo-wide gate to the final
-              // integration verification (all siblings present). Per-merge
-              // repo-wide runs would fail deterministically on missing
-              // not-yet-merged siblings, even with correct workers.
-              !this.jobReferencesGlobalTest(byName.get(nextJob.name) ?? nextJob, this.getEffectiveTestCommand())
-                ? { skipTest: true }
-                : undefined,
+              // Per-merge repo-wide runs would fail deterministically on
+              // missing not-yet-merged siblings even with correct workers:
+              // always skip here; the global gate runs once post-all-merged
+              // (final verification, fail-closed).
+              { skipTest: true },
             )
           : await (this.mergeTrain as unknown as { processNext: () => Promise<{ success: boolean; mergedAt?: string; type?: string; files?: string[]; output?: string; testReport?: MergeTestReport }> }).processNext();
 
@@ -3002,11 +2863,17 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       }
 
       if (plan.status === 'paused') {
-        await updatePlanFields(plan.id, {
-          status: 'running',
-          checkpoint: null,
-          checkpointContext: null,
-        }, repoRoot);
+        // Checkpoint do operador preservado até approve explícito: resume só
+        // re-ancora a identidade em memória (sem despachar — o reconciliador
+        // retorna cedo em pausa, e nenhum driver é iniciado aqui). Limpar a
+        // pausa aqui divergiria da mensagem ("aguarda decisão") e fecharia o
+        // caminho público de correção (approve exige paused).
+        this.checkpoint = plan.checkpoint ?? null;
+        this.activePlanId = plan.id;
+        this.planPlacement = plan.placement ?? null;
+        this.planLaunchSessionID = plan.launchSessionID;
+        this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+        return;
       } else if (plan.status === 'pending') {
         await updatePlanFields(plan.id, { status: 'running' }, repoRoot);
         plan.status = 'running';

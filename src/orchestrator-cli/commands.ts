@@ -24,13 +24,13 @@ export interface HumanControls {
 
 export const HELP = [
   'Human TUI commands (separate from worker sessions):',
-  '  start --repo R --branch B --request "NL" [--context C] [--max-parallel N] — single autonomous run (model invoked internally, plan + workers scheduled)',
+  '  start --repo R --branch B --request "NL" [--context C] [--max-parallel N] — single autonomous run (model invoked internally, plan + workers scheduled). This process stays as coordinator while the run needs driving',
   '  start <request> [--repo R] [--branch B] [--max-parallel N] — capture NL-only intake, persist it, print the planner prompt (legacy two-step)',
-  '  complement [--intake ID] <text> — extend the persisted request (same work continues)',
-  '  resume [--intake ID] — retake without new JSON (no duplicated workers, no reintegration)',
-  '  approve [--intake ID] [--retry <job> | --relaunch <job>] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume',
+  '  complement [--intake ID] <text> — extend the persisted request (same work continues). One-shot: returns after recording/revising; never starts a second driver',
+  '  resume [--intake ID] — retake without new JSON (no duplicated workers, no reintegration). Stays as coordinator while driving an active plan; returns immediately when paused (approve to continue)',
+  '  approve [--intake ID] [--retry <job> | --relaunch <job>] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume. One-shot: applies the decision then returns (the live coordinator picks it up)',
   '  auto-plan --intake ID --plan-file F — advanced diagnostic only, never required for start',
-  '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues',
+  '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues (close never stops work)',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
   '  follow | progress     — short dashboard without raw logs',
   '  task <name>           — consult one task (status, last milestone, questions)',

@@ -276,21 +276,30 @@ export async function complementIntake(args: string[], deps?: AutoCommandDeps): 
     (orchestrator as unknown as { repoRoot: string }).repoRoot = repoRoot;
     // F03: real revision via the model (same slot as intake) — never only Follow-up.
     const generate = deps?.generate ?? (await import('../lib/auto-plan')).createRunPlannerGenerate();
+    // One-shot: shut down whatever loops this call started so the CLI exits
+    // instead of lingering as a secondary coordinator (own loops only,
+    // never another process).
     try {
-      const res = await (orchestrator as unknown as {
-        complementAutonomousRequest: (id: string, t: string, g: unknown) => Promise<{ added: string[]; message: string }>;
-      }).complementAutonomousRequest(record.id, text, generate);
-      return [
-        `${res.message}`,
-        `Request now ends with: "Follow-up: ${text}"`,
-      ].join('\n');
-    } catch (e) {
-      // Model revision failed explicitly — Follow-up persisted, pause/decisions preserved.
-      const msg = e instanceof Error ? e.message : String(e);
-      return [
-        `Complement recorded on intake ${record.id} (revision failed explicitly: ${msg}).`,
-        `Request now ends with: "Follow-up: ${text}"`,
-      ].join('\n');
+      try {
+        const res = await (orchestrator as unknown as {
+          complementAutonomousRequest: (id: string, t: string, g: unknown) => Promise<{ added: string[]; message: string }>;
+        }).complementAutonomousRequest(record.id, text, generate);
+        return [
+          `${res.message}`,
+          `Request now ends with: "Follow-up: ${text}"`,
+        ].join('\n');
+      } catch (e) {
+        // Model revision failed explicitly — Follow-up persisted, pause/decisions preserved.
+        const msg = e instanceof Error ? e.message : String(e);
+        return [
+          `Complement recorded on intake ${record.id} (revision failed explicitly: ${msg}).`,
+          `Request now ends with: "Follow-up: ${text}"`,
+        ].join('\n');
+      }
+    } finally {
+      try {
+        (orchestrator as unknown as { shutdown?: () => void }).shutdown?.();
+      } catch {}
     }
   });
 }
@@ -372,7 +381,7 @@ export function closeFollow(): string {
     'Conducting: the coordinator (observe → decide → dispatch), the reconciler loop (merges), and the monitor (reports) keep driving tasks; this view only reads state.',
     'Recording: worker reports, pending questions and decisions keep being persisted; resume anytime with:',
     `bun ${cliPath()} follow`,
-    'Nothing was stopped or discarded by closing this view.',
+    'Closing ends only this view; the run continues untouched (nothing stopped, nothing discarded).',
   ].join('\n');
 }
 
@@ -461,6 +470,40 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
 }
 
 /**
+ * Apply the persisted effective config (ceiling + pinned model) to a fresh
+ * CLI orchestrator — the same restoration resumeAutonomousIntake performs.
+ * Without the ceiling the reactivated reconciler reviews without testCommand.
+ */
+function applyEffectiveConfig(
+  orchestrator: {
+    applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+    setPlanModelSnapshot: (m: unknown) => void;
+  },
+  record: AutoIntakeRecord,
+  fallbackModel: unknown,
+): void {
+  const rec = record as unknown as {
+    ceiling?: { maxParallel?: number; testCommand?: string };
+    effectiveModel?: string;
+    effectiveVariant?: string;
+  };
+  orchestrator.applyCeiling(rec.ceiling);
+  const eff = rec.effectiveModel?.trim();
+  if (eff) {
+    const slash = eff.indexOf('/');
+    const ref =
+      slash > 0
+        ? { providerID: eff.slice(0, slash), id: eff.slice(slash + 1) }
+        : { providerID: 'unknown', id: eff };
+    orchestrator.setPlanModelSnapshot(rec.effectiveVariant ? { ...ref, variant: rec.effectiveVariant } : ref);
+  } else if (fallbackModel !== undefined) {
+    try {
+      orchestrator.setPlanModelSnapshot(fallbackModel);
+    } catch {}
+  }
+}
+
+/**
  * `approve [--intake ID] [--retry <job> | --relaunch <job>] [--checkpoint <type>]`
  * Public CLI equivalent of `mc_plan_approve` (which is MCP-only): clears an
  * `on_error` (or supervisor) pause so `resume --intake` can proceed, or
@@ -525,15 +568,22 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
           import('../lib/model-tracker'),
         ]);
         const orchestrator = new Orchestrator(new JobMonitor(), config);
-        (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
-        try {
-          orchestrator.setPlanModelSnapshot(getCurrentModel());
-        } catch {}
-        await (orchestrator as unknown as {
+        const ctl = orchestrator as unknown as {
+          setRepoRoot: (r: string) => void;
+          applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+          setPlanModelSnapshot: (m: unknown) => void;
           relaunchJobForCorrection: (name: string, violations: string[], patterns: string[]) => Promise<void>;
-          resumePlan: (repoRoot?: string) => Promise<void>;
-        }).relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
-        await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+          resumePlan: (r?: string) => Promise<void>;
+          shutdown: () => void;
+        };
+        ctl.setRepoRoot(repoRoot);
+        applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+        await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
+        try {
+          await ctl.resumePlan(repoRoot);
+        } finally {
+          ctl.shutdown();
+        }
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${relaunch}" relaunched with correction prompt.`,
           '',
@@ -574,11 +624,20 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
           import('../lib/model-tracker'),
         ]);
         const orchestrator = new Orchestrator(new JobMonitor(), config);
-        (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+        const ctl = orchestrator as unknown as {
+          setRepoRoot: (r: string) => void;
+          applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+          setPlanModelSnapshot: (m: unknown) => void;
+          resumePlan: (r?: string) => Promise<void>;
+          shutdown: () => void;
+        };
+        ctl.setRepoRoot(repoRoot);
+        applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         try {
-          orchestrator.setPlanModelSnapshot(getCurrentModel());
-        } catch {}
-        await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+          await ctl.resumePlan(repoRoot);
+        } finally {
+          ctl.shutdown();
+        }
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${retry}" reset to ready_to_merge.`,
           '',
@@ -607,11 +666,20 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         import('../lib/model-tracker'),
       ]);
       const orchestrator = new Orchestrator(new JobMonitor(), config);
-      (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+      const ctl = orchestrator as unknown as {
+        setRepoRoot: (r: string) => void;
+        applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+        setPlanModelSnapshot: (m: unknown) => void;
+        resumePlan: (r?: string) => Promise<void>;
+        shutdown: () => void;
+      };
+      ctl.setRepoRoot(repoRoot);
+      applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
       try {
-        orchestrator.setPlanModelSnapshot(getCurrentModel());
-      } catch {}
-      await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+        await ctl.resumePlan(repoRoot);
+      } finally {
+        ctl.shutdown();
+      }
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
       return [
         `Checkpoint "${checkpoint}" cleared.${acceptMsg} Plan "${plan.name}" resuming (intake ${record.id}).`,
@@ -647,11 +715,20 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       import('../lib/model-tracker'),
     ]);
     const orchestrator = new Orchestrator(new JobMonitor(), config);
-    (orchestrator as unknown as { setRepoRoot: (r: string) => void }).setRepoRoot(repoRoot);
+    const ctl = orchestrator as unknown as {
+      setRepoRoot: (r: string) => void;
+      applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+      setPlanModelSnapshot: (m: unknown) => void;
+      resumePlan: (r?: string) => Promise<void>;
+      shutdown: () => void;
+    };
+    ctl.setRepoRoot(repoRoot);
+    applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
     try {
-      orchestrator.setPlanModelSnapshot(getCurrentModel());
-    } catch {}
-    await (orchestrator as unknown as { resumePlan: (r?: string) => Promise<void> }).resumePlan(repoRoot);
+      await ctl.resumePlan(repoRoot);
+    } finally {
+      ctl.shutdown();
+    }
     return [
       `Plan "${plan.name}" approved and started (intake ${record.id}).`,
       '',
