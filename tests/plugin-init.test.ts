@@ -49,7 +49,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       const plugin = await MissionControl({ client: mockClient } as any);
       
@@ -63,7 +63,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
 
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       const plugin = await MissionControl({ client: mockClient } as any);
 
@@ -74,7 +74,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -86,7 +86,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -97,7 +97,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -108,7 +108,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -119,7 +119,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = true;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: true });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       const plugin = await MissionControl({ client: mockClient } as any);
       
@@ -137,7 +137,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       const plugin = await MissionControl({ client: mockClient } as any);
       
@@ -174,7 +174,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -186,7 +186,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -197,7 +197,7 @@ describe('plugin initialization', () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
@@ -208,11 +208,46 @@ describe('plugin initialization', () => {
       mockState.isManaged = false;
       vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
       
-      const { default: MissionControl } = await import('../src/index');
+      const { MissionControl } = await import('../src/index');
       const mockClient = createMockClient();
       await MissionControl({ client: mockClient } as any);
       
       expect(planState.loadPlan).toHaveBeenCalled();
+    });
+  });
+
+  describe('v2 entrypoint (OpenCode 2.1.4)', () => {
+    it('default export is a v2 definition with id and setup', async () => {
+      const mod = await import('../src/index');
+      expect(mod.default).toMatchObject({ id: 'opencode-mission-control' });
+      expect(typeof (mod.default as any).setup).toBe('function');
+    });
+
+    it('v2 setup registers v1 tools via transform', async () => {
+      mockState.isManaged = false;
+      vi.spyOn(worktree, 'isInManagedWorktree').mockResolvedValue({ isManaged: false });
+      const mod = await import('../src/index');
+      const added: any[] = [];
+      const mockCtx = {
+        location: { directory: process.cwd() },
+        client: createMockClient(),
+        tool: {
+          transform: vi.fn(async (fn: any) => {
+            fn({ add: (t: any) => added.push(t) });
+          }),
+          hook: vi.fn(async () => {}),
+        },
+        event: { subscribe: () => (async function* () {})() },
+        session: { hook: vi.fn(async () => {}) },
+      };
+      await (mod.default as any).setup(mockCtx);
+      const names = added.map((t) => t.name);
+      expect(names).toContain('mc_launch');
+      expect(names).toContain('mc_status');
+      expect(names).toHaveLength(21);
+      // V2 execute returns structured content, not a bare string.
+      const status = added.find((t) => t.name === 'mc_status');
+      expect(status.input).toMatchObject({ type: 'object' });
     });
   });
 });
