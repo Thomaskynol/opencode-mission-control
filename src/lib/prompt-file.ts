@@ -38,14 +38,18 @@ export async function writeLauncherScript(
 ): Promise<string> {
   const launcherPath = join(worktreePath, LAUNCHER_FILENAME);
   const opencodeBin = resolveOpencodePath();
-  // F06: CLI `-m` has no variant form — the string carries provider/model,
-  // the pinned variant (when supported, e.g. serve triple) is preserved as an
-  // explicit comment so planner/workers stay observably equal.
+  // F06: the TUI root (`opencode --prompt ...`) has no -m/--model flag in
+  // v2.1.4 (`Unrecognized flag: -m`, exit 1) — only `opencode run` pins via
+  // --model. So the TUI launcher never emits -m: it inherits the session
+  // default and records the effective triple explicitly instead of faking a
+  // pin. Serve/SDK paths keep the full triple pin.
   const cliModel = typeof model === 'string' ? model : model ? `${model.providerID}/${model.id}` : undefined;
   const variant = typeof model === 'object' ? model.variant : undefined;
-  const modelFlag = cliModel ? ` -m "${cliModel}"` : '';
-  const variantNote = variant ? `# variant: ${variant} (pinned triple; CLI -m carries provider/model only)\n` : '';
-  const script = `#!/bin/bash\n${variantNote}exec ${opencodeBin}${modelFlag} --prompt "$(cat ${quoteShellPath(promptFilePath)})"\n`;
+  const triple = [cliModel, variant ? `#${variant}` : ''].join('');
+  const modelNote = triple
+    ? `# effective model: ${triple} (not pinned: TUI root has no -m/--model in v2.1.4; inherits default)\n`
+    : '# effective model: none tracked (TUI default)\n';
+  const script = `#!/bin/bash\n${modelNote}exec ${opencodeBin} --prompt "$(cat ${quoteShellPath(promptFilePath)})"\n`;
   await writeFile(launcherPath, script, { mode: 0o755 });
   return launcherPath;
 }
