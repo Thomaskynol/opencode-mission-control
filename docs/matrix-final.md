@@ -561,3 +561,36 @@ Limitações restantes (adendo honesto):
 4. `E2E-E` segue Pendente; workers vivos não re-demonstrados nesta lane (regressões via caminho público com mocks + estado em disco, sem LLM vivo).
 5. Intake segue slot único (sobrescreve); `findIntakeAcrossRepos` cobre resume de terceira pasta via XDG.
 6. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência (§22.2).
+
+## 26. Adendo lock-plugin (F12+F10, HEAD desta lane)
+
+Escopo: `src/lib/file-lock.ts`, `src/lib/integration.ts` (só uso do lock),
+`src/index.ts` (só adaptação F10), `docs`. Sem tocar
+reviewer/orchestrator/forms/model/coordinator. Sem push/PR, sem perfil global.
+
+| ID | Defeito (revisão) | Correção | Evidência |
+| --- | --- | --- | --- |
+| F12 | `file-lock` removia lock só por idade (`staleMs` 660s integração) enquanto setup/teste/retry podem segurar mais; e "flock inter-processo" impreciso (é lockfile O_EXCL com expiração, não flock) | Lease com heartbeat do dono: holder atualiza mtime periodicamente (`heartbeatMs` default `min(max(1000,stale/3),30000)` — 30s p/ integração 660s); stale exige idade SEM progresso de heartbeat (re-stat antes de quebrar evita corrida com heartbeat); `heartbeatMsFor` exportado; header+comentários corrigidos p/ "lockfile with lease — not flock(2)"; `withIntegrationLock` documenta lease | `tests/lib/file-lock.test.ts` (2 processos, hold 3s > stale 2s: contender timeout, sem invasão; stale morto segue quebrado) |
+| F10 | `src/index.ts` era função Plugin legada (`@opencode-ai/plugin`); cliente HTTP próprio fala /api V2 mas não comprova carga como plugin V2 | Contrato oficial 2.1.4 investigado (host exige `default` objeto `{id, setup}`; função com `id+setup` rejeita `Expected object`; padrão migrate-v1 `event→subscribe`, `chat.message→session prompt`, `compacting→session compaction` confirmado via `caveman/server.js`); adaptador mínimo em `src/index.ts`: `MissionControl` V1 preservado (named), `default` vira `{id:'opencode-mission-control', setup}` que reusa V1 (single source) + converte 21 tools V1→V2 (`z.toJSONSchema` + string→`{content}`), `tool.transform/hook`, `event.subscribe`, `session.hook(prompt/compaction)`; `client.config/tui` defensivos (`?.`) + shim V2 (`session`→`client.session`, `config/tui` no-op) | `tests/plugin-init.test.ts` (V1 via named, 21 tools; V2 `default.id/setup` + 21 tools via transform); carga real via `.opencode/plugins` por projeto + `opencode run --standalone --print-logs` sem tocar perfil global |
+
+Provas F10 (sem tocar perfil global, só `/tmp/opencode/f10-probe`):
+- RED (antes do adaptador): `loading plugin …/mc-test` + `failed to load plugin … Expected object at ["default"]` (`/tmp/opencode/f10-v2-load.log` na lane de prova; reproduzido com `dist/index.js` V1).
+- GREEN (após adaptador): `loading plugin …/mc-test` 2×, **0 `failed to load plugin`** (`/tmp/opencode/f10-v2-load2.log`); único erro é `provider.auth User not found` (probe isolado sem auth, sem relação com plugin).
+- Contrato V2 confirmado via `ctx-dump` (`/tmp/opencode/ctx-dump.json`): `ctx` sem `client`, com `session` (`list/get/prompt/...`), `tool` (`transform/hook`), `location.directory`; função com props rejeitada, objeto aceito (probes `mc-func`/`mc-obj`).
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`index.js 1.44 MB`, `/tmp/opencode/f12f10-build.log`);
+focado `tests/plugin-init.test.ts tests/lib/file-lock.test.ts` → exit 0 (**20 pass, 0 fail**);
+full `bun test` → exit 1 — **1069 pass, 7 fail** (`/tmp/opencode/f12f10-test.log`):
+6 fails `tests/lib/tmux*.test.ts` (mesmos nomes §22.2) + 1 `wire-report createPR`
+(ambiental, mesmo padrão F03: passa isolado).
+Isolados verdes: `tmux+tmux-isPaneRunning` exit 0 (**23 pass**,
+`/tmp/opencode/f12f10-tmux-isolated.log`); `wire-report` exit 0 (**11 pass**,
+`/tmp/opencode/f12f10-wire-isolated.log`).
+Repro-antes F12 (TDD RED): holder 4s + stale 2s → contender `ACQUIRED (INVASION)`
+sem fix; após fix → `TIMED_OUT`, sem `invaded`, holder completo.
+Limitações honestas F10: carga V2 comprovada (loader aceita, setup sem erro);
+execução real das 21 tools via V2 com LLM vivo **não validada** (probe isolado
+sem auth; validar = projeto com auth + `mc_status` via V2); `command.execute.before`
+/`config` sem equivalente V2 mapeado (pendente, documentado no código); V1
+preservado via named `MissionControl` (testes usam named; `default` agora é V2).
