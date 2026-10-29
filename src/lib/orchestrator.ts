@@ -14,7 +14,7 @@ import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalRepor
 import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript } from './prompt-file';
-import { getCurrentModel } from './model-tracker';
+import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 import { detectOMO } from './omo';
 import { copyPlansToWorktree } from './plan-copier';
 import {
@@ -38,6 +38,7 @@ import {
   validateRuntimeDecision,
   loadContextDocs,
   formatContextDocsForPrompt,
+  nextStepsFor,
   type AutoIntakeInput,
   type PlannerGenerate,
   type RuntimeDecision,
@@ -57,6 +58,7 @@ import {
   setAutoIntakeStatus,
   saveMergeEvidence,
   loadMergeEvidence,
+  reconcileOnBoot,
 } from './durable-state';
 
 /**
@@ -845,12 +847,29 @@ export class Orchestrator {
 
   private resolveCoordinatorModel(): V2ModelRef {
     // The stored snapshot is already a full triple — return it untouched so a
-    // pinned variant survives (pin triplo). String snapshots never carry a
-    // variant (model-tracker stores provider/modelID only).
-    return (
-      this.planModelSnapshot ??
-      parseModelRef(getCurrentModel() ?? '') ?? { providerID: 'unknown', id: 'unknown' }
+    // pinned variant survives (pin triplo).
+    if (this.planModelSnapshot) return { ...this.planModelSnapshot };
+    // Single effective resolution (env → tracked → config): same chain as the
+    // planner, never unknown/unknown silently. Fallback warns explicitly.
+    const env = process.env.MC_PLANNER_MODEL?.trim();
+    if (env) {
+      const parsed = parseModelRef(env);
+      if (parsed) return parsed;
+    }
+    const ref = getCurrentModelRef();
+    if (ref) return { ...ref };
+    console.warn(
+      '[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).',
     );
+    return { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' };
+  }
+
+  /** Effective model once per execution: resolves, pins snapshot, returns triple. */
+  private ensureEffectiveModel(): V2ModelRef {
+    if (!this.planModelSnapshot) {
+      this.planModelSnapshot = this.resolveCoordinatorModel();
+    }
+    return { ...this.planModelSnapshot };
   }
 
   /**
@@ -904,6 +923,8 @@ export class Orchestrator {
             return { sessionID: '' };
           }
           dispatchedThisPass.add(key);
+          // F03: use the coordinator-calculated prompt (not a stale job.prompt).
+          if (req.prompt) current.prompt = req.prompt;
           await this.launchJob(current);
           current.status = 'running';
           this.coordinatedJobs.add(key);
@@ -1711,8 +1732,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         jobPrompt = `/ulw-loop ${jobPrompt}`;
       }
       promptFilePath = await writePromptFile(worktreePath, jobPrompt);
-      const model = this.planModelSnapshot ? modelRefToCliString(this.planModelSnapshot) : getCurrentModel();
-      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
+      // F06: effective model once per execution — snapshot triple (variant preserved for serve).
+      const effective = this.ensureEffectiveModel();
+      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effective);
 
       const initialCommand = `bash '${launcherPath}'`;
       if (placement === 'session') {
@@ -1904,8 +1926,8 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     try {
       promptFilePath = await writePromptFile(worktreePath, fullPrompt);
-      const model = this.planModelSnapshot ? modelRefToCliString(this.planModelSnapshot) : getCurrentModel();
-      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
+      const effective = this.ensureEffectiveModel();
+      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effective);
 
       const initialCommand = `bash '${launcherPath}'`;
       if (placement === 'session') {
@@ -2117,14 +2139,37 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       docs: loadedDocs.length > 0 ? formattedDocs : input.docs,
       ceiling: validCeiling.maxParallel !== undefined || validCeiling.testCommand !== undefined ? validCeiling : input.ceiling,
     };
+    // F06: effective model once per execution (installation real + variant).
+    const effective = this.ensureEffectiveModel();
+    const effectiveStr = modelRefToCliString(effective);
     return await withRepoRoot(repoRoot, async () => {
       this.repoRoot = repoRoot;
       this.applyCeiling(validCeiling);
+      // F07: persist before long ops — crash during planner/base still resumes.
+      const preId = randomUUID();
+      const preNow = new Date().toISOString();
+      await saveAutoIntake({
+        id: preId,
+        request: enrichedInput.request,
+        repo: repoRoot,
+        targetBranch: enrichedInput.targetBranch,
+        ceiling: Object.keys(validCeiling).length > 0 ? validCeiling : enrichedInput.ceiling,
+        requirements: [],
+        decisions: [`effective model ${effectiveStr}${effective.variant ? ` (variant ${effective.variant})` : ''} resolved once for planner+workers`],
+        questions: [],
+        nextSteps: [],
+        status: 'awaiting-plan',
+        createdAt: preNow,
+        updatedAt: preNow,
+        effectiveModel: effectiveStr,
+        ...(effective.variant ? { effectiveVariant: effective.variant } : {}),
+      }).catch(() => {});
       // Retry with backoff: an invalid model answer never becomes work.
       const { intake, draft, attempts } = await runAutoIntakeWithRetry(enrichedInput, generate, {
         maxAttempts: 3,
         baseDelayMs: 1000,
       });
+      // Re-anchor the early record to the real intake id (same request, no fork).
       const base = await ensureBaseReady(repoRoot, input.targetBranch);
 
       const now = new Date().toISOString();
@@ -2141,6 +2186,8 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         status: 'planned',
         createdAt: intake.createdAt,
         updatedAt: now,
+        effectiveModel: effectiveStr,
+        ...(effective.variant ? { effectiveVariant: effective.variant } : {}),
         // F11: preserve reference/version/scope + content for resume (never just the path).
         ...((loadedDocs.length > 0
           ? { contextDocs: loadedDocs, docs: formattedDocs }
@@ -2191,6 +2238,14 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       spec.baseBranch = base.baseBranch;
     }
     await this.startPlan(spec, { repoRoot });
+    // F07: durable intake↔plan linkage.
+    await saveAutoIntake({
+      ...(await loadAutoIntake(intake.id))!,
+      planId: spec.id,
+      effectiveModel: effectiveStr,
+      ...(effective.variant ? { effectiveVariant: effective.variant } : {}),
+      updatedAt: new Date().toISOString(),
+    }).catch(() => {});
     await appendAutoDecision(intake.id, `plan ${spec.id} launched (${tasks.length} tasks)`).catch(() => {});
     await setAutoIntakeStatus(intake.id, 'running').catch(() => {});
     await appendAutoDecision(
@@ -2206,13 +2261,13 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
    * killed; this re-enters via persisted intake + plan, never duplicates
    * workers (resumePlan reuses tmux/panes, reconciler dedupes queue) and
    * never reintegrates merged work. Never touches user sessions.
+   * F07: public boot reconciles (reconcileOnBoot), awaiting-plan generates,
+   * merging/creating_pr reativa, messages distinguish retomou/aguardou/inconsistência.
    */
-  async resumeAutonomousIntake(intakeId: string): Promise<string> {
-    // F02/F04/F11: restore explicit repo + effective ceiling + preserved context.
-    // Intake may live under a different repo's scope than current cwd (third-folder resume),
-    // so resolve via active scope first, then fall back to a cross-repo search is handled
-    // by the CLI layer (auto-commands) which passes the intake's repo explicitly.
-    const record = await loadAutoIntake(intakeId);
+  async resumeAutonomousIntake(intakeId: string, generate?: PlannerGenerate): Promise<string> {
+    // Cross-repo search (third-folder resume): active scope first, then XDG scan.
+    let record = await loadAutoIntake(intakeId).catch(() => null);
+    if (!record) record = await this.findIntakeAcrossRepos(intakeId).catch(() => null);
     if (!record) {
       throw new Error(`No intake "${intakeId}" persisted — start one before resuming.`);
     }
@@ -2223,10 +2278,63 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       this.repoRoot = repoRoot;
       // F04: restore effective config from the persisted ceiling (validated).
       this.applyCeiling((record as unknown as { ceiling?: { maxParallel?: number; testCommand?: string } }).ceiling);
-      const plan = await loadPlan(repoRoot);
-      if (!plan) {
-        return `Intake ${record.id} [${record.status}]: no active plan to resume (nothing duplicated, nothing reintegrated).`;
+      // F06: restore pinned effective model (planner+workers share one resolution).
+      const eff = (record as unknown as { effectiveModel?: string; effectiveVariant?: string }).effectiveModel;
+      const effVar = (record as unknown as { effectiveVariant?: string }).effectiveVariant;
+      if (eff) {
+        const parsed = parseModelRef(eff);
+        if (parsed) this.planModelSnapshot = effVar ? { ...parsed, variant: effVar } : parsed;
+      } else {
+        this.ensureEffectiveModel();
       }
+      // F07: public boot reconciles disk state (kill -9: dedupe + prune, never re-deliver).
+      try { await reconcileOnBoot(); } catch {}
+      let plan = await loadPlan(repoRoot);
+      if (!plan) {
+        // F07: awaiting-plan resumes by generating (never "no active plan" vazio).
+        if (record!.status === 'awaiting-plan' || record!.status === 'planned') {
+          if (!generate) {
+            return [
+              `Intake ${record!.id} [${record!.status}]: aguardando planejamento — nenhum plano em disco (inconsistência recuperável, nada duplicado).`,
+              `Retome com modelo para gerar o plano (resume --intake ${record!.id} com generate).`,
+            ].join('\n');
+          }
+          const req = (record as unknown as { request: string }).request;
+          const ceil = (record as unknown as { ceiling?: { maxParallel?: number; testCommand?: string } }).ceiling;
+          const tgt = (record as unknown as { targetBranch?: string }).targetBranch;
+          const ctxDocs = (record as unknown as { contextDocs?: LoadedContextDoc[] }).contextDocs;
+          const input: AutoIntakeInput = {
+            request: req, repo: repoRoot, targetBranch: tgt, ceiling: ceil,
+            ...(ctxDocs?.length ? { docs: ctxDocs.map((d) => d.content) } : {}),
+          };
+          const { draft, attempts } = await runAutoIntakeWithRetry(input, generate, { maxAttempts: 3, baseDelayMs: 1000 });
+          const base = await ensureBaseReady(repoRoot, tgt);
+          const now = new Date().toISOString();
+          const jobSpecs: JobSpec[] = draftToJobSpecs(draft).map((shell) => ({
+            ...shell,
+            id: randomUUID(),
+            status: 'queued' as const,
+            prompt: `${shell.prompt}\n\nAcceptance criteria:\n${draft.tasks.find((t) => t.name === shell.name)!.acceptance.map((a) => `- [ ] ${a}`).join('\n')}`,
+          }));
+          const spec: PlanSpec = {
+            id: randomUUID(), name: req.length > 100 ? req.slice(0, 100) : req,
+            mode: 'autopilot', status: 'pending', jobs: jobSpecs,
+            integrationBranch: `mc/integration-${record!.id}`,
+            baseCommit: base.baseCommit, createdAt: now, launchSessionID: this.planLaunchSessionID,
+          };
+          if (tgt) spec.baseBranch = base.baseBranch;
+          await this.startPlan(spec, { repoRoot });
+          await saveAutoIntake({ ...record!, planId: spec.id, status: 'running', updatedAt: now }).catch(() => {});
+          await appendAutoDecision(record!.id, `resumed by generating plan ${spec.id} from awaiting-plan (attempts ${attempts})`).catch(() => {});
+          const progress = await this.autonomousProgress(record!.id);
+          return [`Resumido: planejamento interrompido gerou plano ${spec.id} (${jobSpecs.length} task(s)).`, progress].join('\n');
+        }
+        return [
+          `Inconsistência: intake ${record!.id} [${record!.status}] sem plano em disco (nada duplicado, nada reintegrado).`,
+          `Verifique o repo ${(record as unknown as { repo?: string }).repo ?? repoRoot} ou gere novamente.`,
+        ].join('\n');
+      }
+      const beforeStatus = plan.status;
       await this.resumePlan(repoRoot);
       await appendAutoDecision(record.id, `resumed via public path (plan ${plan.id}, no new JSON)`).catch(() => {});
       // F11: context preserved — never re-declared from a bare path.
@@ -2237,19 +2345,56 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           `context preserved on resume: ${ctx.map((d) => `${d.ref} (sha:${d.hash} scope:${d.scope})`).join(', ')}`,
         ).catch(() => {});
       }
-      return await this.autonomousProgress(record.id);
+      const progress = await this.autonomousProgress(record.id);
+      if (beforeStatus === 'merging' || beforeStatus === 'creating_pr') {
+        return [`Reativado após queda em ${beforeStatus} (plano ${plan.id}, reconciliador reativado, sem sucesso vazio).`, progress].join('\n');
+      }
+      if (beforeStatus === 'paused' || (plan.checkpoint ?? null) !== null) {
+        return [`Aguardando decisão: plano ${plan.id} pausado (pausa respeitada, nada despachado).`, progress].join('\n');
+      }
+      return [`Retomado: plano ${plan.id} [${beforeStatus}] reativado sem duplicar workers.`, progress].join('\n');
     });
+  }
+
+  /** F07: cross-repo intake search (third-folder resume) without launcher-cwd dependence. */
+  private async findIntakeAcrossRepos(id: string): Promise<import('./durable-state').AutoIntakeRecord | null> {
+    try {
+      const fs = await import('fs');
+      const { join } = await import('path');
+      const { getXdgDataDir } = await import('./paths');
+      const base = getXdgDataDir();
+      let entries: string[] = [];
+      try { entries = fs.readdirSync(base); } catch { return null; }
+      for (const entry of entries) {
+        const candidate = join(base, entry, 'state', 'runtime-state.json');
+        try {
+          if (!fs.existsSync(candidate)) continue;
+          const text = fs.readFileSync(candidate, 'utf8');
+          if (!text.includes(id)) continue;
+          const parsed = JSON.parse(text) as { autoIntake?: import('./durable-state').AutoIntakeRecord };
+          if (parsed?.autoIntake?.id === id) {
+            return parsed.autoIntake;
+          }
+        } catch { continue; }
+      }
+    } catch {}
+    return null;
   }
 
   /**
    * Extend the persisted NL request; the same work continues, nothing rebuilds.
-   * When running, the follow-up enters the scheduler and the reconciler /
-   * coordinator advance eligible work with no manual resume. When paused or
-   * blocked by a decision, the pause is respected and the free-text follow-up
-   * is recorded as a question (content, never an approve/deny).
+   * F03: complement triggers a real plan revision via the model (same slot as
+   * intake): new requirements persist as a version, new tasks/corrections go
+   * through existing paths (addJob/applyModelAdjustment), pause/decisions are
+   * preserved. Never announces the scheduler before scheduling.
    */
-  async complementAutonomousRequest(intakeId: string, text: string): Promise<void> {
-    const record = await loadAutoIntake(intakeId);
+  async complementAutonomousRequest(
+    intakeId: string,
+    text: string,
+    generate?: PlannerGenerate,
+  ): Promise<{ added: string[]; message: string }> {
+    let record = await loadAutoIntake(intakeId).catch(() => null);
+    if (!record) record = await this.findIntakeAcrossRepos(intakeId).catch(() => null);
     if (!record) {
       throw new Error(`No intake "${intakeId}" persisted — start one before complementing.`);
     }
@@ -2260,27 +2405,109 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       this.repoRoot = this.repoRoot ?? repoRoot;
       const followUp = text.trim();
       if (!followUp) throw new Error('Complement text must not be empty.');
-      await saveAutoIntake({
-        ...record,
-        request: `${record.request}\nFollow-up: ${followUp}`,
-        updatedAt: new Date().toISOString(),
-      });
+      // Idempotent: the CLI already persisted Follow-up via the resolved record — never duplicate it.
+      const updatedRequest = record!.request.endsWith(`Follow-up: ${followUp}`)
+        ? record!.request
+        : `${record!.request}\nFollow-up: ${followUp}`;
+      if (updatedRequest !== record!.request) {
+        await saveAutoIntake({
+          ...record!,
+          request: updatedRequest,
+          updatedAt: new Date().toISOString(),
+        });
+      }
       const plan = await loadPlan(repoRoot).catch(() => null);
-      const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
+      if (!plan) {
+        await appendAutoDecision(intakeId, `complement (no plan yet): "${followUp.slice(0, 120)}"`).catch(() => {});
+        return { added: [], message: `Complement recorded on intake ${intakeId} (no plan yet, nothing rebuilt).` };
+      }
+      const paused = plan.status === 'paused' || !!plan.checkpoint;
       if (paused) {
         // Free content recorded as a question; the pause/decision stands.
         await appendAutoQuestion(intakeId, followUp).catch(() => {});
-        return;
+        return {
+          added: [],
+          message: `Complement recorded on intake ${intakeId} (pause respected, follow-up kept as open question, nothing dispatched).`,
+        };
       }
-      await appendAutoDecision(intakeId, `complement: "${followUp.slice(0, 120)}"`).catch(() => {});
-      // Running: make sure the loop that advances eligible work is alive, so no
-      // manual resumePlan is needed after a complement/new task.
+      // Running path: real revision via the model (same slot as intake).
+      if (!generate) {
+        await appendAutoDecision(intakeId, `complement: "${followUp.slice(0, 120)}"`).catch(() => {});
+        try {
+          const latest = await loadPlan(repoRoot);
+          if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
+            this.startReconciler();
+          }
+        } catch {}
+        return {
+          added: [],
+          message: `Complement recorded on intake ${intakeId} (reconciler active, no model revision without generate).`,
+        };
+      }
+      const input: AutoIntakeInput = {
+        request: updatedRequest,
+        repo: repoRoot,
+        targetBranch: (record as unknown as { targetBranch?: string }).targetBranch,
+        ceiling: (record as unknown as { ceiling?: { maxParallel?: number; testCommand?: string } }).ceiling,
+      };
+      const { draft } = await runAutoIntakeWithRetry(input, generate, { maxAttempts: 3, baseDelayMs: 1000 });
+      const live = (await loadPlan(repoRoot)) ?? plan;
+      const existing = new Set(live.jobs.map((j) => j.name));
+      const added: string[] = [];
+      let needsUser = 0;
+      for (const t of draft.tasks) {
+        if (existing.has(t.name)) continue;
+        const res = await this.applyModelAdjustment(
+          { action: 'add_task', task: { ...t }, reason: followUp },
+          { intakeId },
+        ).catch((e) => ({ route: 'needs-user' as const, message: e instanceof Error ? e.message : String(e) }));
+        if (res.route === 'autonomous') added.push(t.name);
+        else needsUser += 1;
+      }
+      // Deps adjustments for existing tasks (functional change without new tasks).
+      const depMap: Record<string, string[]> = {};
+      let depsChanged = false;
+      for (const t of draft.tasks) {
+        if (!existing.has(t.name)) continue;
+        const cur = live.jobs.find((j) => j.name === t.name)?.dependsOn ?? [];
+        const nxt = t.dependsOn ?? [];
+        if (JSON.stringify([...cur].sort()) !== JSON.stringify([...nxt].sort())) {
+          depMap[t.name] = [...nxt];
+          depsChanged = true;
+        }
+      }
+      if (depsChanged) {
+        const res = await this.applyModelAdjustment(
+          { action: 'adjust_deps', dependsOn: depMap, reason: followUp },
+          { intakeId },
+        ).catch(() => ({ route: 'needs-user' as const, message: '' }));
+        if (res.route === 'needs-user') needsUser += 1;
+      }
+      // Persist requirement version (never only Follow-up in JSON).
+      await saveAutoIntake({
+        ...(await loadAutoIntake(intakeId))!,
+        requirements: draft.requirements.map((r) => ({ ...r })),
+        decisions: [...((await loadAutoIntake(intakeId))?.decisions ?? []), ...draft.decisions],
+        questions: [...((await loadAutoIntake(intakeId))?.questions ?? [])],
+        nextSteps: nextStepsFor(draft),
+        updatedAt: new Date().toISOString(),
+      }).catch(() => {});
+      await appendAutoDecision(intakeId, `complement revision: ${draft.requirements.length} requirements, +${added.length} tasks${needsUser ? `, ${needsUser} needs-user` : ''}`).catch(() => {});
+      // Ensure the loop is alive only after scheduling (never announce before).
       try {
         const latest = await loadPlan(repoRoot);
         if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
           this.startReconciler();
         }
       } catch {}
+      const reconciled = this.isRunning ? 'reconciler active' : 'reconciler will advance on next pass';
+      if (added.length > 0) {
+        return { added, message: `Complement revised plan: added ${added.length} task(s) [${added.join(', ')}] (${reconciled}).` };
+      }
+      if (needsUser > 0) {
+        return { added, message: `Complement recorded as human decision (${needsUser} proposal(s) need review, ${reconciled}).` };
+      }
+      return { added, message: `Complement noted: requirements version persisted (${draft.requirements.length}), no new tasks (${reconciled}).` };
     });
   }
 
@@ -2606,8 +2833,11 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     const repoRoot = resolveRepoRoot(repoRootOverride ?? this.repoRoot ?? getActiveRepoRoot() ?? undefined);
     this.repoRoot = repoRoot;
     await withRepoRoot(repoRoot, async () => {
+      // F07: public boot reconciles disk state first (kill -9 safe).
+      try { await reconcileOnBoot(); } catch {}
       const plan = await loadPlan(repoRoot);
-      if (!plan || (plan.status !== 'running' && plan.status !== 'paused')) {
+      // F07: recoverable transitions include pending/merging/creating_pr — never silent no-op.
+      if (!plan || (plan.status !== 'running' && plan.status !== 'paused' && plan.status !== 'pending' && plan.status !== 'merging' && plan.status !== 'creating_pr')) {
         return;
       }
 
@@ -2617,6 +2847,17 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           checkpoint: null,
           checkpointContext: null,
         }, repoRoot);
+      } else if (plan.status === 'pending') {
+        await updatePlanFields(plan.id, { status: 'running' }, repoRoot);
+        plan.status = 'running';
+      } else if (plan.status === 'creating_pr') {
+        // Crash during PR creation: retry completion via merging (forced recovery, warn-and-apply).
+        await updatePlanFields(plan.id, { status: 'merging' }, repoRoot);
+        plan.status = 'merging';
+      } else if (plan.status === 'merging') {
+        // Reativação: merging volta a running para o reconciliador re-enfileirar (sem sucesso vazio).
+        await updatePlanFields(plan.id, { status: 'running' }, repoRoot);
+        plan.status = 'running';
       }
       this.checkpoint = null;
 

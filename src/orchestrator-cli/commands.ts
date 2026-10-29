@@ -140,7 +140,7 @@ async function dispatchTokens(
     }
 
     case 'complement': {
-      return complementIntake(rest);
+      return complementIntake(rest, autoDeps);
     }
 
     case 'auto-plan': {

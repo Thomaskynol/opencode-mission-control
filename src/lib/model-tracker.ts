@@ -11,6 +11,8 @@
 export interface ModelInfo {
   providerID: string;
   modelID: string;
+  /** Pinned variant when the installation reports one (pin triplo). CLI `-m` has no variant form. */
+  variant?: string;
 }
 
 /** Per-session model storage, keyed by sessionID. Capped at MAX_SESSION_ENTRIES. */
@@ -45,6 +47,7 @@ export function setCurrentModel(model: ModelInfo | undefined, sessionID?: string
     return;
   }
   const info: ModelInfo = { providerID: model.providerID, modelID: model.modelID };
+  if (model.variant !== undefined) info.variant = model.variant;
 
   lastSetModel = info;
 
@@ -90,15 +93,34 @@ export function getCurrentModel(sessionID?: string): string | undefined {
 }
 
 /**
- * Get the raw model info object.
- * Priority: sessionModels[sessionID] → lastSetModel → undefined
+ * Get the raw model info object (incl. variant when pinned).
+ * Priority: sessionModels[sessionID] → lastSetModel → config fallback → undefined
  */
 export function getCurrentModelInfo(sessionID?: string): ModelInfo | undefined {
   if (sessionID && sessionModels.has(sessionID)) {
     const m = sessionModels.get(sessionID)!;
     return { ...m };
   }
-  return lastSetModel ? { ...lastSetModel } : undefined;
+  if (lastSetModel) return { ...lastSetModel };
+  if (configFallbackModel) {
+    const slash = configFallbackModel.indexOf('/');
+    if (slash > 0) {
+      return { providerID: configFallbackModel.slice(0, slash), modelID: configFallbackModel.slice(slash + 1) };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Effective model triple for one execution (installation real, variant when pinned).
+ * Same chain as getCurrentModel but preserves variant for serve paths.
+ */
+export function getCurrentModelRef(sessionID?: string): { providerID: string; id: string; variant?: string } | undefined {
+  const info = getCurrentModelInfo(sessionID);
+  if (!info) return undefined;
+  return info.variant !== undefined
+    ? { providerID: info.providerID, id: info.modelID, variant: info.variant }
+    : { providerID: info.providerID, id: info.modelID };
 }
 
 /**
@@ -119,13 +141,13 @@ export function clearCurrentModel(sessionID?: string): void {
  * Maps Model.id → ModelInfo.modelID and Model.providerID → ModelInfo.providerID.
  */
 export function setCurrentModelFromSDK(
-  model: { id: string; providerID: string } | undefined,
+  model: { id: string; providerID: string; variant?: string } | undefined,
   sessionID?: string,
 ): void {
   if (!model?.id || !model?.providerID) {
     return;
   }
-  setCurrentModel({ providerID: model.providerID, modelID: model.id }, sessionID);
+  setCurrentModel({ providerID: model.providerID, modelID: model.id, ...(model.variant !== undefined ? { variant: model.variant } : {}) }, sessionID);
 }
 
 /**

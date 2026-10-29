@@ -120,11 +120,30 @@ export async function answerViaForm(
 
 /**
  * Answer a permission escalation (`perm:<id>`) via the session-scoped
- * permission reply endpoint. Maps `approve/1/yes` → `once`,
- * `deny/2/no` → `reject`; any other explicit text approves with that
- * message (the operator typed it, so it is explicit authorization).
+ * permission reply endpoint. Fail-closed: only explicit positive
+ * approve/deny tokens (PT+EN) send a decision (`once`/`reject`);
+ * empty, questions, "aguarde" and any ambiguous text never approve —
+ * they throw a clarification error without touching the network.
  * Returns true when a permission reply was sent.
  */
+const PERM_APPROVE = new Set([
+  '1', 'approve', 'approved', 'yes', 'y', 'yeah', 'yep', 'allow', 'allowed',
+  'once', 'always', 'sim', 's', 'autorizo', 'autorizado', 'aprovado', 'aprovar',
+  'aprove', 'permitir', 'permitido', 'confirmar', 'confirmo', 'liberado', 'liberar', 'ok',
+]);
+const PERM_DENY = new Set([
+  '2', 'deny', 'denied', 'no', 'n', 'nope', 'reject', 'rejected',
+  'nao', 'nunca', 'nego', 'negar', 'negado', 'negada', 'recuso', 'recusar',
+  'recusado', 'rejeito', 'rejeitar', 'rejeitado', 'cancelar', 'cancelado',
+  'cancela', 'proibo', 'proibido', 'nao autorizo', 'nao permito', 'nao aprovo',
+]);
+// Multi-word deny intent inside a longer sentence (word-boundaried, never approves).
+const PERM_DENY_PHRASE = /\b(nao\s+autorizo|nao\s+permito|nao\s+aprovo|deny|rejected?)\b/;
+
+function normalizePerm(text: string): string {
+  return text.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ');
+}
+
 export async function answerViaPermission(
   port: number,
   sessionID: string,
@@ -134,29 +153,33 @@ export async function answerViaPermission(
   if (!partId.startsWith('perm:')) return false;
   if (!port || !sessionID) return false;
   const permissionId = partId.slice('perm:'.length);
-  const want = response.trim().toLowerCase();
+  const want = normalizePerm(response ?? '');
+  if (!want) {
+    throw new Error(
+      'Clarification needed: empty response never approves. Reply with explicit "approve"/"sim" (once) or "deny"/"não" (reject).',
+    );
+  }
+  if (want.endsWith('?')) {
+    throw new Error(
+      'Clarification needed: questions never approve. Reply with explicit "approve"/"sim" (once) or "deny"/"não" (reject), or "aguarde" to keep waiting (no decision sent).',
+    );
+  }
   let approved: boolean;
   let message: string;
-  if (want === '2' || want === 'deny' || want === 'denied' || want === 'no' || want === 'n' || want === 'reject') {
-    approved = false;
-    message = 'Denied by operator';
-  } else if (
-    want === '1' ||
-    want === 'approve' ||
-    want === 'approved' ||
-    want === 'yes' ||
-    want === 'y' ||
-    want === 'allow' ||
-    want === 'once'
-  ) {
+  if (PERM_APPROVE.has(want)) {
     approved = true;
     message = 'Approved by operator (once)';
-  } else if (want.includes('deny') || want.includes('reject') || want === 'no') {
+  } else if (PERM_DENY.has(want)) {
+    approved = false;
+    message = 'Denied by operator';
+  } else if (PERM_DENY_PHRASE.test(want)) {
     approved = false;
     message = response;
   } else {
-    approved = true;
-    message = response;
+    // Unknown/ambiguous (incl. "aguarde", free-text): never approve, never deny by silence.
+    throw new Error(
+      `Clarification needed: "${response}" is not an explicit approve/deny. Reply with "approve"/"sim" (once) or "deny"/"não" (reject); "aguarde" keeps waiting without sending a decision.`,
+    );
   }
   const config = await loadConfig();
   const client = createV2Client(port, config.serverPassword);
@@ -176,12 +199,18 @@ export async function answerQuestion(
   const live = findPendingQuestionByJobName(jobName);
   if (live) {
     if (live.partId.startsWith('perm:')) {
-      const sent = await answerViaPermission(live.port, live.remoteSessionID, live.partId, response).catch(() => false);
+      try {
+        await answerViaPermission(live.port, live.remoteSessionID, live.partId, response);
+      } catch (e) {
+        // Clarification never sends and never drops the question.
+        if (e instanceof Error && /clarification needed/i.test(e.message)) throw e;
+        removePendingQuestion(live.jobId, live.partId);
+        await dropPersistedQuestion(live.jobId, live.partId);
+        return `Permission "${live.partId}" recorded for job "${jobName}" (worker offline — decision visible in overview)`;
+      }
       removePendingQuestion(live.jobId, live.partId);
       await dropPersistedQuestion(live.jobId, live.partId);
-      return sent
-        ? `Permission decision sent to job "${jobName}": "${response}"`
-        : `Permission "${live.partId}" recorded for job "${jobName}" (worker offline — decision visible in overview)`;
+      return `Permission decision sent to job "${jobName}": "${response}"`;
     }
     const formID = await answerViaForm(live.port, live.remoteSessionID, live.partId, response).catch(() => null);
     if (!formID) {
@@ -204,11 +233,15 @@ export async function answerQuestion(
   }
   const q = persisted[0];
   if (q.partId.startsWith('perm:')) {
-    const sent = await answerViaPermission(q.port, q.remoteSessionID, q.partId, response).catch(() => false);
+    try {
+      await answerViaPermission(q.port, q.remoteSessionID, q.partId, response);
+    } catch (e) {
+      if (e instanceof Error && /clarification needed/i.test(e.message)) throw e;
+      await dropPersistedQuestion(q.jobId, q.partId);
+      return `Permission "${q.partId}" recorded for job "${jobName}" (from durable sidecar, worker offline)`;
+    }
     await dropPersistedQuestion(q.jobId, q.partId);
-    return sent
-      ? `Permission decision sent to job "${jobName}" (from durable sidecar): "${response}"`
-      : `Permission "${q.partId}" recorded for job "${jobName}" (from durable sidecar, worker offline)`;
+    return `Permission decision sent to job "${jobName}" (from durable sidecar): "${response}"`;
   }
   const formID = await answerViaForm(q.port, q.remoteSessionID, q.partId, response).catch(() => null);
   if (!formID) {

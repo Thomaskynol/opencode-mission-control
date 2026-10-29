@@ -409,6 +409,12 @@ export interface CoordinatorDeps {
 export async function coordinateOnce(deps: CoordinatorDeps): Promise<string[]> {
   assertDepthAllowed();
   const snapshot = await deps.observe();
+  // F06: never dispatch with an unknown silent fallback — fail-closed.
+  if (!snapshot.model || snapshot.model.providerID === 'unknown' || snapshot.model.id === 'unknown') {
+    throw new Error(
+      'Coordinator has no effective model (unknown/unknown) — resolve once per execution (env/tracked/config) before dispatching.',
+    );
+  }
   const model: V2ModelRef = { ...snapshot.model };
   const picked = decideNextJobs(snapshot.jobs, snapshot.runningCount, deps.maxParallel);
   const dispatched: string[] = [];

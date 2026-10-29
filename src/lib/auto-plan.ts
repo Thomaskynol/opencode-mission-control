@@ -14,7 +14,7 @@ import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
 import { gitCommand } from './git';
-import { getCurrentModel } from './model-tracker';
+import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 
 export interface AutoCeiling {
   maxParallel?: number;
@@ -567,11 +567,40 @@ export async function runAutoIntake(
 /** Default planner model (normal opencode auth, never a key prompt). */
 export const PLANNER_MODEL_DEFAULT = 'opencode-go/muse-spark-1.3-contributor';
 
-/** Resolve the planner model: explicit env → tracked session model → default. */
+/**
+ * Resolve the planner model: explicit env → tracked session model → config → default.
+ * The default is never silent: when no installation model is found it warns
+ * explicitly (console.warn) so the fallback is visible, never quiet.
+ * Use resolveEffectiveModelRef() when the variant triple is needed.
+ */
 export function resolvePlannerModel(): string {
   const env = process.env.MC_PLANNER_MODEL?.trim();
   if (env) return env;
-  return getCurrentModel() ?? PLANNER_MODEL_DEFAULT;
+  const tracked = getCurrentModel();
+  if (tracked) return tracked;
+  console.warn(
+    `[MC] No tracked model (session/config) found — falling back to default "${PLANNER_MODEL_DEFAULT}". ` +
+    `Set MC_PLANNER_MODEL or run inside the control center so planner and workers share the effective model.`,
+  );
+  return PLANNER_MODEL_DEFAULT;
+}
+
+/** Effective triple (provider/id + variant when pinned) for one execution. */
+export function resolveEffectiveModelRef(): { providerID: string; id: string; variant?: string } {
+  const env = process.env.MC_PLANNER_MODEL?.trim();
+  if (env) {
+    const slash = env.indexOf('/');
+    if (slash > 0) return { providerID: env.slice(0, slash), id: env.slice(slash + 1) };
+    return { providerID: 'unknown', id: env };
+  }
+  const ref = getCurrentModelRef();
+  if (ref) return ref;
+  console.warn(
+    `[MC] No tracked model (session/config) found — falling back to default "${PLANNER_MODEL_DEFAULT}" (triple). ` +
+    `Set MC_PLANNER_MODEL or run inside the control center so planner and workers share the effective model.`,
+  );
+  const slash = PLANNER_MODEL_DEFAULT.indexOf('/');
+  return { providerID: PLANNER_MODEL_DEFAULT.slice(0, slash), id: PLANNER_MODEL_DEFAULT.slice(slash + 1) };
 }
 
 function defaultSleep(ms: number): Promise<void> {

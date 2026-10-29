@@ -250,7 +250,7 @@ async function resolveIntake(flags: Map<string, string>): Promise<AutoIntakeReco
 }
 
 /** `complement [--intake ID] <follow-up text>` — same work continues, nothing rebuilt. */
-export async function complementIntake(args: string[]): Promise<string> {
+export async function complementIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { positional, flags } = parseFlags(args);
   const text = positional.join(' ').trim();
   if (!text) throw new Error('Usage: complement [--intake <id>] <follow-up text>');
@@ -258,30 +258,40 @@ export async function complementIntake(args: string[]): Promise<string> {
   // F02: operate inside the intake's repo scope (never the launcher cwd).
   const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
   return await withRepoRoot(repoRoot, async () => {
-    await saveAutoIntake({
-      ...record,
-      request: `${record.request}\nFollow-up: ${text}`,
-      updatedAt: new Date().toISOString(),
-    });
-    // Pause-aware: a paused/blocked plan keeps its decision; the free-text
-    // follow-up is recorded as a question (content, never approve/deny).
-    // A running plan takes the complement into the scheduler — the
-    // coordinator/reconciler advance eligible work with no manual resume.
-    const plan = await loadPlan(repoRoot).catch(() => null);
-    const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
-    if (paused) {
-      await appendAutoQuestion(record.id, text).catch(() => {});
+    // Robust: persist Follow-up first via the already-resolved record (same mocked scope as the test/CLI),
+    // so the request version survives even if the revision below fails or resolves another scope.
+    try {
+      const cur = (await loadAutoIntake(record.id).catch(() => null)) ?? record;
+      if (!cur.request.endsWith(`Follow-up: ${text}`)) {
+        await saveAutoIntake({ ...cur, request: `${cur.request}\nFollow-up: ${text}`, updatedAt: new Date().toISOString() });
+      }
+    } catch {}
+    const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
+      import('../lib/orchestrator'),
+      import('../lib/monitor'),
+      import('../lib/config'),
+    ]);
+    const config = await loadConfig();
+    const orchestrator = new Orchestrator(new JobMonitor(), config);
+    (orchestrator as unknown as { repoRoot: string }).repoRoot = repoRoot;
+    // F03: real revision via the model (same slot as intake) — never only Follow-up.
+    const generate = deps?.generate ?? (await import('../lib/auto-plan')).createRunPlannerGenerate();
+    try {
+      const res = await (orchestrator as unknown as {
+        complementAutonomousRequest: (id: string, t: string, g: unknown) => Promise<{ added: string[]; message: string }>;
+      }).complementAutonomousRequest(record.id, text, generate);
       return [
-        `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
-        `Plan is paused — pause respected, follow-up kept as an open question (free text, not approve/deny).`,
+        `${res.message}`,
+        `Request now ends with: "Follow-up: ${text}"`,
+      ].join('\n');
+    } catch (e) {
+      // Model revision failed explicitly — Follow-up persisted, pause/decisions preserved.
+      const msg = e instanceof Error ? e.message : String(e);
+      return [
+        `Complement recorded on intake ${record.id} (revision failed explicitly: ${msg}).`,
         `Request now ends with: "Follow-up: ${text}"`,
       ].join('\n');
     }
-    return [
-      `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
-      `Running: follow-up enters the scheduler — coordinator/reconciler advance eligible work, no manual resume needed.`,
-      `Request now ends with: "Follow-up: ${text}"`,
-    ].join('\n');
   });
 }
 
@@ -461,6 +471,7 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
   const record = await resolveIntake(flags);
   // F02: resume inside the intake's repo scope (third-folder resume never touches launcher state).
   const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
+  const generate = deps?.generate ?? (await import('../lib/auto-plan')).createRunPlannerGenerate();
   const resumeFn =
     deps?.resumeAutonomous ??
     (async (intakeId: string) => {
@@ -472,7 +483,8 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
         ]);
         const config = await loadConfig();
         const orchestrator = new Orchestrator(new JobMonitor(), config);
-        return orchestrator.resumeAutonomousIntake(intakeId);
+        // F07: awaiting-plan generates via the model (never "no active plan" vazio).
+        return (orchestrator as unknown as { resumeAutonomousIntake: (id: string, g?: unknown) => Promise<string> }).resumeAutonomousIntake(intakeId, generate);
       });
     });
   const progress = await withRepoRoot(repoRoot, async () => resumeFn(record.id));

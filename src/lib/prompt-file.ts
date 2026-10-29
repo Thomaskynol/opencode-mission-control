@@ -34,12 +34,18 @@ export function cleanupPromptFile(filePath: string, delayMs = 5000): void {
 export async function writeLauncherScript(
   worktreePath: string,
   promptFilePath: string,
-  model?: string,
+  model?: string | { providerID: string; id: string; variant?: string },
 ): Promise<string> {
   const launcherPath = join(worktreePath, LAUNCHER_FILENAME);
   const opencodeBin = resolveOpencodePath();
-  const modelFlag = model ? ` -m "${model}"` : '';
-  const script = `#!/bin/bash\nexec ${opencodeBin}${modelFlag} --prompt "$(cat ${quoteShellPath(promptFilePath)})"\n`;
+  // F06: CLI `-m` has no variant form — the string carries provider/model,
+  // the pinned variant (when supported, e.g. serve triple) is preserved as an
+  // explicit comment so planner/workers stay observably equal.
+  const cliModel = typeof model === 'string' ? model : model ? `${model.providerID}/${model.id}` : undefined;
+  const variant = typeof model === 'object' ? model.variant : undefined;
+  const modelFlag = cliModel ? ` -m "${cliModel}"` : '';
+  const variantNote = variant ? `# variant: ${variant} (pinned triple; CLI -m carries provider/model only)\n` : '';
+  const script = `#!/bin/bash\n${variantNote}exec ${opencodeBin}${modelFlag} --prompt "$(cat ${quoteShellPath(promptFilePath)})"\n`;
   await writeFile(launcherPath, script, { mode: 0o755 });
   return launcherPath;
 }

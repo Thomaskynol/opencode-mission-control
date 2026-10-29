@@ -183,7 +183,7 @@ describe('answer routing: free-text content is never an approve/deny', () => {
     expect(fetched).toEqual([]);
   });
 
-  it('routes free-text content on a permission question as an explicit permission message', async () => {
+  it('fail-closed: free-text on a permission question asks clarification (never once)', async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     globalThis.fetch = (async (url: unknown, init: unknown) => {
       calls.push({ url: String(url), body: JSON.parse(String((init as RequestInit)?.body)) });
@@ -192,20 +192,12 @@ describe('answer routing: free-text content is never an approve/deny', () => {
 
     permissionQuestion();
     let prompted = 0;
-    const result = await answerQuestion(
-      'auto-alpha',
-      'use your best judgment to fix the build',
-      async () => {
+    await expect(
+      answerQuestion('auto-alpha', 'use your best judgment to fix the build', async () => {
         prompted += 1;
-      },
-    );
+      }),
+    ).rejects.toThrow(/clarification/i);
     expect(prompted).toBe(0);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toContain('/permission/req-1/reply');
-    expect(calls[0].body).toEqual({
-      decision: 'once',
-      message: 'use your best judgment to fix the build',
-    });
-    expect(result).toMatch(/Permission decision sent/);
+    expect(calls.filter((c) => c.url.includes('/permission/'))).toHaveLength(0);
   });
 });

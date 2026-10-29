@@ -62,6 +62,11 @@ export interface AutoIntakeRecord {
   status: AutoIntakeStatus;
   createdAt: string;
   updatedAt: string;
+  /** F07: durable intake↔plan linkage (which plan this intake produced). */
+  planId?: string;
+  /** F06: effective model once per execution (provider/model + variant when pinned). */
+  effectiveModel?: string;
+  effectiveVariant?: string;
 }
 
 export interface RuntimeSnapshot {

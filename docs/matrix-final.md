@@ -524,3 +524,40 @@ Limitações restantes (adendo honesto):
    integração (`orchestration.test.ts` 4 pass sem intake).
 3. `E2E-E` segue Pendente; workers vivos não re-demonstrados nesta lane.
 4. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência.
+
+## 25. Adendo replan-auth-model-resume (F03+F05+F06+F07, HEAD desta lane)
+
+Escopo: `src/lib/orchestrator.ts`, `src/lib/coordinator.ts`, `src/orchestrator-cli/forms.ts`,
+`src/orchestrator-cli/auto-commands.ts`, `src/orchestrator-cli/commands.ts`,
+`src/lib/auto-plan.ts` (só model resolve), `src/lib/model-tracker.ts`,
+`src/lib/durable-state.ts` (só reconcile/persistência intake),
+`src/lib/prompt-file.ts` (só variant). Sem tocar merge-train/reviewer/paths/plan-state/integration/reports.
+Sem push/PR, sem perfil global, modelo `muse-spark-1.3-contributor` autorizado.
+
+| ID | Defeito (revisão) | Correção | Evidência |
+| --- | --- | --- | --- |
+| F03 | Complement só salvava texto (request muda, plan.json não); `applyModelAdjustment` sem chamador de produção; coordinator puramente determinístico; dispatch ignorava prompt calculado | Complement dispara revisão real via modelo (mesmo slot generate do intake): persiste versão de requisitos, cria tarefas novas/correções via `addJob`/`applyModelAdjustment`, preserva pausa/decisões; `runCoordinatorPass` usa `req.prompt` calculado; nunca anuncia scheduler antes de agendar (mensagem reflete added/reconciler real) | `tests/lib/f03f05f06f07-regression.test.ts` (complement com requisito novo cria task-b ou registra pergunta humana, nunca só Follow-up); RED antes: fail, GREEN depois: pass |
+| F05 | `answerViaPermission` só poucas palavras inglesas negavam, resto caía em approved=true ("não autorizo"→once) | Decisão explícita separada de conteúdo: listas PT+EN de approve/deny validadas positivamente; vazio/pergunta/"aguarde"/ambíguo NUNCA aprova — lança esclarecimento sem enviar decisão; `answerQuestion` propaga clarification sem remover a pergunta (só offline registra) | Mesmo arquivo (não autorizo→reject; aguarde/vazio/pergunta→throw sem fetch; sim/não/aprove PT+EN funcionam); teste legado de free-text→once atualizado para fail-closed |
+| F06 | Planner resolve fallback fixo sem tracker; coordinator unknown/unknown; TUI sem variant; InstanceManager não instanciado | Modelo efetivo 1x por execução (env→tracked→config, fallback só com aviso explícito, nunca silencioso); `model-tracker` preserva variant (pin triplo); planner+coordinator observam o mesmo triple; launcher TUI carrega triple com nota de variant (CLI -m sem forma de variant); `coordinateOnce` fail-closed contra unknown/unknown; intake persiste `effectiveModel`/`effectiveVariant` para retomada | Mesmo arquivo (planner==coordinator; sem tracker avisa em vez de silêncio; coordinator nunca unknown silencioso; variant max atravessa tracker→coordinator) |
+| F07 | Pedido persistido só após planner+base; awaiting-plan sem retomada real; resume sem plano não gera; resumePlan só running/paused; "Resumed" vazio; reconcileOnBoot sem chamador | Persiste antes de operações longas (awaiting-plan precoce); vincula intake↔planId duravelmente; `resumePlan` reconcilia transições recuperáveis (pending/merging/creating_pr→running, com retry de creating_pr via merging); `resumeAutonomousIntake` com generate: awaiting-plan gera plano, merging/creating_pr reativa com mensagem explícita (reativado/aguardando/inconsistência, nunca "Resumed" vazio); `reconcileOnBoot` chamado no boot público | Mesmo arquivo (awaiting-plan gera plano, não "no active plan"; queda em merging volta a running com reativado; kill-9 simulado reconcilia) |
+
+Regressões via caminho público (sem harness por fora):
+- Complement com requisito novo muda resultado funcional ou registra decisão humana necessária (nova task via caminhos existentes ou pergunta).
+- "não autorizo"/"aguarde"/vazio/pergunta nunca geram once/allow; approve/deny estruturados PT+EN funcionam.
+- Modelo/variant efetivos observados iguais nos caminhos usados; sem divergência silenciosa.
+- Retomada com planejamento interrompido gera plano; queda em merging reativa sem sucesso vazio; kill-9 simulado (processo morto com estado em disco) reconcilia.
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`index.js 1.43 MB`, `/tmp/opencode/f03f05f06f07-build.log`);
+focado 11 arquivos (`f03f05f06f07+auto-commands+human-controls+coordinator+auto-plan+model-tracker+ceiling+repo-context+review-destination+orchestrator+wire`) → exit 0 (**197 pass, 0 fail**, `/tmp/opencode/f03f05f06f07-focused.log`);
+full `bun test` → exit 1 — **1066 pass, 7 fail** (`/tmp/opencode/f03f05f06f07-full2.log`): 6 fails só `tests/lib/tmux*.test.ts` (pré-existentes e ambientais, mesmos nomes do baseline §22.2) + 1 `wire-report createPR` ambiental (passa isolado 11 pass e no focado 197 pass; falha só no full de 71 arquivos por interferência de mocks/estado compartilhado, mesmo padrão do flake 6→7 da lane prove-autocomplete).
+Baseline sem esta lane (stash): exit 1 — **1057 pass, 6 fail** (todos tmux, `/tmp/opencode/baseline-full.log`).
+Repro-antes (TDD RED, isolado): `f03f05f06f07-regression` 1 pass 9 fail (não-autorizo→once, aguarde→send, PT sem deny, fallback silencioso, unknown/unknown, complement sem task, awaiting-plan vazio, merging preso); repro-depois (GREEN): 10 pass 0 fail.
+
+Limitações restantes (adendo honesto):
+1. `question-relay.ts handleUserResponse` (dead code, sem chamador de produção) mantém fallback antigo — fora do escopo de escrita desta rodada; caminho vivo (`forms.ts answerViaPermission`) está fail-closed e o morto está documentado, não wired.
+2. `InstanceManager` segue não instanciado no caminho tmux (workers tmux não passam por serve): equivalência de perfil vale no caminho serve (`assertProfileEquivalence`); no caminho tmux a garantia é o triple efetivo único + `coordinateOnce` fail-closed, sem swap silencioso.
+3. Launcher TUI (`-m`) não tem forma de variant: triple completo vive no snapshot/coordinator/serve; launcher carrega string + nota de variant (quando suportada, serve a usa; CLI documenta o limite).
+4. `E2E-E` segue Pendente; workers vivos não re-demonstrados nesta lane (regressões via caminho público com mocks + estado em disco, sem LLM vivo).
+5. Intake segue slot único (sobrescreve); `findIntakeAcrossRepos` cobre resume de terceira pasta via XDG.
+6. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência (§22.2).
