@@ -689,3 +689,99 @@ Status F10 após esta lane: **Parcial-alta** — carga (0 failed loads) +
 registro (21 contratos) + execução representativa sem-custo (overview/jobs/
 plan_status via V2) comprovados; execução das 17 tools com side effects via
 LLM vivo segue pendente e não alegada.
+
+## 29. Adendo review-packet-2 (consolidação da rodada, HEAD `c2759a1`)
+
+Escopo desta rodada (sem push/PR, sem perfil global): 5 commits locais
+`91f96ae..c2759a1` + validações live + este adendo (só `docs/`).
+Base de comparação: `6db667e` (upstream). Modelo live:
+`opencode-go/muse-spark-1.3-contributor` (banner TUI + `effectiveModel`).
+
+### 29.1 Suíte: causa, fix, sequência de contagens (comandos exatos)
+
+Causa: poluição entre arquivos de teste. Prova: `focused.log` (13:44,
+seleção 2-arquivos `dest-branch` + `review-destination`) falha em nível de
+import (`getProjectId is not a function`, `SyntaxError: Export named
+'getActiveRepoRoot' not found`) enquanto os mesmos arquivos **isolados**
+passam (`revdest-alone.log` 7/0, `planstate-alone.log` 26/0,
+`prestash.log` 7/0). Os 3 arquivos históricos com `mock.module`
+(`tests/lib/monitor.test.ts:4,13,19`,
+`tests/lib/monitor-v2.test.ts:6,14,20`,
+`tests/integration/z-workflows.test.ts:37,84,96,118`) seguem intocados
+nesta rodada — a contenção foi não adicionar nenhum `mock.module` novo:
+os 6 arquivos de teste da rodada usam `spyOn` + `mock.restore()` em
+`afterEach` (0 ocorrências de `mock.module` em `gap1-integration-context`,
+`gate-resume-approve` (4× `mock.restore`), `dest-branch`,
+`launcher-flag-regression`, `gap2-approve-intake`, `v2-contract`).
+
+Fix real encontrado pela suíte cheia (ordem cheia não reproduz a poluição
+do focused e revelou o bug de verdade): `d6d0d73` (baseBranch perdido no
+round-trip `PlanSpecSchema`; `full.log` 13:45 = 1093/1 só nesse teste →
+`full2.log` 13:47 = 1094/0).
+
+Sequência (comando padrão da lane: `bun test` full com stdout em arquivo e
+`EXIT` capturado sem pipe; `bun run build` idem):
+
+| Quando | Log | Contagem | Arquivos | Contexto |
+| --- | --- | --- | --- | --- |
+| 11:49 | `full-before.log` | 1069 pass / 7 fail | 1076 / 71 | HEAD anterior `91f96ae`; 7 = 6× tmux + 1× wire (mesmo conjunto §22.2) |
+| 11:53–11:54 | `full-after-monitor-fix.log`, `full-after.log`, `full-final.log` | **1076 / 0** | 1076 / 71 | mesma árvore `91f96ae` (nenhum commit entre os runs) → delta 7→0 **ambiental/ordenação**, sem fix de código alegado aqui |
+| 12:13 | `launcher-flag-full.log` (+`launcher-flag-build.log` exit 0) | **1080 / 0** | 72 | após `c788c1c` (+1 arquivo `launcher-flag-regression`) |
+| 13:23 | `verify-gate/full.log` | **1092 / 0** | 75 | após `a48000f` (+gap1+gap2+gate) |
+| 13:45 | `full.log` | 1093 pass / **1 fail** | 1094 / 76 | após `d10bb3a`+`a48000f` (+dest-branch); fail único = bug real baseBranch |
+| 13:47 | `full2.log` | **1094 / 0** | 1094 / 76 | após `d6d0d73` (fix) |
+| 13:51 | `v2/full-test.log` | 1113 pass / 7 fail | 1120 / 77 | após `c2759a1` (+26 `v2-contract`); 7 = mesmos ambientais; isolados exit 0: tmux 23 pass (`v2/tmux-isolated.log`), wire 11 pass (`v2/wire-isolated.log`) |
+
+HEAD anterior vs base: "HEAD anterior" acima = `91f96ae` (71 arquivos,
+1076 testes) — último ponto com suíte cheia antes da rodada. Sobre a base
+`6db667e`: **nenhuma suíte foi rodada na base `6db667e` nesta rodada**
+(nenhum log a comprova); o conjunto dos 7 ambientais é o documentado desde
+§22.2 e §§25–28, mas baseline original na `6db667e` **não é alegado aqui
+por falta de prova** — declarado explicitamente.
+
+### 29.2 Matriz F01–F12 (implementação + evidência + nível)
+
+Legenda: **Validado live** (exercício real com modelo vivo) /
+**Verificado teste** (regressão verde, sem live) / **Parcial** /
+**Pendente**. "Mocks" = `spyOn`+restore; "fixtures" = repos git reais em
+tmpdir (sem LLM/tmux); "live" = modelo vivo + tmux + worktrees reais.
+
+| ID | Implementação (arquivo:linha/função) | Teste regressivo (mocks/fixtures) | Evidência live | Nível |
+| --- | --- | --- | --- | --- |
+| F01 gate estrutural+final | `src/lib/orchestrator.ts:510` `reviewJobWithFixLoop` (veredito `pass/fail`, `src/lib/reviewer.ts` `ReviewVerdict`); pré-merge estrutural em `merge-train.ts` + gate único pós-all-merged | `tests/lib/review-destination-regression.test.ts` (fixtures git reais) + `tests/lib/gate-resume-approve.test.ts` (spyOn+restore) + `tests/lib/gap1-integration-context.test.ts` | revalidate item 1 **PASS** (`14/18-decisions`, `19-final-check-integration` CHECK PASS); demo-fixes2 gate bloqueou fail-closed (registrou veredito) | **Validado live (item 1)** |
+| F02 repo explícito | `src/lib/paths.ts:30` `getActiveRepoRoot`, `:52` `resolveRepoRoot`, `:64` `getProjectId` | `tests/lib/repo-context-regression.test.ts` | terceira pasta (launcher ≠ repo ≠ produto) em demo-fixes2, revalidate (`rv-repo`+`launcher/`), final-live (`fl-repo`+`launcher3/`) | **Validado live (terceira pasta)** |
+| F03 complement com revisão | `src/lib/orchestrator.ts:2412` `complementAutonomousRequest` (revisão real via modelo, `appendAutoDecision`) | `tests/lib/f03f05f06f07-regression.test.ts` | revalidate: `COMPLEMENT_EXIT=0` + "complement revision: 5 requirements, +0 tasks" (decisões/questions atualizados); final-live + demo-fixes2: registrado, **sem efeito em arquivos** (workers já haviam terminado) | **Parcial** (decisões/questions sim; efeito em arquivos não demonstrado) |
+| F04 ceiling | `src/lib/orchestrator.ts:92` `validateCeiling` (teto explícito respeitado; 4–8 só default); `applyEffectiveConfig` no approve (`a48000f`) | `tests/lib/ceiling-context-regression.test.ts` | final-live B1 (`maxParallel: 2` respeitado, 2 running) + revalidate (4 simultâneos, `04-tmux-simultaneous.log`) | **Validado teste + live** |
+| F05 fail-closed PT | `src/orchestrator-cli/forms.ts:147` `answerViaPermission` (deny/clarify PT+EN, sem aprovação por omissão) | mesmo `f03f05f06f07` (deny/clarify PT+EN) | `'não autorizo'` real **não exercido** live | **Verificado teste; live pendente** |
+| F06 triple | mesmo modelo planner==coordenador (sem `unknown/unknown` silencioso; `model-tracker.ts` + `auto-commands.ts`) | mesmo `f03f05f06f07` (planner==coordinator, nunca unknown silencioso) | planner+serve validados; TUI launcher sem `-m`/variant documentado (`c788c1c`, teste `launcher-flag-regression`) | **Validado planner+serve; TUI documentado sem pin** |
+| F07 resume/reconcile | `src/lib/durable-state.ts:280` `reconcileOnBoot`; `resumePlan`/`resumeAutonomousIntake` (pausa preservada, `a48000f`) | mesmo `f03f05f06f07` (awaiting-plan gera plano; kill-9 simulado reconcilia) | B1 **validado** (final-live: awaiting-plan→plano, sem fantasma); B2-paused **parcial** (final-live achou perda de pausa → fix `a48000f`; revalidate B2 só caso `completed` PASS, caso pausado não exercido live) | **B1 validado, B2-paused parcial** |
+| F08 completeLocalDestination | `src/lib/orchestrator.ts:549` `completeLocalDestination` (chamada `:1567`); `baseBranch` preservado (`schemas.ts` + `d6d0d73`) | `review-destination` (suja recusa) + `tests/lib/dest-branch.test.ts` (round-trip baseBranch, fixtures git reais) | destino explícita live **PENDENTE pós-fix `d6d0d73`** (nenhum run live com destino explícita após o fix; revalidate/final-live usaram branch nova, integração local ok mas destino explícita não revalidada) | **Código+teste; live PENDENTE (marcar claramente)** |
+| F09 relatório real | `src/lib/reports.ts` (final real, MergeTestReports preservados, sem success-skip) | `review-destination` + `tests/**/report-final.test.ts` | validado em live anterior (relatório final com 5× CHECK PASS em revalidate `19-final-report.md`) | **Validado live (anterior)** |
+| F10 V2 | adaptador V2 (`c765364`; `default.setup`→`tool.transform`); V1 preservado named | `tests/plugin-init.test.ts` + `tests/v2-contract.test.ts` (26 testes: 21 contratos) + `/tmp/opencode/v2/` (`load.log` 0 failed, `exec.log` 3 ok) | carga+registro+exec representativa (overview/jobs/plan_status); **17 tools com side effects via LLM vivo pendentes** | **Carga+registro+exec representativa; 17 tools live pendentes** |
+| F11 context bytes | `src/lib/auto-plan.ts:917` `CONTEXT_MAX_BYTES` (256 KiB), `:966-967` fail explícito; conteúdo inline no prompt, intake+resume preservam | `ceiling-context` (conteúdo inline + persistência) | — (sem exercício live específico alegado) | **Validado teste** |
+| F12 lease+heartbeat | `src/lib/file-lock.ts:12-13,33` (lease só quebra sem progresso de heartbeat; nunca invade holder vivo) | `tests/lib/file-lock.test.ts` (RED invasão antes, `TIMED_OUT` sem invasão depois) | — (sem exercício live específico alegado) | **Verificado teste** |
+
+### 29.3 Limitações restantes (honestas, não alegadas como feitas)
+
+1. Complement-efeito-em-arquivos (F03): decisões/questions atualizados
+   provados; entrega de arquivo via follow-up **não demonstrada**
+   (final-live + demo-fixes2, +0 tasks).
+2. F05 live: `'não autorizo'` real nunca exercido.
+3. F08-destino live pós-fix: `d6d0d73` só tem prova de teste
+   (`full2.log` 1094/0); live com destino explícita **pendente**.
+4. B2-paused (F07): preservação de pausa pós-`a48000f` só em código/teste;
+   live só cobriu `completed` (revalidate B2 PASS parcial).
+5. 17 tools V2 com side effects via LLM vivo (F10): pendentes.
+6. E2E-E (`MANUAL_TEST_PLAN.md`): não executado nesta rodada.
+7. Intake-resume pós-crash no meio de `running` (F07): B1 cobriu
+   `awaiting-plan`; crash com workers ativos e retomada sem duplicação
+   **não exercido** nesta rodada.
+8. Metering (consumo/custo por modelo): desconhecido = 0 medido nesta
+   rodada (lanes live usaram modelo vivo sem medição registrada).
+
+### 29.4 Commits da rodada (locais, sem push/PR)
+
+`c788c1c` fix(launcher) → `d10bb3a` fix(review-scope-approve, gap1+gap2)
+→ `a48000f` fix(gate-resume-approve) → `d6d0d73` fix(baseBranch) →
+`c2759a1` docs(v2-validation). Todos locais em
+`feat/autonomous-orchestrator-v2`, HEAD `c2759a1a27cad6417966c9830e47ec8b88aa7049`.
