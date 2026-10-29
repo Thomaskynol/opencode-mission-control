@@ -10,20 +10,20 @@ import { atomicWrite } from './utils';
 const PLAN_FILE = 'plan.json';
 
 /** Cross-process lock for plan.json read-modify-write cycles (see file-lock.ts). */
-async function withPlanLock<T>(fn: () => Promise<T>): Promise<T> {
-  const dataDir = await getDataDir();
+async function withPlanLock<T>(fn: () => Promise<T>, repoRoot?: string): Promise<T> {
+  const dataDir = await getDataDir(repoRoot);
   return withFileLock(lockPathFor(join(dataDir, PLAN_FILE)), fn);
 }
 
-async function getPlanFilePath(): Promise<string> {
-  const dataDir = await getDataDir();
+async function getPlanFilePath(repoRoot?: string): Promise<string> {
+  const dataDir = await getDataDir(repoRoot);
   return join(dataDir, PLAN_FILE);
 }
 
 
 
-export async function loadPlan(): Promise<PlanSpec | null> {
-  const filePath = await getPlanFilePath();
+export async function loadPlan(repoRoot?: string): Promise<PlanSpec | null> {
+  const filePath = await getPlanFilePath(repoRoot);
   const file = Bun.file(filePath);
   const exists = await file.exists();
 
@@ -43,9 +43,9 @@ export async function loadPlan(): Promise<PlanSpec | null> {
   }
 }
 
-export async function savePlan(plan: PlanSpec): Promise<void> {
+export async function savePlan(plan: PlanSpec, repoRoot?: string): Promise<void> {
   await withPlanLock(async () => {
-    const existing = await loadPlan();
+    const existing = await loadPlan(repoRoot);
 
     if (existing && existing.id !== plan.id) {
       throw new Error('active plan already exists');
@@ -60,18 +60,18 @@ export async function savePlan(plan: PlanSpec): Promise<void> {
     const ghAuthenticated = await validateGhAuth();
     const planToSave = { ...plan, ghAuthenticated };
 
-    const filePath = await getPlanFilePath();
+    const filePath = await getPlanFilePath(repoRoot);
     try {
       const data = JSON.stringify(planToSave, null, 2);
       await atomicWrite(filePath, data);
     } catch (error) {
       throw new Error(`Failed to save plan state to ${filePath}: ${error}`);
     }
-  });
+  }, repoRoot);
 }
 
-export async function getActivePlan(): Promise<PlanSpec | null> {
-  return loadPlan();
+export async function getActivePlan(repoRoot?: string): Promise<PlanSpec | null> {
+  return loadPlan(repoRoot);
 }
 
 export async function updatePlanJob(
@@ -79,9 +79,13 @@ export async function updatePlanJob(
   jobName: string,
   updates: Partial<JobSpec>,
   opts?: { force?: boolean },
+  repoRoot?: string,
 ): Promise<void> {
+  // Back-compat: updatePlanJob(id, name, updates, "repoRoot-string") treats 4th arg as repoRoot.
+  const effectiveRepo = typeof opts === 'string' ? (opts as unknown as string) : repoRoot;
+  const effectiveOpts = typeof opts === 'string' ? undefined : opts;
   await withPlanLock(async () => {
-    const plan = await loadPlan();
+    const plan = await loadPlan(effectiveRepo);
 
     if (!plan) {
       throw new Error('No active plan exists');
@@ -101,7 +105,7 @@ export async function updatePlanJob(
     if (updates.status && updates.status !== plan.jobs[jobIndex].status) {
       if (!isValidJobTransition(plan.jobs[jobIndex].status, updates.status)) {
         const msg = `[MC] Invalid job transition: ${plan.jobs[jobIndex].status} → ${updates.status} (job: ${jobName})`;
-        if (!opts?.force) {
+        if (!effectiveOpts?.force) {
           // Fail-closed: an invalid transition is a bug, never a state to
           // persist. Reject without applying so a skipped gate (e.g.
           // queued → merged) cannot mark work integrated. Recovery paths
@@ -118,14 +122,14 @@ export async function updatePlanJob(
       ...updates,
     };
 
-    const filePath = await getPlanFilePath();
+    const filePath = await getPlanFilePath(effectiveRepo);
     try {
       const data = JSON.stringify(plan, null, 2);
       await atomicWrite(filePath, data);
     } catch (error) {
       throw new Error(`Failed to save plan state to ${filePath}: ${error}`);
     }
-  });
+  }, effectiveRepo);
 }
 
 export interface PlanFieldUpdates {
@@ -148,9 +152,10 @@ export interface PlanFieldUpdates {
 export async function updatePlanFields(
   planId: string,
   updates: PlanFieldUpdates,
+  repoRoot?: string,
 ): Promise<void> {
   await withPlanLock(async () => {
-    const plan = await loadPlan();
+    const plan = await loadPlan(repoRoot);
 
     if (!plan) {
       throw new Error('No active plan exists');
@@ -184,24 +189,24 @@ export async function updatePlanFields(
     const ghAuthenticated = await validateGhAuth();
     const planToSave = { ...plan, ghAuthenticated };
 
-    const filePath = await getPlanFilePath();
+    const filePath = await getPlanFilePath(repoRoot);
     try {
       const data = JSON.stringify(planToSave, null, 2);
       await atomicWrite(filePath, data);
     } catch (error) {
       throw new Error(`Failed to save plan state to ${filePath}: ${error}`);
     }
-  });
+  }, repoRoot);
 }
 
-export async function clearPlan(): Promise<void> {
+export async function clearPlan(repoRoot?: string): Promise<void> {
   await withPlanLock(async () => {
-    const filePath = await getPlanFilePath();
+    const filePath = await getPlanFilePath(repoRoot);
     const fs = await import('fs');
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
-  });
+  }, repoRoot);
 }
 
 export async function validateGhAuth(): Promise<boolean> {

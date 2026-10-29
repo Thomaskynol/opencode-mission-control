@@ -865,3 +865,95 @@ export function createRunPlannerGenerate(opts?: RunPlannerOptions): PlannerGener
     return extractPlannerText(raw);
   };
 }
+
+// ---------------------------------------------------------------------------
+// F11 --context contract: path or text, loaded + validated explicitly.
+// Only this loader may claim "context incorporated": the planner prompt
+// receives file CONTENT (never just the path), and the intake preserves
+// {ref, content, hash, scope} for resume. Missing/empty/oversized files
+// fail explicitly; inline text uses the `text:` prefix or a newline payload.
+// ---------------------------------------------------------------------------
+
+/** Loaded --context doc: reference + version + scope + content for resume. */
+export interface LoadedContextDoc {
+  /** Canonical file path, or `inline:<hash>` for inline text. */
+  ref: string;
+  content: string;
+  /** sha1(content).slice(0,12): version pin for resume/staleness checks. */
+  hash: string;
+  /** `repo` = file inside --repo, `external` = file outside, `inline` = text. */
+  scope: 'repo' | 'external' | 'inline';
+}
+
+const CONTEXT_MAX_BYTES = 256 * 1024;
+
+function sha1Short(text: string): string {
+  // Bun.hash: deterministic, no 'crypto' import (workflow tests mock 'crypto').
+  return Bun.hash(text).toString(16).padStart(16, '0').slice(0, 12);
+}
+
+/**
+ * Load + validate --context values.
+ * Contract:
+ * - `text:<content>` or any value containing a newline → inline text (must be non-empty).
+ * - otherwise → file path (absolute, or relative to repoRoot/cwd). Must exist,
+ *   be a regular file, non-empty, ≤256KB, UTF-8 readable. Missing files fail
+ *   explicitly (never silently treated as text).
+ */
+export async function loadContextDocs(
+  inputs?: string[],
+  opts?: { repoRoot?: string },
+): Promise<LoadedContextDoc[]> {
+  if (!inputs || inputs.length === 0) return [];
+  const { isAbsolute, resolve: resolvePath } = await import('path');
+  const fs = await import('fs');
+  const out: LoadedContextDoc[] = [];
+  const repoCanonical = opts?.repoRoot ? (() => { try { return fs.realpathSync(opts.repoRoot); } catch { return resolvePath(opts.repoRoot); } })() : null;
+  for (const raw of inputs) {
+    const trimmed = (raw ?? '').trim();
+    if (!trimmed) throw new Error('--context value must not be empty.');
+    if (trimmed.startsWith('text:')) {
+      const content = trimmed.slice('text:'.length).trim();
+      if (!content) throw new Error('--context inline text after `text:` must not be empty.');
+      const hash = sha1Short(content);
+      out.push({ ref: `inline:${hash}`, content, hash, scope: 'inline' });
+      continue;
+    }
+    if (trimmed.includes('\n')) {
+      const hash = sha1Short(trimmed);
+      out.push({ ref: `inline:${hash}`, content: trimmed, hash, scope: 'inline' });
+      continue;
+    }
+    // File path: resolve against repoRoot (explicit --repo) or process cwd.
+    const base = opts?.repoRoot ?? process.cwd();
+    const candidate = isAbsolute(trimmed) ? trimmed : resolvePath(base, trimmed);
+    let stat: import('fs').Stats;
+    try {
+      stat = fs.statSync(candidate);
+    } catch {
+      throw new Error(`--context file not found: "${raw}" (resolved to "${candidate}"). Minimal preparation: create the file or pass inline text with \`text:<content>\`, then retry.`);
+    }
+    if (!stat.isFile()) throw new Error(`--context path is not a regular file: "${candidate}".`);
+    if (stat.size > CONTEXT_MAX_BYTES) {
+      throw new Error(`--context file too large (${stat.size} bytes, max ${CONTEXT_MAX_BYTES}): "${candidate}".`);
+    }
+    let content: string;
+    try {
+      content = fs.readFileSync(candidate, 'utf8');
+    } catch (error) {
+      throw new Error(`--context file is not UTF-8 readable: "${candidate}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!content.trim()) throw new Error(`--context file is empty: "${candidate}".`);
+    let canonical: string;
+    try { canonical = fs.realpathSync(candidate); } catch { canonical = resolvePath(candidate); }
+    const hash = sha1Short(content);
+    const scope: LoadedContextDoc['scope'] = repoCanonical && (canonical === repoCanonical || canonical.startsWith(repoCanonical + '/')) ? 'repo' : 'external';
+    out.push({ ref: canonical, content, hash, scope });
+  }
+  return out;
+}
+
+/** Format loaded docs for the planner prompt (content + ref/version/scope header). */
+export function formatContextDocsForPrompt(docs: LoadedContextDoc[]): string[] {
+  return docs.map((d, i) => `--- context ${i + 1} ref:${d.ref} sha:${d.hash} scope:${d.scope} ---\n${d.content}`);
+}

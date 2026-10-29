@@ -437,3 +437,46 @@ negação (2 starts `hello.txt` fail-closed), **`mc_report` ausente** nos
 workers (conclusão por idle-threshold, `log` vazio — honesto no relatório),
 **INS-5** sem teste dedicado, **E2E-B→E2E-E** lacunas menores já listadas.
 Nada declarado completo que siga manual.
+
+## 23. Adendo repo-context-config (F02+F04+F11, HEAD 56656a6)
+
+Escopo: `src/lib/orchestrator.ts`, `src/orchestrator-cli/auto-commands.ts`,
+`src/lib/integration.ts`, `src/lib/paths.ts`, `src/lib/plan-state.ts`,
+`src/lib/auto-plan.ts` (só carga de `--context`). Sem tocar
+reviewer/merge-train/forms/model-tracker/monitor. Sem push/PR, sem perfil
+global, modelo `muse-spark-1.3-contributor` autorizado, sem segredos.
+
+| ID | Defeito (revisão) | Correção | Evidência |
+| --- | --- | --- | --- |
+| F02 | `startAutonomousPlan` recebia `--repo` mas criava `Orchestrator` do cwd; `startPlan` criava integração sem contexto; `getProjectId` só basename (colisão); `integration/git/paths/plan-state` usavam cwd | Contexto explícito fim-a-fim via `resolveRepoRoot` + `withRepoRoot` (AsyncLocalStorage, sem chdir): `paths.getProjectId/getDataDir` com hash canônico (`basename-hash12`), `plan-state` com `repoRoot?`, `integration` com `git -C repo` + worktree `git worktree add` no repo explícito, `orchestrator` com `repoRoot` + `createJobWorktree/removeJobWorktree` (delega ao helper legado só quando `repo==cwd` p/ compat), `auto-commands` resolve `--repo` canônico + `findIntakeAcrossRepos` p/ resume de terceira pasta | `tests/lib/repo-context-regression.test.ts` (colisão, estado e branch via caminho público `dispatchCommand start --repo A` com cwd!=A; integração `createIntegrationBranch(..., repoA)`) |
+| F04 | Ceiling `{maxParallel,testCommand}` guardado no intake mas não aplicado (config 3, merge sem `testCommand`; clamp 4–8 reinterpretava teto 1) | `validateCeiling` fail-closed (`>=1` inteiro, `testCommand` não-vazio); `resolveEffectiveMaxParallel/TestCommand` (explícito vence, sem clamp; 4–8 só default interno do coordenador com compensação); `applyCeiling` no `startAutonomousPlan` (até com `launch:false`) e restaurado no `resumeAutonomousIntake`; `getEffectiveMaxParallel/TestCommand` expostos; `getMergeTrainConfig` lê config efetiva; `_doReconcile` usa `getEffectiveMaxParallel()` | `tests/lib/ceiling-context-regression.test.ts` (ceiling 1 + `echo hi` via `Orchestrator.startAutonomousPlan` público com `launch:false`; inválido 0 rejeita; `clampMaxParallel(1)==4` documenta reinterpretação antiga) |
+| F11 | `--context` passava só path no prompt, sem leitura nem persistência | Contrato em `auto-plan.ts` (`loadContextDocs/formatContextDocsForPrompt`): `text:<...>` ou newline → inline, senão path (absoluto ou relativo a `--repo`, ≤256KB, UTF-8, não-vazio; ausente falha explícita); prompt recebe `--- context ref:sha:scope ---\n<conteúdo>`; intake preserva `{ref,content,hash,scope}` (`repo`/`external`/`inline`) e decisão `context loaded`; resume preserva e loga `context preserved` | `tests/lib/ceiling-context-regression.test.ts` (arquivo real `ctx.txt` com payload único: prompt contém conteúdo, intake contém path+conteúdo, resume mantém) |
+
+Verificação desta lane (fresca, log integral, exit capturado sem pipe):
+`bun run build` → exit 0 (`Bundled 222 modules`); `bun test` → exit 1 —
+**1050 pass, 6 fail** (1056 testes / 69 arquivos; +6 testes vs 1044/1050/67 do
+mission-close; 6 fails só `tests/lib/tmux*.test.ts`, pré-existentes e
+ambientais, mesmos nomes do baseline §22.2, sem fail fora do domínio tmux).
+Evidência: `/tmp/opencode/full-test3.log` (+ `/tmp/opencode/full-test.log`).
+Repro-antes (TDD RED): colisão `proj==proj`, estado em launcher, `getEffective`
+ausente, `0` aceito, prompt só com path — visto em
+`tests/lib/repo-context-regression.test.ts` + `ceiling-context-regression.test.ts`
+(2 fail + 3 fail antes do fix, 0 fail depois isolado, 0 fail no full exceto tmux).
+
+Limitações restantes (adendo honesto):
+1. `worktree.ts`/`job-state.ts`/`reports.ts`/`durable-state.ts`/`config.ts`/`monitor.ts`
+   não tocados (outro owner): escopo repo chega a eles via `withRepoRoot` + `getDataDir`
+   ativa; `git` sem `cwd` nesses arquivos continua cwd-dependente fora dos caminhos
+   cobertos (`orchestrator`/`integration` reimplementam com `cwd` explícito).
+2. `coordinator.ts` não tocado: `decideNextJobs` ainda `clampMaxParallel` 4–8
+   internamente, mas `runCoordinatorPass` compensa `(clamp-config)` preservando teto
+   explícito (1 continua 1); sem mudança, sem reinterpretação silenciosa no uso efetivo.
+3. `resume --intake` sem `--repo` faz busca em todos os XDG (`findIntakeAcrossRepos`);
+   intake segue slot único (sobrescreve) — trilha em decisões, sem migração de antigos
+   `basename` puros (IDs antigos `basename` não resolvem p/ novo `basename-hash`; re-start
+   necessário p/ runs antigos).
+4. `--context` múltiplo: `--context` singular (último vence no `parseFlags`); múltiplos
+   exigem `text:` múltiplo futuro ou repetição de flag (não implementado p/ manter diff mínimo).
+5. `E2E-E` segue Pendente (roteiro fase a fase não executado); merges reais com workers
+   vivos não re-demonstrados nesta lane (cobertos por `live-proof.md` + `single-demo`).
+6. Flake tmux (6 fails) inalterado, ambiental, com prova de pré-existência (§22.2).

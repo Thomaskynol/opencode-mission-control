@@ -22,6 +22,13 @@ import {
   type AutoIntakeRecord,
 } from '../lib/durable-state';
 import { loadPlan } from '../lib/plan-state';
+import {
+  getActiveRepoRoot,
+  withRepoRoot,
+  resolveRepoRoot,
+  getDataDir,
+  getXdgDataDir,
+} from '../lib/paths';
 
 /**
  * Autonomous intake commands for the human TUI (public NL path).
@@ -110,11 +117,55 @@ function ceilingFrom(flags: Map<string, string>): AutoIntakeRecord['ceiling'] {
   const maxParallel = flags.get('max-parallel');
   const testCommand = flags.get('test-command');
   if (maxParallel === undefined && testCommand === undefined) return undefined;
-  const parsed = maxParallel !== undefined ? Number.parseInt(maxParallel, 10) : undefined;
+  // F04: validate explicitly — invalid ceilings fail, explicit 1 is kept (no 4–8 reinterpretation).
+  let parsed: number | undefined;
+  if (maxParallel !== undefined) {
+    parsed = Number.parseInt(maxParallel, 10);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(`Invalid --max-parallel "${maxParallel}": must be an integer >= 1.`);
+    }
+  }
+  if (testCommand !== undefined && testCommand !== '' && !testCommand.trim()) {
+    throw new Error('Invalid --test-command: must be a non-empty string.');
+  }
   return {
     ...(parsed !== undefined && Number.isFinite(parsed) ? { maxParallel: parsed } : {}),
-    ...(testCommand !== undefined && testCommand !== '' ? { testCommand } : {}),
+    ...(testCommand !== undefined && testCommand !== '' ? { testCommand: testCommand.trim() } : {}),
   };
+}
+
+/** F02: find an intake by id across all repo scopes (third-folder resume). */
+async function findIntakeAcrossRepos(id: string): Promise<AutoIntakeRecord | null> {
+  // Fast path: current scope (explicit --repo, active context, or cwd).
+  const direct = await loadAutoIntake(id).catch(() => null);
+  if (direct) return direct;
+  // Slow path: scan XDG project dirs for a runtime-state.json holding this id.
+  try {
+    const fs = await import('fs');
+    const { join } = await import('path');
+    const base = getXdgDataDir();
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      const candidate = join(base, entry, 'state', 'runtime-state.json');
+      try {
+        if (!fs.existsSync(candidate)) continue;
+        const text = fs.readFileSync(candidate, 'utf8');
+        if (!text.includes(id)) continue;
+        const parsed = JSON.parse(text) as { autoIntake?: AutoIntakeRecord };
+        if (parsed?.autoIntake?.id === id) return parsed.autoIntake;
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    // Best-effort: fall through to null.
+  }
+  return null;
 }
 
 /** `start <NL...> [--repo R] [--branch B] [--max-parallel N]` (legacy, two-step) or
@@ -127,44 +178,67 @@ export async function startIntake(args: string[], deps?: AutoCommandDeps): Promi
     return startAutonomous(args, deps);
   }
   const request = normalizeRequest(positional.join(' '));
-  const now = new Date().toISOString();
-  const record: AutoIntakeRecord = {
-    id: randomUUID(),
-    request,
-    repo: flags.get('repo') || undefined,
-    targetBranch: flags.get('branch') || undefined,
-    ceiling: ceilingFrom(flags),
-    requirements: [],
-    decisions: [],
-    questions: [],
-    nextSteps: [],
-    status: 'awaiting-plan',
-    createdAt: now,
-    updatedAt: now,
-  };
-  const plannerPrompt = buildPlannerPrompt(record);
-  record.nextSteps = [
-    'Feed the planner prompt below to the configured model, save its strict-JSON answer to a file, then run:',
-    resumeCommand(record.id),
-  ];
-  await saveAutoIntake(record);
-  return [
-    `Intake ${record.id} persisted (awaiting-plan).`,
-    `Request: ${request}`,
-    ...(record.targetBranch ? [`Destination branch: ${record.targetBranch}`] : []),
-    '',
-    'Planner prompt for the configured model:',
-    plannerPrompt,
-    '',
-    'Resume with:',
-    resumeCommand(record.id),
-  ].join('\n');
+  // F02: explicit repo scope (canonical) — never persist intake in the launcher cwd.
+  const repoRoot = resolveRepoRoot(flags.get('repo') || getActiveRepoRoot() || undefined);
+  const ceiling = ceilingFrom(flags);
+  return await withRepoRoot(repoRoot, async () => {
+    const now = new Date().toISOString();
+    const record: AutoIntakeRecord = {
+      id: randomUUID(),
+      request,
+      repo: repoRoot,
+      targetBranch: flags.get('branch') || undefined,
+      ceiling,
+      requirements: [],
+      decisions: [],
+      questions: [],
+      nextSteps: [],
+      status: 'awaiting-plan',
+      createdAt: now,
+      updatedAt: now,
+    };
+    const plannerPrompt = buildPlannerPrompt(record);
+    record.nextSteps = [
+      'Feed the planner prompt below to the configured model, save its strict-JSON answer to a file, then run:',
+      resumeCommand(record.id),
+    ];
+    await saveAutoIntake(record);
+    return [
+      `Intake ${record.id} persisted (awaiting-plan).`,
+      `Request: ${request}`,
+      ...(record.targetBranch ? [`Destination branch: ${record.targetBranch}`] : []),
+      '',
+      'Planner prompt for the configured model:',
+      plannerPrompt,
+      '',
+      'Resume with:',
+      resumeCommand(record.id),
+    ].join('\n');
+  });
 }
 
 async function resolveIntake(flags: Map<string, string>): Promise<AutoIntakeRecord> {
+  // Explicit --repo wins (third-folder resume); else active scope; else search all scopes by id.
+  const repoFlag = flags.get('repo');
+  if (repoFlag) {
+    const repoRoot = resolveRepoRoot(repoFlag);
+    return await withRepoRoot(repoRoot, async () => {
+      const id = flags.get('intake');
+      if (id) {
+        const record = (await findIntakeAcrossRepos(id)) ?? (await loadAutoIntake(id).catch(() => null));
+        if (!record) throw new Error(`No intake "${id}" persisted — start one with: start <request>`);
+        return record;
+      }
+      const snapshot = await loadRuntimeSnapshot();
+      if (!snapshot?.autoIntake) {
+        throw new Error('No active intake — start one with: start <request>');
+      }
+      return snapshot.autoIntake;
+    });
+  }
   const id = flags.get('intake');
   if (id) {
-    const record = await loadAutoIntake(id);
+    const record = (await findIntakeAcrossRepos(id)) ?? (await loadAutoIntake(id).catch(() => null));
     if (!record) throw new Error(`No intake "${id}" persisted — start one with: start <request>`);
     return record;
   }
@@ -181,30 +255,34 @@ export async function complementIntake(args: string[]): Promise<string> {
   const text = positional.join(' ').trim();
   if (!text) throw new Error('Usage: complement [--intake <id>] <follow-up text>');
   const record = await resolveIntake(flags);
-  await saveAutoIntake({
-    ...record,
-    request: `${record.request}\nFollow-up: ${text}`,
-    updatedAt: new Date().toISOString(),
-  });
-  // Pause-aware: a paused/blocked plan keeps its decision; the free-text
-  // follow-up is recorded as a question (content, never approve/deny).
-  // A running plan takes the complement into the scheduler — the
-  // coordinator/reconciler advance eligible work with no manual resume.
-  const plan = await loadPlan().catch(() => null);
-  const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
-  if (paused) {
-    await appendAutoQuestion(record.id, text).catch(() => {});
+  // F02: operate inside the intake's repo scope (never the launcher cwd).
+  const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
+  return await withRepoRoot(repoRoot, async () => {
+    await saveAutoIntake({
+      ...record,
+      request: `${record.request}\nFollow-up: ${text}`,
+      updatedAt: new Date().toISOString(),
+    });
+    // Pause-aware: a paused/blocked plan keeps its decision; the free-text
+    // follow-up is recorded as a question (content, never approve/deny).
+    // A running plan takes the complement into the scheduler — the
+    // coordinator/reconciler advance eligible work with no manual resume.
+    const plan = await loadPlan(repoRoot).catch(() => null);
+    const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
+    if (paused) {
+      await appendAutoQuestion(record.id, text).catch(() => {});
+      return [
+        `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
+        `Plan is paused — pause respected, follow-up kept as an open question (free text, not approve/deny).`,
+        `Request now ends with: "Follow-up: ${text}"`,
+      ].join('\n');
+    }
     return [
       `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
-      `Plan is paused — pause respected, follow-up kept as an open question (free text, not approve/deny).`,
+      `Running: follow-up enters the scheduler — coordinator/reconciler advance eligible work, no manual resume needed.`,
       `Request now ends with: "Follow-up: ${text}"`,
     ].join('\n');
-  }
-  return [
-    `Complement recorded on intake ${record.id} (same work continues, nothing rebuilt).`,
-    `Running: follow-up enters the scheduler — coordinator/reconciler advance eligible work, no manual resume needed.`,
-    `Request now ends with: "Follow-up: ${text}"`,
-  ].join('\n');
+  });
 }
 
 /**
@@ -220,50 +298,56 @@ export async function applyModelPlan(args: string[]): Promise<string> {
   if (!intakeId || !planFile) {
     throw new Error('Usage: auto-plan --intake <id> --plan-file <model-output.json>');
   }
-  const record = await loadAutoIntake(intakeId);
-  if (!record) throw new Error(`No intake "${intakeId}" persisted — start one with: start <request>`);
+  // F02: resolve intake across repos (third-folder diagnostic), then operate in its repo scope.
+  const initial = (await findIntakeAcrossRepos(intakeId)) ?? (await loadAutoIntake(intakeId).catch(() => null));
+  if (!initial) throw new Error(`No intake "${intakeId}" persisted — start one with: start <request>`);
+  const repoRoot = resolveRepoRoot((initial as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
+  return await withRepoRoot(repoRoot, async () => {
+    const record = (await findIntakeAcrossRepos(intakeId)) ?? (await loadAutoIntake(intakeId).catch(() => null));
+    if (!record) throw new Error(`No intake "${intakeId}" persisted — start one with: start <request>`);
 
-  const raw = await Bun.file(planFile).text().catch(() => {
-    throw new Error(`Cannot read plan file "${planFile}".`);
+    const raw = await Bun.file(planFile).text().catch(() => {
+      throw new Error(`Cannot read plan file "${planFile}".`);
+    });
+    const draft = parsePlannerOutput(raw);
+    assertSafeDestinations(draft);
+    assertAuthorizedActions(draft);
+
+    const base = await ensureBaseReady(repoRoot, record.targetBranch);
+
+    await saveAutoIntake({
+      ...record,
+      requirements: draft.requirements.map((r) => ({ ...r })),
+      decisions: [...record.decisions, ...draft.decisions],
+      questions: [...record.questions, ...draft.questions],
+      nextSteps: nextStepsFor(draft),
+      status: 'planned',
+      updatedAt: new Date().toISOString(),
+    });
+    await setAutoNextSteps(record.id, nextStepsFor(draft));
+    await setAutoIntakeStatus(record.id, 'planned');
+
+    const taskLines = draft.tasks.map((t) => {
+      const deps = t.dependsOn?.length ? ` (depends on: ${t.dependsOn.join(', ')})` : '';
+      return `  - ${t.name}${deps}\n    acceptance: ${t.acceptance.join('; ')}`;
+    });
+    return [
+      `Plan validated for intake ${record.id}: ${draft.tasks.length} task(s), ${draft.requirements.length} requirement(s).`,
+      `Base ready: ${base.baseBranch}@${base.baseCommit.slice(0, 8)}${base.createdBranch ? ' (destination branch created locally)' : ''}`,
+      '',
+      'Tasks:',
+      ...taskLines,
+      ...(draft.questions.length > 0
+        ? ['', 'Open questions (answer with free text, blocking nothing else):', ...draft.questions.map((q) => `  ? ${q}`)]
+        : []),
+      '',
+      'Next steps:',
+      ...nextStepsFor(draft).map((s) => `  - ${s}`),
+      '',
+      'Dispatch stays with the coordinator loop; track it with:',
+      `bun ${cliPath()} follow`,
+    ].join('\n');
   });
-  const draft = parsePlannerOutput(raw);
-  assertSafeDestinations(draft);
-  assertAuthorizedActions(draft);
-
-  const base = await ensureBaseReady(record.repo ?? process.cwd(), record.targetBranch);
-
-  await saveAutoIntake({
-    ...record,
-    requirements: draft.requirements.map((r) => ({ ...r })),
-    decisions: [...record.decisions, ...draft.decisions],
-    questions: [...record.questions, ...draft.questions],
-    nextSteps: nextStepsFor(draft),
-    status: 'planned',
-    updatedAt: new Date().toISOString(),
-  });
-  await setAutoNextSteps(record.id, nextStepsFor(draft));
-  await setAutoIntakeStatus(record.id, 'planned');
-
-  const taskLines = draft.tasks.map((t) => {
-    const deps = t.dependsOn?.length ? ` (depends on: ${t.dependsOn.join(', ')})` : '';
-    return `  - ${t.name}${deps}\n    acceptance: ${t.acceptance.join('; ')}`;
-  });
-  return [
-    `Plan validated for intake ${record.id}: ${draft.tasks.length} task(s), ${draft.requirements.length} requirement(s).`,
-    `Base ready: ${base.baseBranch}@${base.baseCommit.slice(0, 8)}${base.createdBranch ? ' (destination branch created locally)' : ''}`,
-    '',
-    'Tasks:',
-    ...taskLines,
-    ...(draft.questions.length > 0
-      ? ['', 'Open questions (answer with free text, blocking nothing else):', ...draft.questions.map((q) => `  ? ${q}`)]
-      : []),
-    '',
-    'Next steps:',
-    ...nextStepsFor(draft).map((s) => `  - ${s}`),
-    '',
-    'Dispatch stays with the coordinator loop; track it with:',
-    `bun ${cliPath()} follow`,
-  ].join('\n');
 }
 
 /**
@@ -298,32 +382,36 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
   const requestFlag = flags.get('request');
   const rawRequest = (requestFlag !== undefined ? [requestFlag, ...positional].join(' ') : positional.join(' ')).trim();
   const request = normalizeRequest(rawRequest);
-  const repo = flags.get('repo') || undefined;
+  // F02: canonical repo scope (never bare cwd downstream).
+  const repo = resolveRepoRoot(flags.get('repo') || getActiveRepoRoot() || undefined);
   const targetBranch = flags.get('branch') || undefined;
   const context = flags.get('context');
   const docs = context ? [context] : undefined;
+  const ceiling = ceilingFrom(flags);
   const input: AutoIntakeInput = {
     request,
     repo,
     targetBranch,
     docs,
-    ceiling: ceilingFrom(flags),
+    ceiling,
   };
   const generate = deps?.generate ?? createRunPlannerGenerate();
   const startFn =
     deps?.startAutonomous ??
     (async (inp: AutoIntakeInput, gen: PlannerGenerate) => {
-      const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
-        import('../lib/orchestrator'),
-        import('../lib/monitor'),
-        import('../lib/config'),
-      ]);
-      const config = await loadConfig();
-      const orchestrator = new Orchestrator(new JobMonitor(), config);
-      return orchestrator.startAutonomousPlan(inp, gen);
+      return await withRepoRoot(repo, async () => {
+        const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
+          import('../lib/orchestrator'),
+          import('../lib/monitor'),
+          import('../lib/config'),
+        ]);
+        const config = await loadConfig();
+        const orchestrator = new Orchestrator(new JobMonitor(), config);
+        return orchestrator.startAutonomousPlan(inp, gen);
+      });
     });
   try {
-    const { intakeId, tasks, launched } = await startFn(input, generate);
+    const { intakeId, tasks, launched } = await withRepoRoot(repo, async () => startFn(input, generate));
     return [
       `Intake ${intakeId} persisted (running).`,
       `Request: ${request}`,
@@ -339,6 +427,7 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
     // Preserve state for a public resume: keep the NL request as an
     // awaiting-plan intake so `resume --intake <id>` retries the model
     // without new JSON. No tasks, branches or workers are created here.
+    // F02: preserve inside the explicit repo scope, never the launcher cwd.
     const now = new Date().toISOString();
     const record: AutoIntakeRecord = {
       id: randomUUID(),
@@ -354,7 +443,7 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
       createdAt: now,
       updatedAt: now,
     };
-    await saveAutoIntake(record).catch(() => {});
+    await withRepoRoot(repo, async () => saveAutoIntake(record)).catch(() => {});
     throw new Error(
       `Autonomous start failed (intake ${record.id} kept for resume): ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -370,19 +459,23 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
 export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { flags } = parseFlags(args);
   const record = await resolveIntake(flags);
+  // F02: resume inside the intake's repo scope (third-folder resume never touches launcher state).
+  const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
   const resumeFn =
     deps?.resumeAutonomous ??
     (async (intakeId: string) => {
-      const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
-        import('../lib/orchestrator'),
-        import('../lib/monitor'),
-        import('../lib/config'),
-      ]);
-      const config = await loadConfig();
-      const orchestrator = new Orchestrator(new JobMonitor(), config);
-      return orchestrator.resumeAutonomousIntake(intakeId);
+      return await withRepoRoot(repoRoot, async () => {
+        const [{ Orchestrator }, { JobMonitor }, { loadConfig }] = await Promise.all([
+          import('../lib/orchestrator'),
+          import('../lib/monitor'),
+          import('../lib/config'),
+        ]);
+        const config = await loadConfig();
+        const orchestrator = new Orchestrator(new JobMonitor(), config);
+        return orchestrator.resumeAutonomousIntake(intakeId);
+      });
     });
-  const progress = await resumeFn(record.id);
+  const progress = await withRepoRoot(repoRoot, async () => resumeFn(record.id));
   return [
     `Resumed intake ${record.id} without new JSON (no duplicated workers, no reintegration).`,
     progress,

@@ -2,14 +2,14 @@ import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
 import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth } from './plan-state';
-import { getDefaultBranch } from './git';
+import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, type MergeTestReport, validateTouchSet } from './merge-train';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
 import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
-import { createWorktree, removeWorktree } from './worktree';
+import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript } from './prompt-file';
 import { getCurrentModel } from './model-tracker';
@@ -34,10 +34,18 @@ import {
   ensureBaseReady,
   draftToJobSpecs,
   validateRuntimeDecision,
+  loadContextDocs,
+  formatContextDocsForPrompt,
   type AutoIntakeInput,
   type PlannerGenerate,
   type RuntimeDecision,
+  type LoadedContextDoc,
 } from './auto-plan';
+import {
+  getActiveRepoRoot,
+  withRepoRoot,
+  resolveRepoRoot,
+} from './paths';
 import {
   saveAutoIntake,
   loadAutoIntake,
@@ -66,6 +74,56 @@ export function parseModelRef(raw: string): V2ModelRef | undefined {
 /** Format a model ref for the `opencode -m` CLI flag (variant has no CLI form). */
 export function modelRefToCliString(ref: V2ModelRef): string {
   return `${ref.providerID}/${ref.id}`;
+}
+
+/**
+ * F04 ceiling: validated effective config per execution.
+ * Explicit positive ceilings (e.g. 1) are respected as-is — the 4–8 window
+ * only applies as a default when no ceiling is configured (inside the
+ * coordinator's decideNextJobs cap, compensated in runCoordinatorPass).
+ * Invalid ceilings fail explicitly, never silently ignored.
+ */
+export function validateCeiling(ceiling?: { maxParallel?: number; testCommand?: string }): {
+  maxParallel?: number;
+  testCommand?: string;
+} {
+  if (!ceiling) return {};
+  const out: { maxParallel?: number; testCommand?: string } = {};
+  if (ceiling.maxParallel !== undefined) {
+    const n = ceiling.maxParallel;
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(`Invalid ceiling maxParallel "${n}": must be an integer >= 1.`);
+    }
+    out.maxParallel = n;
+  }
+  if (ceiling.testCommand !== undefined) {
+    const t = ceiling.testCommand;
+    if (typeof t !== 'string' || !t.trim()) {
+      throw new Error('Invalid ceiling testCommand: must be a non-empty string.');
+    }
+    out.testCommand = t.trim();
+  }
+  return out;
+}
+
+/** Effective maxParallel: explicit ceiling wins (no 4–8 reinterpretation); else fallback ?? 3. */
+export function resolveEffectiveMaxParallel(ceilingMax?: number, fallback?: number): number {
+  if (ceilingMax !== undefined) {
+    if (!Number.isInteger(ceilingMax) || ceilingMax < 1) {
+      throw new Error(`Invalid ceiling maxParallel "${ceilingMax}": must be an integer >= 1.`);
+    }
+    return ceilingMax;
+  }
+  return fallback ?? 3;
+}
+
+/** Effective testCommand: explicit ceiling wins; else fallback. */
+export function resolveEffectiveTestCommand(ceilingTest?: string, fallback?: string): string | undefined {
+  if (ceilingTest !== undefined) {
+    if (!ceilingTest.trim()) throw new Error('Invalid ceiling testCommand: must be non-empty.');
+    return ceilingTest.trim();
+  }
+  return fallback;
 }
 
 type PlanSpecWithAuth = PlanSpec & { ghAuthenticated?: boolean };
@@ -216,12 +274,154 @@ export class Orchestrator {
   private approvedForMerge = new Set<string>();
   private firstJobCompleted = false;
   /**
+   * F02: explicit repo root for this execution (canonical path).
+   * All git/worktree/state/lock/monitor/report paths resolve through it —
+   * never bare cwd, never global chdir.
+   */
+  private repoRoot: string | null = null;
+  /**
    * M5/M7 wiring: coordinator dispatches tracked per plan run so a
    * retry/crash never launches the same job twice. Key: `${planId}:${jobName}`.
    */
   private coordinatedJobs = new Set<string>();
   private jobComms: JobComms = new JobComms();
   private pendingReplanActions: Map<string, () => Promise<void>> = new Map();
+
+  /** F02: explicit repo root (canonical) for this execution. */
+  getRepoRoot(): string | null {
+    return this.repoRoot;
+  }
+
+  setRepoRoot(repoRoot: string | null | undefined): void {
+    this.repoRoot = repoRoot ? resolveRepoRoot(repoRoot) : null;
+  }
+
+  private effectiveRepoRoot(): string {
+    return this.repoRoot ?? getActiveRepoRoot() ?? resolveRepoRoot(undefined);
+  }
+
+  /** F04: effective maxParallel (explicit ceiling wins, no 4–8 reinterpretation). */
+  getEffectiveMaxParallel(): number {
+    const raw = (this.config as MCConfig & { maxParallel?: number }).maxParallel;
+    return resolveEffectiveMaxParallel(undefined, raw);
+  }
+
+  /** F04: effective testCommand (ceiling wins when applied, else config). */
+  getEffectiveTestCommand(): string | undefined {
+    return (this.config as MCConfig & { testCommand?: string }).testCommand;
+  }
+
+  /** F04: validate + apply ceiling to this execution's config (used by all components). */
+  private applyCeiling(ceiling?: { maxParallel?: number; testCommand?: string }): void {
+    const valid = validateCeiling(ceiling);
+    if (valid.maxParallel !== undefined) {
+      (this.config as MCConfig & { maxParallel?: number }).maxParallel = valid.maxParallel;
+    }
+    if (valid.testCommand !== undefined) {
+      (this.config as MCConfig & { testCommand?: string }).testCommand = valid.testCommand;
+    }
+  }
+
+  /**
+   * F02: repo-scoped job worktree creation (never bare-cwd helper).
+   * Computes the XDG path from the explicit repo's projectId and runs
+   * `git worktree add` inside the explicit repo.
+   * Backward compat: when the explicit repo equals the current cwd
+   * (unit tests, single-repo runs), delegate to the existing helper so
+   * mocked `createWorktree` expectations keep passing; third-folder runs
+   * (repo != cwd) use the explicit-cwd git path below.
+   */
+  private async createJobWorktree(opts: {
+    branch: string;
+    startPoint?: string;
+    postCreate?: import('./providers/worktree-provider').PostCreateHook;
+  }): Promise<string> {
+    const repo = this.effectiveRepoRoot();
+    const { realpathSync } = await import('node:fs');
+    let cwdCanon: string;
+    try { cwdCanon = realpathSync(process.cwd()); } catch { cwdCanon = process.cwd(); }
+    if (repo === cwdCanon) {
+      const { createWorktree } = await import('./worktree');
+      return createWorktree({ branch: opts.branch, startPoint: opts.startPoint, postCreate: opts.postCreate });
+    }
+    const projectId = await getProjectId(repo);
+    const { join, resolve } = await import('path');
+    const sanitized = opts.branch.replace(/\//g, '-');
+    const worktreePath = join(getXdgDataDir(), projectId, sanitized);
+    const fs = await import('fs');
+    fs.mkdirSync(join(worktreePath, '..'), { recursive: true });
+    const branchCheck = await gitCommand(['branch', '--list', opts.branch], { cwd: repo });
+    const exists = branchCheck.stdout.includes(opts.branch);
+    let res;
+    if (exists) {
+      res = await gitCommand(['worktree', 'add', worktreePath, opts.branch], { cwd: repo });
+    } else {
+      const args = ['worktree', 'add', '-b', opts.branch, worktreePath];
+      if (opts.startPoint) args.push(opts.startPoint);
+      res = await gitCommand(args, { cwd: repo });
+    }
+    if (res.exitCode !== 0) {
+      throw new Error(`Failed to create worktree: ${res.stdout || res.stderr}`);
+    }
+    if (opts.postCreate) {
+      const hooks = opts.postCreate;
+      if (hooks.copyFiles) {
+        for (const file of hooks.copyFiles) {
+          const src = join(repo, file);
+          const dest = join(worktreePath, file);
+          if (fs.existsSync(src)) {
+            fs.mkdirSync(join(dest, '..'), { recursive: true });
+            try { fs.copyFileSync(src, dest); } catch {}
+          }
+        }
+      }
+      if (hooks.symlinkDirs) {
+        for (const dir of hooks.symlinkDirs) {
+          const src = join(repo, dir);
+          const dest = join(worktreePath, dir);
+          if (fs.existsSync(src) && !fs.existsSync(dest)) {
+            fs.mkdirSync(join(dest, '..'), { recursive: true });
+            try { fs.symlinkSync(resolve(src), dest); } catch {}
+          }
+        }
+      }
+      if (hooks.commands) {
+        for (const cmd of hooks.commands) {
+          const proc = Bun.spawn(['sh', '-c', cmd], {
+            cwd: worktreePath,
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          const exitCode = await proc.exited;
+          if (exitCode !== 0) {
+            const stderr = await new Response(proc.stderr).text();
+            throw new Error(`Post-create command failed: "${cmd}" (exit ${exitCode}): ${stderr}`);
+          }
+        }
+      }
+    }
+    return worktreePath;
+  }
+
+  private async removeJobWorktree(path: string, force = true): Promise<void> {
+    const repo = this.effectiveRepoRoot();
+    const { realpathSync } = await import('node:fs');
+    let cwdCanon: string;
+    try { cwdCanon = realpathSync(process.cwd()); } catch { cwdCanon = process.cwd(); }
+    if (repo === cwdCanon) {
+      const { removeWorktree } = await import('./worktree');
+      return removeWorktree(path, force);
+    }
+    if (!force) {
+      const status = await gitCommand(['-C', path, 'status', '--porcelain']);
+      if (status.exitCode !== 0) throw new Error(`Cannot check worktree status at ${path}`);
+      if (status.stdout.length > 0) throw new Error(`Worktree at ${path} has uncommitted changes. Use force=true to remove anyway.`);
+    }
+    const res = await gitCommand(['worktree', 'remove', ...(force ? ['--force'] : []), path], { cwd: repo });
+    if (res.exitCode !== 0) {
+      throw new Error(`Failed to remove worktree at ${path}: ${res.stderr || res.stdout}`);
+    }
+  }
 
   private getMergeTrainConfig(): {
     testCommand?: string;
@@ -554,58 +754,67 @@ export class Orchestrator {
     const wasPreMerge = this.checkpoint === 'pre_merge';
     this.checkpoint = null;
 
-    const plan = await loadPlan();
-    if (plan && plan.status === 'paused') {
-      if (wasPreMerge) {
-        for (const job of plan.jobs) {
-          if (job.status === 'ready_to_merge') {
-            this.approvedForMerge.add(job.name);
+    const repoRoot = this.effectiveRepoRoot();
+    await withRepoRoot(repoRoot, async () => {
+      const plan = await loadPlan(repoRoot);
+      if (plan && plan.status === 'paused') {
+        if (wasPreMerge) {
+          for (const job of plan.jobs) {
+            if (job.status === 'ready_to_merge') {
+              this.approvedForMerge.add(job.name);
+            }
           }
         }
-      }
 
-      await updatePlanFields(plan.id, {
-        status: 'running',
-        checkpoint: null,
-        checkpointContext: null,
-      });
+        await updatePlanFields(plan.id, {
+          status: 'running',
+          checkpoint: null,
+          checkpointContext: null,
+        }, repoRoot);
       this.showToast('Mission Control', 'Checkpoint cleared, resuming execution.', 'info');
 
       if (!this.isRunning) {
         this.startReconciler();
       }
-    }
+      }
+    });
   }
 
-  async startPlan(spec: PlanSpec): Promise<{ pending: boolean; message?: string }> {
-    this.validatePlan(spec);
+  async startPlan(spec: PlanSpec, opts?: { repoRoot?: string }): Promise<{ pending: boolean; message?: string }> {
+    // F02: explicit repo scope end-to-end (never bare cwd, never global chdir).
+    const repoRoot = opts?.repoRoot ? resolveRepoRoot(opts.repoRoot) : this.repoRoot ?? getActiveRepoRoot() ?? resolveRepoRoot(undefined);
+    this.repoRoot = repoRoot;
+    return await withRepoRoot(repoRoot, async () => {
+      this.validatePlan(spec);
 
-    const existingPlan = await loadPlan();
-    if (existingPlan) {
-      throw new Error('Active plan already exists');
-    }
+      const existingPlan = await loadPlan(repoRoot);
+      if (existingPlan) {
+        throw new Error('Active plan already exists');
+      }
 
-    const ghAuthenticated = await validateGhAuth();
-    const plan: PlanSpecWithAuth = {
-      ...spec,
-      status: 'pending',
-      ghAuthenticated,
-      jobs: topologicalSort(spec.jobs).map((job, idx) => ({
-        ...job,
-        status: job.dependsOn?.length ? 'waiting_deps' : 'queued',
-        mergeOrder: job.mergeOrder ?? idx,
-      })),
-    };
+      const ghAuthenticated = await validateGhAuth();
+      const plan: PlanSpecWithAuth = {
+        ...spec,
+        status: 'pending',
+        ghAuthenticated,
+        jobs: topologicalSort(spec.jobs).map((job, idx) => ({
+          ...job,
+          status: job.dependsOn?.length ? 'waiting_deps' : 'queued',
+          mergeOrder: job.mergeOrder ?? idx,
+        })),
+      };
 
-    const integrationPostCreate = resolvePostCreateHook(this.config.worktreeSetup);
-    const integration = spec.baseBranch
-      ? await createIntegrationBranch(spec.id, integrationPostCreate, spec.baseBranch)
-      : await createIntegrationBranch(spec.id, integrationPostCreate);
+      const integrationPostCreate = resolvePostCreateHook(this.config.worktreeSetup);
+      // F02: repo scope via active context (withRepoRoot above) — explicit param
+      // only for direct third-folder calls; keep 2/3-arg shape for backward compat.
+      const integration = spec.baseBranch
+        ? await createIntegrationBranch(spec.id, integrationPostCreate, spec.baseBranch)
+        : await createIntegrationBranch(spec.id, integrationPostCreate);
     plan.integrationBranch = integration.branch;
     plan.integrationWorktree = integration.worktreePath;
 
     if (spec.mode === 'copilot') {
-      await savePlan(plan);
+      await savePlan(plan, repoRoot);
       this.showToast(
         'Mission Control',
         `Plan "${plan.name}" created in copilot mode. Awaiting approval.`,
@@ -617,19 +826,20 @@ export class Orchestrator {
       };
     }
 
-    await savePlan(plan);
+    await savePlan(plan, repoRoot);
 
     this.activePlanId = plan.id;
     this.coordinatedJobs.clear();
     this.planPlacement = spec.placement ?? null;
     this.planLaunchSessionID = spec.launchSessionID;
-    this.mergeTrain = new MergeTrain(plan.integrationWorktree, this.getMergeTrainConfig());
+    this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
     this.subscribeToMonitorEvents();
     this.ensureMonitorRunning();
     this.startReconciler();
     this.showToast('Mission Control', `Plan "${plan.name}" started.`, 'info');
     this.notify(`📋 Plan "${plan.name}" started in autopilot mode. ${plan.jobs.length} jobs queued.`);
     return { pending: false };
+    });
   }
 
   private startReconciler(): void {
@@ -663,7 +873,7 @@ export class Orchestrator {
       status: 'paused',
       checkpoint: type,
       checkpointContext: context ?? null,
-    });
+    }, this.effectiveRepoRoot());
     this.stopReconciler();
     this.showToast(
       'Mission Control',
@@ -694,11 +904,16 @@ export class Orchestrator {
   }
 
   private async _doReconcile(): Promise<void> {
+    // F02: run the whole pass inside the explicit repo scope so state helpers
+    // without an explicit param (job-state/reports/durable/monitor/config)
+    // still resolve to the target repo, never the launcher cwd.
+    const repoRoot = this.effectiveRepoRoot();
+    await withRepoRoot(repoRoot, async () => {
       // Conductor cover: drive one monitor cycle so session events land in
       // jobs.json even when the interval hasn't fired yet (CLI conductor).
       await this.driveMonitorOnce();
       this.ensureMonitorRunning();
-      const plan = await loadPlan();
+      const plan = await loadPlan(repoRoot);
 
       if (!plan || isTerminalPlanStatus(plan.status)) {
         this.stopReconciler();
@@ -716,7 +931,8 @@ export class Orchestrator {
         plan.status = 'running';
       }
 
-      const maxParallel = (this.config as MCConfig & { maxParallel?: number }).maxParallel ?? 3;
+      // F04: effective ceiling per execution (explicit 1 respected, no 4–8 reinterpretation).
+      const maxParallel = this.getEffectiveMaxParallel();
       const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
       let runningCount = runningJobs.length;
 
@@ -809,7 +1025,7 @@ export class Orchestrator {
       for (const job of mergeOrder) {
         if (job.status === 'completed') {
           if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
-            const validation = await validateTouchSet(job.branch, plan.integrationBranch, job.touchSet);
+            const validation = await validateTouchSet(job.branch, plan.integrationBranch, job.touchSet, { cwd: repoRoot });
             if (!validation.valid && validation.violations) {
               await updatePlanJob(plan.id, job.name, {
                 status: 'failed',
@@ -967,7 +1183,7 @@ export class Orchestrator {
         plan.status = 'running';
       }
 
-      const latestPlan = await loadPlan();
+      const latestPlan = await loadPlan(this.effectiveRepoRoot());
       if (!latestPlan) {
         return;
       }
@@ -980,7 +1196,7 @@ export class Orchestrator {
 
         if (this.isSupervisor(latestPlan)) {
           await this.setCheckpoint('pre_pr', latestPlan);
-          await this.writeAutoFinalReport((await loadPlan()) ?? latestPlan);
+          await this.writeAutoFinalReport((await loadPlan(this.effectiveRepoRoot())) ?? latestPlan);
           return;
         }
 
@@ -994,7 +1210,7 @@ export class Orchestrator {
             prUrl,
             completedAt,
           });
-          const donePlan = (await loadPlan()) ?? { ...latestPlan, status: 'completed' as const, prUrl, completedAt };
+          const donePlan = (await loadPlan(this.effectiveRepoRoot())) ?? { ...latestPlan, status: 'completed' as const, prUrl, completedAt };
           await this.writeAutoFinalReport(donePlan);
           this.stopReconciler();
           this.unsubscribeFromMonitorEvents();
@@ -1012,7 +1228,7 @@ export class Orchestrator {
               `no push was made. Approve with mc_plan_approve(checkpoint: "pre_pr").`,
             );
             await this.setCheckpoint('pre_pr', latestPlan);
-            await this.writeAutoFinalReport((await loadPlan()) ?? latestPlan);
+            await this.writeAutoFinalReport((await loadPlan(this.effectiveRepoRoot())) ?? latestPlan);
             return;
           }
           const completedAt = new Date().toISOString();
@@ -1041,6 +1257,7 @@ export class Orchestrator {
         }
         await updatePlanFields(latestPlan.id, updates);
       }
+    });
   }
 
   private async launchJob(job: JobSpec): Promise<void> {
@@ -1066,7 +1283,7 @@ export class Orchestrator {
             return `${currentSession}:${sanitizedName}`;
           })();
 
-    await updatePlanJob(planId, job.name, { status: 'running', branch });
+    await updatePlanJob(planId, job.name, { status: 'running', branch }, undefined, this.effectiveRepoRoot());
 
     let worktreePath = '';
     let promptFilePath: string | undefined;
@@ -1083,11 +1300,12 @@ export class Orchestrator {
       // Plan jobs branch from a deterministic start point:
       // - Jobs WITH dependencies → integration branch HEAD (sees upstream changes)
       // - Root jobs (no deps) → baseCommit (consistent starting state)
-      const plan = await loadPlan();
+      const plan = await loadPlan(this.effectiveRepoRoot());
       const hasDeps = job.dependsOn && job.dependsOn.length > 0;
       const startPoint = plan ? (hasDeps ? plan.integrationBranch : plan.baseCommit) : undefined;
 
-      worktreePath = await createWorktree({ branch, startPoint, postCreate });
+      // F02: repo-scoped worktree (never bare-cwd helper).
+      worktreePath = await this.createJobWorktree({ branch, startPoint, postCreate });
 
       if (mode !== 'vanilla') {
         const omoStatus = await detectOMO();
@@ -1099,7 +1317,8 @@ export class Orchestrator {
 
         if (mode === 'plan' || mode === 'ralph' || mode === 'ulw') {
           try {
-            const sourcePlansPath = './.sisyphus/plans';
+            const { join: joinPath } = await import('path');
+            const sourcePlansPath = joinPath(this.effectiveRepoRoot(), '.sisyphus/plans');
             const targetPlansPath = `${worktreePath}/.sisyphus/plans`;
             await copyPlansToWorktree(sourcePlansPath, targetPlansPath);
           } catch {
@@ -1222,7 +1441,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       } catch {}
 
       if (worktreePath) {
-        await removeWorktree(worktreePath, true).catch(() => {});
+        await this.removeJobWorktree(worktreePath, true).catch(() => {});
       }
 
       // Recovery: the job never left queued/waiting_deps (no worktree yet),
@@ -1231,7 +1450,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       await updatePlanJob(planId, job.name, {
         status: 'failed',
         error: error instanceof Error ? error.message : String(error),
-      }, { force: true });
+      }, { force: true }, this.effectiveRepoRoot());
     }
   }
 
@@ -1240,7 +1459,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     violations: string[],
     touchSetPatterns: string[],
   ): Promise<void> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
       throw new Error('No active plan');
     }
@@ -1471,40 +1690,43 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
   }
 
-  async cancelPlan(): Promise<void> {
-    this.stopReconciler();
-    this.coordinatedJobs.clear();
+  async cancelPlan(repoRootOverride?: string): Promise<void> {
+    const repoRoot = resolveRepoRoot(repoRootOverride ?? this.repoRoot ?? getActiveRepoRoot() ?? undefined);
+    await withRepoRoot(repoRoot, async () => {
+      this.stopReconciler();
+      this.coordinatedJobs.clear();
 
-    const plan = await loadPlan();
-    if (!plan) {
-      return;
-    }
+      const plan = await loadPlan(repoRoot);
+      if (!plan) {
+        return;
+      }
 
-    // Unsubscribe from monitor events BEFORE killing jobs to prevent
-    // completion/failure handlers from racing with plan cleanup.
-    this.unsubscribeFromMonitorEvents();
-    this.activePlanId = null;
+      // Unsubscribe from monitor events BEFORE killing jobs to prevent
+      // completion/failure handlers from racing with plan cleanup.
+      this.unsubscribeFromMonitorEvents();
+      this.activePlanId = null;
 
-    const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
-    for (const job of runningJobs) {
-      try {
-        if (job.placement === 'session') {
-          await killSession(job.tmuxTarget);
-        } else {
-          const [session, window] = job.tmuxTarget.split(':');
-          if (session && window) {
-            await killWindow(session, window);
+      const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
+      for (const job of runningJobs) {
+        try {
+          if (job.placement === 'session') {
+            await killSession(job.tmuxTarget);
+          } else {
+            const [session, window] = job.tmuxTarget.split(':');
+            if (session && window) {
+              await killWindow(session, window);
+            }
           }
-        }
-        await updateJob(job.id, {
-          status: 'stopped',
-          completedAt: new Date().toISOString(),
-        });
-      } catch {}
-    }
+          await updateJob(job.id, {
+            status: 'stopped',
+            completedAt: new Date().toISOString(),
+          });
+        } catch {}
+      }
 
-    await deleteIntegrationBranch(plan.id);
-    await clearPlan();
+      await deleteIntegrationBranch(plan.id);
+      await clearPlan();
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1520,41 +1742,66 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     generate: PlannerGenerate,
     opts?: { launch?: boolean },
   ): Promise<{ intakeId: string; tasks: string[]; launched: boolean }> {
-    // Retry with backoff: an invalid model answer never becomes work.
-    const { intake, draft, attempts } = await runAutoIntakeWithRetry(input, generate, {
-      maxAttempts: 3,
-      baseDelayMs: 1000,
-    });
-    const base = await ensureBaseReady(input.repo ?? process.cwd(), input.targetBranch);
+    // F02/F04/F11: explicit repo scope, validated ceiling, loaded --context.
+    const repoRoot = resolveRepoRoot(input.repo ?? getActiveRepoRoot() ?? undefined);
+    const validCeiling = validateCeiling(input.ceiling);
+    // F11: load --context file(s) explicitly — prompt gets CONTENT, never just the path.
+    const loadedDocs: LoadedContextDoc[] = await loadContextDocs(input.docs, { repoRoot });
+    const formattedDocs = formatContextDocsForPrompt(loadedDocs);
+    const enrichedInput: AutoIntakeInput = {
+      ...input,
+      repo: repoRoot,
+      docs: loadedDocs.length > 0 ? formattedDocs : input.docs,
+      ceiling: validCeiling.maxParallel !== undefined || validCeiling.testCommand !== undefined ? validCeiling : input.ceiling,
+    };
+    return await withRepoRoot(repoRoot, async () => {
+      this.repoRoot = repoRoot;
+      this.applyCeiling(validCeiling);
+      // Retry with backoff: an invalid model answer never becomes work.
+      const { intake, draft, attempts } = await runAutoIntakeWithRetry(enrichedInput, generate, {
+        maxAttempts: 3,
+        baseDelayMs: 1000,
+      });
+      const base = await ensureBaseReady(repoRoot, input.targetBranch);
 
-    const now = new Date().toISOString();
-    await saveAutoIntake({
-      id: intake.id,
-      request: intake.request,
-      repo: intake.repo,
-      targetBranch: intake.targetBranch,
-      ceiling: intake.ceiling,
-      requirements: draft.requirements.map((r) => ({ ...r })),
-      decisions: [...draft.decisions],
-      questions: [...draft.questions],
-      nextSteps: [],
-      status: 'planned',
-      createdAt: intake.createdAt,
-      updatedAt: now,
-    });
-    await appendAutoDecision(
-      intake.id,
-      `model answered in ${attempts} attempt(s) (${draft.requirements.length} requirements, ${draft.tasks.length} tasks)`,
-    ).catch(() => {});
-    await appendAutoDecision(
-      intake.id,
-      `base ready: ${base.baseBranch}@${base.baseCommit.slice(0, 8)}${base.createdBranch ? ' (destination branch created locally, never pushed)' : ''}`,
-    ).catch(() => {});
+      const now = new Date().toISOString();
+      await saveAutoIntake({
+        id: intake.id,
+        request: intake.request,
+        repo: repoRoot,
+        targetBranch: intake.targetBranch,
+        ceiling: Object.keys(validCeiling).length > 0 ? validCeiling : intake.ceiling,
+        requirements: draft.requirements.map((r) => ({ ...r })),
+        decisions: [...draft.decisions],
+        questions: [...draft.questions],
+        nextSteps: [],
+        status: 'planned',
+        createdAt: intake.createdAt,
+        updatedAt: now,
+        // F11: preserve reference/version/scope + content for resume (never just the path).
+        ...((loadedDocs.length > 0
+          ? { contextDocs: loadedDocs, docs: formattedDocs }
+          : {}) as unknown as Record<string, unknown>),
+      } as unknown as Parameters<typeof saveAutoIntake>[0]);
+      await appendAutoDecision(
+        intake.id,
+        `model answered in ${attempts} attempt(s) (${draft.requirements.length} requirements, ${draft.tasks.length} tasks)`,
+      ).catch(() => {});
+      await appendAutoDecision(
+        intake.id,
+        `base ready: ${base.baseBranch}@${base.baseCommit.slice(0, 8)}${base.createdBranch ? ' (destination branch created locally, never pushed)' : ''}`,
+      ).catch(() => {});
+      if (loadedDocs.length > 0) {
+        await appendAutoDecision(
+          intake.id,
+          `context loaded: ${loadedDocs.map((d) => `${d.ref} (sha:${d.hash} scope:${d.scope})`).join(', ')}`,
+        ).catch(() => {});
+      }
 
-    const tasks = draft.tasks.map((t) => t.name);
-    if (opts?.launch === false) {
-      return { intakeId: intake.id, tasks, launched: false };
-    }
+      const tasks = draft.tasks.map((t) => t.name);
+      if (opts?.launch === false) {
+        return { intakeId: intake.id, tasks, launched: false };
+      }
 
     const jobSpecs: JobSpec[] = draftToJobSpecs(draft).map((shell) => ({
       ...shell,
@@ -1580,7 +1827,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     if (input.targetBranch) {
       spec.baseBranch = base.baseBranch;
     }
-    await this.startPlan(spec);
+    await this.startPlan(spec, { repoRoot });
     await appendAutoDecision(intake.id, `plan ${spec.id} launched (${tasks.length} tasks)`).catch(() => {});
     await setAutoIntakeStatus(intake.id, 'running').catch(() => {});
     await appendAutoDecision(
@@ -1588,6 +1835,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       'conducting: coordinator (observe → decide → dispatch) + reconciler (merge) + monitor (reports); follow detaches, close never cancels',
     ).catch(() => {});
     return { intakeId: intake.id, tasks, launched: true };
+    });
   }
 
   /**
@@ -1597,17 +1845,37 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
    * never reintegrates merged work. Never touches user sessions.
    */
   async resumeAutonomousIntake(intakeId: string): Promise<string> {
+    // F02/F04/F11: restore explicit repo + effective ceiling + preserved context.
+    // Intake may live under a different repo's scope than current cwd (third-folder resume),
+    // so resolve via active scope first, then fall back to a cross-repo search is handled
+    // by the CLI layer (auto-commands) which passes the intake's repo explicitly.
     const record = await loadAutoIntake(intakeId);
     if (!record) {
       throw new Error(`No intake "${intakeId}" persisted — start one before resuming.`);
     }
-    const plan = await loadPlan();
-    if (!plan) {
-      return `Intake ${record.id} [${record.status}]: no active plan to resume (nothing duplicated, nothing reintegrated).`;
-    }
-    await this.resumePlan();
-    await appendAutoDecision(record.id, `resumed via public path (plan ${plan.id}, no new JSON)`).catch(() => {});
-    return await this.autonomousProgress(record.id);
+    const repoRoot = resolveRepoRoot(
+      (record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined,
+    );
+    return await withRepoRoot(repoRoot, async () => {
+      this.repoRoot = repoRoot;
+      // F04: restore effective config from the persisted ceiling (validated).
+      this.applyCeiling((record as unknown as { ceiling?: { maxParallel?: number; testCommand?: string } }).ceiling);
+      const plan = await loadPlan(repoRoot);
+      if (!plan) {
+        return `Intake ${record.id} [${record.status}]: no active plan to resume (nothing duplicated, nothing reintegrated).`;
+      }
+      await this.resumePlan(repoRoot);
+      await appendAutoDecision(record.id, `resumed via public path (plan ${plan.id}, no new JSON)`).catch(() => {});
+      // F11: context preserved — never re-declared from a bare path.
+      const ctx = (record as unknown as { contextDocs?: LoadedContextDoc[] }).contextDocs;
+      if (ctx && ctx.length > 0) {
+        await appendAutoDecision(
+          record.id,
+          `context preserved on resume: ${ctx.map((d) => `${d.ref} (sha:${d.hash} scope:${d.scope})`).join(', ')}`,
+        ).catch(() => {});
+      }
+      return await this.autonomousProgress(record.id);
+    });
   }
 
   /**
@@ -1622,29 +1890,35 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     if (!record) {
       throw new Error(`No intake "${intakeId}" persisted — start one before complementing.`);
     }
-    const followUp = text.trim();
-    if (!followUp) throw new Error('Complement text must not be empty.');
-    await saveAutoIntake({
-      ...record,
-      request: `${record.request}\nFollow-up: ${followUp}`,
-      updatedAt: new Date().toISOString(),
-    });
-    const plan = await loadPlan().catch(() => null);
-    const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
-    if (paused) {
-      // Free content recorded as a question; the pause/decision stands.
-      await appendAutoQuestion(intakeId, followUp).catch(() => {});
-      return;
-    }
-    await appendAutoDecision(intakeId, `complement: "${followUp.slice(0, 120)}"`).catch(() => {});
-    // Running: make sure the loop that advances eligible work is alive, so no
-    // manual resumePlan is needed after a complement/new task.
-    try {
-      const latest = await loadPlan();
-      if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
-        this.startReconciler();
+    const repoRoot = resolveRepoRoot(
+      (record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined,
+    );
+    return await withRepoRoot(repoRoot, async () => {
+      this.repoRoot = this.repoRoot ?? repoRoot;
+      const followUp = text.trim();
+      if (!followUp) throw new Error('Complement text must not be empty.');
+      await saveAutoIntake({
+        ...record,
+        request: `${record.request}\nFollow-up: ${followUp}`,
+        updatedAt: new Date().toISOString(),
+      });
+      const plan = await loadPlan(repoRoot).catch(() => null);
+      const paused = !!plan && (plan.status === 'paused' || !!plan.checkpoint);
+      if (paused) {
+        // Free content recorded as a question; the pause/decision stands.
+        await appendAutoQuestion(intakeId, followUp).catch(() => {});
+        return;
       }
-    } catch {}
+      await appendAutoDecision(intakeId, `complement: "${followUp.slice(0, 120)}"`).catch(() => {});
+      // Running: make sure the loop that advances eligible work is alive, so no
+      // manual resumePlan is needed after a complement/new task.
+      try {
+        const latest = await loadPlan(repoRoot);
+        if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
+          this.startReconciler();
+        }
+      } catch {}
+    });
   }
 
   /**
@@ -1657,7 +1931,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     decision: RuntimeDecision,
     opts?: { intakeId?: string },
   ): Promise<{ route: 'autonomous' | 'needs-user'; message: string }> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) throw new Error('No active plan — cannot apply a model adjustment.');
     const route = validateRuntimeDecision(decision, {
       taskNames: plan.jobs.map((j) => j.name),
@@ -1728,7 +2002,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         lines.push(`Decisions kept: ${record.decisions.length}, open questions: ${record.questions.length}`);
       }
     }
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
       lines.push('No active plan.');
       return lines.join('\n');
@@ -1743,7 +2017,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   }
 
   async skipJob(jobName: string, reason?: string): Promise<void> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
       throw new Error('No active plan');
     }
@@ -1786,7 +2060,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   }
 
   async addJob(jobSpec: Omit<JobSpec, 'id' | 'status'>, options?: { forkFrom?: string }): Promise<void> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
       throw new Error('No active plan');
     }
@@ -1843,7 +2117,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
 
     plan.jobs.push(newJob);
-    await savePlan(plan);
+    await savePlan(plan, this.effectiveRepoRoot());
     this.jobComms.registerJob(newJob);
 
     const auditEntry: AuditLogEntry = {
@@ -1861,7 +2135,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     // When the plan is active (not paused/terminal), ensure the reconciler
     // loop is alive so eligible work dispatches on its own.
     try {
-      const latest = await loadPlan();
+      const latest = await loadPlan(this.effectiveRepoRoot());
       if (latest && (latest.status === 'running' || latest.status === 'merging' || latest.status === 'pending') && !this.isRunning) {
         this.startReconciler();
       }
@@ -1869,7 +2143,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   }
 
   async reorderJobs(newOrder: string[]): Promise<void> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
       throw new Error('No active plan');
     }
@@ -1907,7 +2181,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
 
     plan.jobs = reorderedJobs;
-    await savePlan(plan);
+    await savePlan(plan, this.effectiveRepoRoot());
 
     const auditEntry: AuditLogEntry = {
       timestamp: new Date().toISOString(),
@@ -1922,7 +2196,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   }
 
   private async appendAuditLog(planId: string, entry: AuditLogEntry): Promise<void> {
-    const plan = await loadPlan();
+    const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan || plan.id !== planId) {
       return;
     }
@@ -1965,67 +2239,71 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     return actionId;
   }
 
-  async resumePlan(): Promise<void> {
-    const plan = await loadPlan();
-    if (!plan || (plan.status !== 'running' && plan.status !== 'paused')) {
-      return;
-    }
+  async resumePlan(repoRootOverride?: string): Promise<void> {
+    const repoRoot = resolveRepoRoot(repoRootOverride ?? this.repoRoot ?? getActiveRepoRoot() ?? undefined);
+    this.repoRoot = repoRoot;
+    await withRepoRoot(repoRoot, async () => {
+      const plan = await loadPlan(repoRoot);
+      if (!plan || (plan.status !== 'running' && plan.status !== 'paused')) {
+        return;
+      }
 
-    if (plan.status === 'paused') {
-      await updatePlanFields(plan.id, {
-        status: 'running',
-        checkpoint: null,
-        checkpointContext: null,
-      });
-    }
-    this.checkpoint = null;
+      if (plan.status === 'paused') {
+        await updatePlanFields(plan.id, {
+          status: 'running',
+          checkpoint: null,
+          checkpointContext: null,
+        }, repoRoot);
+      }
+      this.checkpoint = null;
 
-    this.activePlanId = plan.id;
-    this.planPlacement = plan.placement ?? null;
-    this.planLaunchSessionID = plan.launchSessionID;
-    this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+      this.activePlanId = plan.id;
+      this.planPlacement = plan.placement ?? null;
+      this.planLaunchSessionID = plan.launchSessionID;
+      this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
 
-    const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
-    let hasDeadRunningJob = false;
+      const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
+      let hasDeadRunningJob = false;
 
-    const tmuxHealthy = await isTmuxHealthy();
-    if (!tmuxHealthy) {
-      console.warn('tmux server is not responsive, skipping pane checks during resumePlan');
-    } else {
-      for (const runningJob of runningJobs) {
-        try {
-          const paneAlive = await isPaneRunning(runningJob.tmuxTarget);
-          if (!paneAlive) {
-            hasDeadRunningJob = true;
-            await updateJob(runningJob.id, {
-              status: 'failed',
-              completedAt: new Date().toISOString(),
-            });
-            await updatePlanJob(plan.id, runningJob.name, {
-              status: 'failed',
-              error: 'tmux pane is not running',
-            });
+      const tmuxHealthy = await isTmuxHealthy();
+      if (!tmuxHealthy) {
+        console.warn('tmux server is not responsive, skipping pane checks during resumePlan');
+      } else {
+        for (const runningJob of runningJobs) {
+          try {
+            const paneAlive = await isPaneRunning(runningJob.tmuxTarget);
+            if (!paneAlive) {
+              hasDeadRunningJob = true;
+              await updateJob(runningJob.id, {
+                status: 'failed',
+                completedAt: new Date().toISOString(),
+              });
+              await updatePlanJob(plan.id, runningJob.name, {
+                status: 'failed',
+                error: 'tmux pane is not running',
+              }, undefined, repoRoot);
+            }
+          } catch (error) {
+            console.warn(
+              `tmux error checking job ${runningJob.name} during resumePlan, skipping:`,
+              error instanceof Error ? error.message : error,
+            );
           }
-        } catch (error) {
-          console.warn(
-            `tmux error checking job ${runningJob.name} during resumePlan, skipping:`,
-            error instanceof Error ? error.message : error,
-          );
         }
       }
-    }
 
-    if (hasDeadRunningJob) {
-      await updatePlanFields(plan.id, {
-        status: 'failed',
-        completedAt: new Date().toISOString(),
-      });
-      return;
-    }
+      if (hasDeadRunningJob) {
+        await updatePlanFields(plan.id, {
+          status: 'failed',
+          completedAt: new Date().toISOString(),
+        }, repoRoot);
+        return;
+      }
 
-    this.subscribeToMonitorEvents();
-    this.ensureMonitorRunning();
-    this.startReconciler();
+      this.subscribeToMonitorEvents();
+      this.ensureMonitorRunning();
+      this.startReconciler();
+    });
   }
 
   private async createPR(opts?: PublishAuthOptions): Promise<string> {
@@ -2033,17 +2311,18 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     // The human opts in per call — absence of the flag is a refusal.
     requireHumanAuth('git push', opts);
     requireHumanAuth('gh pr create', opts);
-    const plan = await loadPlan();
+    const repoRoot = this.effectiveRepoRoot();
+    const plan = await loadPlan(repoRoot);
     if (!plan) {
       throw new Error('No active plan found');
     }
 
-    const pushResult = await this.runCommand(['git', 'push', 'origin', plan.integrationBranch]);
+    const pushResult = await this.runCommand(['git', 'push', 'origin', plan.integrationBranch], repoRoot);
     if (pushResult.exitCode !== 0) {
       throw new Error(`Failed to push integration branch: ${pushResult.stderr || pushResult.stdout}`);
     }
 
-    const baseBranch = plan.baseBranch ?? await getDefaultBranch();
+    const baseBranch = plan.baseBranch ?? await getDefaultBranch(repoRoot);
     const title = plan.name;
     const jobLines = plan.jobs.map((j) => {
       const status = j.status === 'merged' ? '✅' : j.status === 'failed' ? '❌' : '⏳';
@@ -2100,7 +2379,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       title,
       '--body',
       body,
-    ]);
+    ], repoRoot);
 
     if (prResult.exitCode !== 0) {
       throw new Error(`Failed to create PR: ${prResult.stderr || prResult.stdout}`);
