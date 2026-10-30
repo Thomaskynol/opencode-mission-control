@@ -1,0 +1,12 @@
+bun test v1.3.14 (0d9b296a)
+
+tests/lib/wire-report.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+ 70 pass
+ 11 skip
+ 0 fail
+ 207 expect() calls
+Ran 81 tests across 8 files. [985.00ms]
