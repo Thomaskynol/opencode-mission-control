@@ -16,6 +16,7 @@ import {
   saveAutoIntake,
   loadAutoIntake,
   loadRuntimeSnapshot,
+  appendAutoDecision,
   appendAutoQuestion,
   setAutoNextSteps,
   setAutoIntakeStatus,
@@ -447,13 +448,24 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
     // awaiting-plan intake so `resume --intake <id>` retries the model
     // without new JSON. No tasks, branches or workers are created here.
     // F02: preserve inside the explicit repo scope, never the launcher cwd.
+    // R04: the kept entry already carries docs/context, ceiling and the
+    // effective model — a crash here still resumes the complete entry.
     const now = new Date().toISOString();
+    let effModel: string | undefined;
+    let effVariant: string | undefined;
+    try {
+      const { resolveEffectiveModelRef } = await import('../lib/auto-plan');
+      const eff = resolveEffectiveModelRef();
+      effModel = `${eff.providerID}/${eff.id}`;
+      effVariant = eff.variant;
+    } catch {}
     const record: AutoIntakeRecord = {
       id: randomUUID(),
       request,
       repo,
       targetBranch,
       ceiling: input.ceiling,
+      ...(input.docs?.length ? { docs: input.docs } : {}),
       requirements: [],
       decisions: [`model failed: ${error instanceof Error ? error.message : String(error)}`],
       questions: [],
@@ -461,6 +473,8 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
       status: 'awaiting-plan',
       createdAt: now,
       updatedAt: now,
+      ...(effModel ? { effectiveModel: effModel } : {}),
+      ...(effVariant ? { effectiveVariant: effVariant } : {}),
     };
     await withRepoRoot(repo, async () => saveAutoIntake(record)).catch(() => {});
     throw new Error(
@@ -490,17 +504,67 @@ function applyEffectiveConfig(
   orchestrator.applyCeiling(rec.ceiling);
   const eff = rec.effectiveModel?.trim();
   if (eff) {
-    const slash = eff.indexOf('/');
+    // Same `provider/model[#variant]` grammar as parseModelRef: the persisted
+    // effectiveModel string is variant-less (variant rides effectiveVariant),
+    // but a `#variant` suffix must survive instead of polluting the id.
+    const hash = eff.indexOf('#');
+    const base = hash > 0 ? eff.slice(0, hash) : eff;
+    const inlineVariant = hash > 0 ? eff.slice(hash + 1).trim() : undefined;
+    const slash = base.indexOf('/');
     const ref =
       slash > 0
-        ? { providerID: eff.slice(0, slash), id: eff.slice(slash + 1) }
-        : { providerID: 'unknown', id: eff };
-    orchestrator.setPlanModelSnapshot(rec.effectiveVariant ? { ...ref, variant: rec.effectiveVariant } : ref);
+        ? { providerID: base.slice(0, slash), id: base.slice(slash + 1) }
+        : { providerID: 'unknown', id: base };
+    const variant = rec.effectiveVariant || inlineVariant;
+    orchestrator.setPlanModelSnapshot(variant ? { ...ref, variant } : ref);
   } else if (fallbackModel !== undefined) {
     try {
       orchestrator.setPlanModelSnapshot(fallbackModel);
     } catch {}
   }
+}
+
+/**
+ * R04: verifiable conductor handoff after a CLI resumePlan.
+ * A one-shot CLI cannot stay alive as the conductor, so approve/resume must
+ * not do resumePlan+shutdown silently: this re-reads the plan AFTER the
+ * resume, verifies what actually continues (live workers + plan state +
+ * reconciler), persists the transfer as an intake decision, and returns the
+ * proof. The caller still shuts down its own loops afterwards (CLI hygiene),
+ * but only after the handoff is recorded and reported.
+ */
+async function recordConductorHandoff(
+  ctl: {
+    resumePlan: (r?: string) => Promise<void>;
+    autonomousProgress?: (id?: string) => Promise<string>;
+  },
+  record: AutoIntakeRecord,
+  repoRoot: string,
+  action: string,
+): Promise<string> {
+  await ctl.resumePlan(repoRoot);
+  const { loadPlan } = await import('../lib/plan-state');
+  const plan = await loadPlan(repoRoot).catch(() => null);
+  const alive = (ctl as unknown as { isRunning?: boolean }).isRunning === true;
+  let handoff: string;
+  if (!plan) {
+    handoff = `${action}: no active plan in ${repoRoot} — nothing to conduct (intake ${record.id} kept).`;
+  } else if (plan.status === 'paused' || plan.checkpoint) {
+    handoff = `${action}: pause respected (plan ${plan.id} [${plan.status}] checkpoint ${plan.checkpoint ?? 'none'}) — no conductor started; approve to continue.`;
+  } else if (plan.status === 'completed' || plan.status === 'failed' || plan.status === 'canceled') {
+    handoff = `${action}: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report.`;
+  } else {
+    const running = plan.jobs.filter((j) => j.status === 'running' || j.status === 'merging').length;
+    handoff =
+      `${action}: conductor handed off (plan ${plan.id} [${plan.status}], reconciler ${alive ? 'running' : 'armed for next pass'} in pid ${process.pid}, ` +
+      `${running} job(s) in flight, state persisted; re-attach with: bun ${cliPath()} resume --intake ${record.id}).`;
+  }
+  await appendAutoDecision(record.id, `handoff: ${handoff}`).catch(() => {});
+  let progress = '';
+  try {
+    if (ctl.autonomousProgress) progress = await ctl.autonomousProgress(record.id);
+  } catch {}
+  return [handoff, progress].filter(Boolean).join('\n');
 }
 
 /**
@@ -579,13 +643,15 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         ctl.setRepoRoot(repoRoot);
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
+        let handoff: string;
         try {
-          await ctl.resumePlan(repoRoot);
+          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`);
         } finally {
           ctl.shutdown();
         }
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${relaunch}" relaunched with correction prompt.`,
+          handoff,
           '',
           `  ID:   ${plan.id}`,
           `  Mode: ${plan.mode}`,
@@ -633,13 +699,15 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         };
         ctl.setRepoRoot(repoRoot);
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+        let retryHandoff: string;
         try {
-          await ctl.resumePlan(repoRoot);
+          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`);
         } finally {
           ctl.shutdown();
         }
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${retry}" reset to ready_to_merge.`,
+          retryHandoff,
           '',
           `  ID:   ${plan.id}`,
           `  Mode: ${plan.mode}`,
@@ -675,14 +743,16 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       };
       ctl.setRepoRoot(repoRoot);
       applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+      let clearHandoff: string;
       try {
-        await ctl.resumePlan(repoRoot);
+        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear');
       } finally {
         ctl.shutdown();
       }
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
       return [
         `Checkpoint "${checkpoint}" cleared.${acceptMsg} Plan "${plan.name}" resuming (intake ${record.id}).`,
+        clearHandoff,
         '',
         `  ID:   ${plan.id}`,
         `  Mode: ${plan.mode}`,
@@ -724,13 +794,15 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     };
     ctl.setRepoRoot(repoRoot);
     applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+    let startHandoff: string;
     try {
-      await ctl.resumePlan(repoRoot);
+      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start');
     } finally {
       ctl.shutdown();
     }
     return [
       `Plan "${plan.name}" approved and started (intake ${record.id}).`,
+      startHandoff,
       '',
       `  ID:   ${plan.id}`,
       `  Mode: ${plan.mode}`,
@@ -769,8 +841,27 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
       });
     });
   const progress = await withRepoRoot(repoRoot, async () => resumeFn(record.id));
+  // R04: verifiable handoff — `resume` stays as coordinator while driving an
+  // active plan, so verify what is actually live and persist the transfer.
+  const handoff = await withRepoRoot(repoRoot, async () => {
+    const plan = await loadPlan(repoRoot).catch(() => null);
+    let line: string;
+    if (!plan) {
+      line = `resume: no active plan in ${repoRoot} — nothing to conduct (intake ${record.id} kept).`;
+    } else if (plan.status === 'paused' || plan.checkpoint) {
+      line = `resume: pause respected (plan ${plan.id} [${plan.status}]) — returning without dispatch, approve to continue.`;
+    } else if (plan.status === 'completed' || plan.status === 'failed' || plan.status === 'canceled') {
+      line = `resume: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report.`;
+    } else {
+      const running = plan.jobs.filter((j) => j.status === 'running' || j.status === 'merging').length;
+      line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
+    }
+    await appendAutoDecision(record.id, `handoff: ${line}`).catch(() => {});
+    return line;
+  }).catch(() => '');
   return [
     `Resumed intake ${record.id} without new JSON (no duplicated workers, no reintegration).`,
+    handoff,
     progress,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }

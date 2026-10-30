@@ -5,8 +5,8 @@ import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validat
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
-import { MergeTrain, checkMergeability, detectTestCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
-import { type ReviewVerdict } from './reviewer';
+import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
+import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type TestEvidence } from './reviewer';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
 import { JobMonitor } from './monitor';
@@ -36,6 +36,7 @@ import {
   ensureBaseReady,
   draftToJobSpecs,
   validateRuntimeDecision,
+  requiresUserReview,
   loadContextDocs,
   formatContextDocsForPrompt,
   nextStepsFor,
@@ -62,22 +63,30 @@ import {
 } from './durable-state';
 
 /**
- * Parse a "provider/model" snapshot string into a model ref.
- * The variant is never present in the string form (model-tracker stores
- * provider/modelID only), so it stays unset — but a V2ModelRef snapshot
- * set programmatically keeps its variant untouched (pin triple).
+ * Parse a "provider/model[#variant]" snapshot string into a model ref.
+ * The `#variant` suffix is the `opencode run --model` pin form (preserved
+ * end to end by the planner slot); a bare "provider/model" simply yields no
+ * variant. String snapshots without a slash keep provider "unknown".
  */
 export function parseModelRef(raw: string): V2ModelRef | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
-  const slash = trimmed.indexOf('/');
-  if (slash > 0) {
-    return { providerID: trimmed.slice(0, slash), id: trimmed.slice(slash + 1) };
-  }
-  return { providerID: 'unknown', id: trimmed };
+  const hash = trimmed.indexOf('#');
+  const base = hash > 0 ? trimmed.slice(0, hash) : trimmed;
+  const variant = hash > 0 ? trimmed.slice(hash + 1).trim() : undefined;
+  const slash = base.indexOf('/');
+  const ref = slash > 0
+    ? { providerID: base.slice(0, slash), id: base.slice(slash + 1) }
+    : { providerID: 'unknown', id: base };
+  return variant ? { ...ref, variant } : ref;
 }
 
-/** Format a model ref for the `opencode -m` CLI flag (variant has no CLI form). */
+/**
+ * Format a model ref WITHOUT variant (persistence/snapshot-string form).
+ * The argv pin form WITH variant lives in auto-plan's formatModelRefForArgv
+ * (`opencode run --model provider/id#variant`). Kept variant-less here:
+ * the intake persists the variant in its own effectiveVariant field.
+ */
 export function modelRefToCliString(ref: V2ModelRef): string {
   return `${ref.providerID}/${ref.id}`;
 }
@@ -280,6 +289,16 @@ export class Orchestrator {
   private approvedForMerge = new Set<string>();
   private firstJobCompleted = false;
   /**
+   * R01: bounded autonomous fix-loop state per job (diagnostic → worker
+   * instruction → reverification). attempts counts correction dispatches;
+   * lastSignature detects no-progress repeats. Cleared on pass.
+   */
+  private reviewAttempts = new Map<string, { attempts: number; lastSignature: string }>();
+  /** R01: job whose latest review dispatched an autonomous correction (merge skips pause for it). */
+  private lastReviewAutoFix: string | null = null;
+  /** R01: autonomous correction dispatches before escalating to the user. */
+  private static readonly REVIEW_MAX_AUTO_FIX = 2;
+  /**
    * F02: explicit repo root for this execution (canonical path).
    * All git/worktree/state/lock/monitor/report paths resolve through it —
    * never bare cwd, never global chdir.
@@ -315,6 +334,30 @@ export class Orchestrator {
   /** F04: effective testCommand (ceiling wins when applied, else config). */
   getEffectiveTestCommand(): string | undefined {
     return (this.config as MCConfig & { testCommand?: string }).testCommand;
+  }
+
+  /**
+   * R05: real install/usage notes (observed, never invented). Reports the
+   * detected install command for the integration worktree labeled as
+   * detected-not-executed, plus the effective test command as the usage
+   * entry. Never reduces install/usage to the test command alone.
+   */
+  private async detectInstallNotes(worktree?: string): Promise<string[]> {
+    const notes: string[] = [];
+    if (worktree) {
+      try {
+        const install = await detectInstallCommand(worktree).catch(() => null);
+        if (install) {
+          notes.push(`install (detected, not executed here): ${install}`);
+        } else {
+          const hasPackageJson = await Bun.file(`${worktree}/package.json`).exists().catch(() => false);
+          if (hasPackageJson) notes.push('install: package.json present but no install command detected (bun install is the default guess, not executed)');
+        }
+      } catch {}
+    }
+    const testCmd = this.getEffectiveTestCommand();
+    if (testCmd) notes.push(`usage: run tests with \`${testCmd}\``);
+    return notes;
   }
 
   /** F04: validate + apply ceiling to this execution's config (used by all components). */
@@ -499,15 +542,18 @@ export class Orchestrator {
   }
 
   /**
-   * Per-task gate on the real approval path: structural-only (diff pins).
-   * No repo-wide probe pre-merge (it fails deterministically without the
-   * job's own change); no verbatim acceptance anchors on runner stdout.
-   * The global test runs once post-all-merged (final verification,
-   * fail-closed). Persistent structural failure (empty diff) blocks
-   * integration — the reconciler pauses with on_error so correction is
-   * requested via mc_plan_approve, never merged.
+   * R01: per-task functional gate on the real approval path. NEVER passes on
+   * diff alone: derives requirements from the task's acceptance criteria,
+   * inspects implementation + tests, runs task-scoped verification (the test
+   * command in a candidate worktree at the job HEAD — never the repo-wide
+   * gate, which runs once post-all-merged), and judges coverage via reviewJob
+   * on product-observed evidence (a green suite that does not exercise the
+   * requirement fails). Bounded fix loop (diagnostic → worker instruction →
+   * reverification, capped attempts + no-progress detection); escalates to the
+   * user only on reserved decisions or grounded impediments.
    */
   private async reviewJobWithFixLoop(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
+    this.lastReviewAutoFix = null;
     const pins = await this.buildStructuralPins(job, plan);
     if (pins.changedFiles.length === 0) {
       return {
@@ -519,32 +565,288 @@ export class Orchestrator {
         reviewedBase: pins.baseHead,
       };
     }
-    const verdict: ReviewVerdict = {
-      verdict: 'pass',
-      blocking: false,
-      reasons: [],
+    const requirements = requirementsFromAcceptance(job.name, job.prompt ?? '');
+    // Manual-plan fallback (documented rule): a prompt WITHOUT `- [ ]`
+    // acceptance lines carries no criterion to judge coverage against, so the
+    // artificial fallback anchor is NOT graded — grading absence-of-criteria
+    // would make every manual merge impossible. The gate still requires
+    // product-observed test evidence (command + exit 0 + output + commit on
+    // the candidate — never diff alone); the pass is recorded acceptanceLess
+    // so the report keeps the job out of Verified and under Gaps ("merged
+    // without acceptance criteria"). Autonomous plans always carry acceptance
+    // and keep the strict anchor rule.
+    const acceptanceLess = !hasAcceptanceCriteria(job.prompt ?? '');
+    const gradedRequirements = acceptanceLess ? [] : requirements;
+    const touchSet = job.touchSet?.length ? [...job.touchSet] : undefined;
+    const baseInput: ReviewInput = {
       jobName: job.name,
-      reviewedCommit: pins.jobHead,
-      reviewedBase: pins.baseHead,
+      jobBranch: job.branch ?? '',
+      baseBranch: plan.integrationBranch,
+      baseHead: pins.baseHead,
+      jobHead: pins.jobHead,
+      changedFiles: pins.changedFiles,
+      ...(touchSet ? { touchSet } : {}),
+      requirements: gradedRequirements,
+      evidence: null,
+      claimedPass: true,
     };
-    try {
-      const snap = await loadRuntimeSnapshot().catch(() => null);
-      const intakeId = snap?.autoIntake?.id;
-      if (intakeId) {
-        await appendAutoDecision(intakeId, `review ${job.name}: pass (structural pre-merge; repo-wide gate deferred to final integration verification)`).catch(() => {});
+    // Inline evidence cycle: review → gather product-observed evidence →
+    // re-review, bounded with quarantine on repeating signatures.
+    let observed: TestEvidence | null = null;
+    const loop = await runReviewFixLoop({
+      input: baseInput,
+      options: { maxFixCycles: 1, backoffMs: 0, quarantineAfterRepeats: 2 },
+      review: (input) => reviewJob(input),
+      fix: async (_attempt, _last, input) => {
+        // Evidence present but insufficient: needs a worker, not another probe.
+        if (input.evidence) return null;
+        const evidence = await this.gatherScopeEvidence(job, pins.jobHead, plan.integrationBranch).catch(() => null);
+        if (!evidence) return null; // grounded impediment: surface the fail, escalate downstream
+        observed = evidence;
+        return { ...input, evidence };
+      },
+      sleep: async () => {},
+    });
+    if (loop.quarantined) {
+      return {
+        ...loop.verdict,
+        reasons: [...loop.verdict.reasons, 'review quarantined: same failure signature repeats (no progress) — escalating'],
+      };
+    }
+    if (loop.verdict.verdict === 'pass') {
+      this.reviewAttempts.delete(job.name);
+      // Conserve task-scoped evidence (merged, never replaced) so the final
+      // report verifies this job without the global smoke.
+      try {
+        await saveMergeEvidence({
+          jobName: job.name,
+          mergedAt: new Date().toISOString(),
+          reviewedCommit: pins.jobHead,
+          reviewedBase: pins.baseHead,
+          changedFiles: pins.changedFiles,
+          testCommand: observed?.command,
+          testStatus: observed ? 'passed' : 'skipped',
+          ...(observed?.output ? { testOutput: observed.output } : {}),
+          scope: 'task',
+          ...(acceptanceLess ? { acceptanceLess: true } : {}),
+        }).catch(() => {});
+      } catch {}
+      try {
+        const snap = await loadRuntimeSnapshot().catch(() => null);
+        const intakeId = snap?.autoIntake?.id;
+        if (intakeId) {
+          await appendAutoDecision(intakeId, `review ${job.name}: pass (${acceptanceLess ? 'MANUAL fallback — no acceptance criteria; scoped evidence only' : 'functional'}, scoped ${observed?.command ?? 'no-command'} @ ${pins.jobHead.slice(0, 8)})`).catch(() => {});
+        }
+      } catch {}
+      return {
+        verdict: 'pass',
+        blocking: false,
+        reasons: [],
+        jobName: job.name,
+        reviewedCommit: pins.jobHead,
+        reviewedBase: pins.baseHead,
+      };
+    }
+    // Fail: decide autonomous correction vs escalation.
+    const signature = [...loop.verdict.reasons].sort().join('\n');
+    const prev = this.reviewAttempts.get(job.name) ?? { attempts: 0, lastSignature: '' };
+    const noProgress = prev.lastSignature !== '' && prev.lastSignature === signature;
+    const reasonsText = loop.verdict.reasons.join(' ');
+    const reserved =
+      requiresUserReview(reasonsText) ||
+      /touchSet violation|missing test command|missing execution environment|tested code diverges|no test command exists/i.test(reasonsText);
+    const canRelaunch = Boolean(job.branch && job.worktreePath);
+    if (!reserved && !noProgress && prev.attempts < Orchestrator.REVIEW_MAX_AUTO_FIX && canRelaunch) {
+      const instruction = this.buildFunctionalCorrection(job, gradedRequirements, pins.changedFiles, loop.verdict.reasons);
+      try {
+        await updatePlanJob(plan.id, job.name, {
+          status: 'failed',
+          error: `Functional review failed: ${loop.verdict.reasons.join('; ').slice(0, 500)}`,
+          prompt: `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`,
+        });
+        job.status = 'failed';
+        job.prompt = `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`;
+        await this.relaunchJobForCorrection(job.name, [], [], {
+          functional: { title: 'CORRECTION TASK — Functional review failed', body: instruction },
+        });
+        job.status = 'running';
+        this.reviewAttempts.set(job.name, { attempts: prev.attempts + 1, lastSignature: signature });
+        this.lastReviewAutoFix = job.name;
+        try {
+          const snap = await loadRuntimeSnapshot().catch(() => null);
+          const intakeId = snap?.autoIntake?.id;
+          if (intakeId) {
+            await appendAutoDecision(intakeId, `review ${job.name}: fail (${loop.verdict.reasons.length} reason(s)) — auto-fix attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched`).catch(() => {});
+          }
+        } catch {}
+        return {
+          verdict: 'fail',
+          blocking: true,
+          reasons: [...loop.verdict.reasons, `auto-fix attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched: worker re-oriented, merge deferred (no pause)`],
+          jobName: job.name,
+          reviewedCommit: pins.jobHead,
+          reviewedBase: pins.baseHead,
+        };
+      } catch (error) {
+        // Relaunch itself failed: grounded impediment, escalate explicitly.
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          verdict: 'fail',
+          blocking: true,
+          reasons: [...loop.verdict.reasons, `auto-fix dispatch failed (grounded impediment): ${msg}`],
+          jobName: job.name,
+          reviewedCommit: pins.jobHead,
+          reviewedBase: pins.baseHead,
+        };
       }
-    } catch {}
-    return verdict;
+    }
+    if (noProgress) {
+      loop.verdict.reasons.push('no progress: same failure signature as the previous attempt — escalating');
+    } else if (prev.attempts >= Orchestrator.REVIEW_MAX_AUTO_FIX) {
+      loop.verdict.reasons.push(`auto-fix budget exhausted (${prev.attempts}/${Orchestrator.REVIEW_MAX_AUTO_FIX}) — escalating`);
+    }
+    return loop.verdict;
   }
 
   /**
-   * F08: conclude integration locally on the destination branch.
+   * R01: product-observed scoped verification. Runs the effective test
+   * command in a candidate worktree and returns evidence built by the
+   * product — never a worker claim. Two scopes, in order:
+   *  1. job scope: the job's own worktree (or a temporary detached
+   *     worktree at the job HEAD);
+   *  2. integration candidate: a temporary worktree at the integration
+   *     branch with the job's changes merged in (temp area, discarded
+   *     afterwards) — the appropriate scope for aggregator tasks whose
+   *     isolated probe fails deterministically without siblings.
+   * A pass in either scope verifies the candidate; both failing returns
+   * combined failing evidence for the diagnosis. Null only when no command
+   * can be resolved or executed (grounded impediment).
+   */
+  private async gatherScopeEvidence(job: JobSpec, jobHead: string, integrationBranch: string): Promise<TestEvidence | null> {
+    const repoRoot = this.effectiveRepoRoot();
+    const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
+    const configured = this.getEffectiveTestCommand();
+    const tempDirs: string[] = [];
+    const makeTemp = async (prefix: string): Promise<string> => {
+      const { mkdtempSync } = await import('fs');
+      const { tmpdir } = await import('os');
+      const { join } = await import('path');
+      const dir = mkdtempSync(join(tmpdir(), prefix));
+      tempDirs.push(dir);
+      return dir;
+    };
+    const cleanup = async (): Promise<void> => {
+      for (const dir of tempDirs.splice(0)) {
+        await gitCommand(['worktree', 'remove', '--force', dir], { cwd: repoRoot }).catch(() => {});
+      }
+    };
+    try {
+      // Scope 1: job tree.
+      let jobCandidate = job.worktreePath;
+      if (jobCandidate) {
+        const probe = await gitCommand(['-C', jobCandidate, 'rev-parse', '--git-dir']);
+        if (probe.exitCode !== 0) jobCandidate = undefined;
+      }
+      if (!jobCandidate) {
+        const base = await makeTemp('mc-review-job-');
+        const add = await gitCommand(['worktree', 'add', '--detach', base, jobHead], { cwd: repoRoot });
+        if (add.exitCode !== 0) return null;
+        jobCandidate = base;
+      }
+      const cmdA = configured ?? await detectTestCommand(jobCandidate);
+      let evidenceA: TestEvidence | null = null;
+      if (cmdA) {
+        const result = await runTestCommand(jobCandidate, cmdA, timeout);
+        evidenceA = this.toScopeEvidence(cmdA, result, jobHead, `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`);
+        if (result.success) return evidenceA;
+      }
+      // Scope 2: integration candidate (base + job changes, temp area).
+      const candidateDir = await makeTemp('mc-review-int-');
+      const addB = await gitCommand(['worktree', 'add', '--detach', candidateDir, integrationBranch], { cwd: repoRoot });
+      if (addB.exitCode !== 0) return evidenceA;
+      const mergeB = await gitCommand(['merge', '--no-ff', '--no-edit', jobHead], { cwd: candidateDir });
+      if (mergeB.exitCode !== 0) {
+        await gitCommand(['merge', '--abort'], { cwd: candidateDir }).catch(() => {});
+        return evidenceA;
+      }
+      const cmdB = configured ?? await detectTestCommand(candidateDir);
+      if (!cmdB) return evidenceA;
+      const resultB = await runTestCommand(candidateDir, cmdB, timeout);
+      const evidenceB = this.toScopeEvidence(
+        cmdB,
+        resultB,
+        jobHead,
+        `integration-candidate:${candidateDir} (base ${integrationBranch} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
+      );
+      if (resultB.success) return evidenceB;
+      // Both scopes failed: combined evidence so the diagnosis names both.
+      if (evidenceA) {
+        return {
+          ...evidenceB,
+          output: `[job scope] ${cmdA}\n${evidenceA.output}\n\n[integration candidate] ${cmdB}\n${evidenceB.output}`.slice(0, 8000),
+        };
+      }
+      return evidenceB;
+    } finally {
+      await cleanup();
+    }
+  }
+
+  private toScopeEvidence(
+    command: string,
+    result: { success: boolean; output: string; timedOut: boolean },
+    jobHead: string,
+    environment: string,
+  ): TestEvidence {
+    const output = `${result.timedOut ? '[timed out] ' : ''}${result.output}`.slice(0, 8000).trim()
+      || `(no output; ${result.success ? 'exit 0' : 'non-zero exit'})`;
+    return { command, exitCode: result.success ? 0 : 1, output, testedCommit: jobHead, environment };
+  }
+
+  /**
+   * R01: worker instruction for a functional review failure. Names the failing
+   * reasons, the requirements (with the anchors the test output must show),
+   * and the changed scope — never a bare "fix it".
+   */
+  private buildFunctionalCorrection(
+    job: JobSpec,
+    requirements: EssentialRequirement[],
+    changedFiles: string[],
+    diagnosis: string[],
+  ): string {
+    const isTest = (f: string) => /test|spec|__tests__|\.test\.|\.spec\./i.test(f);
+    const impl = changedFiles.filter((f) => !isTest(f));
+    const testFiles = changedFiles.filter(isTest);
+    return [
+      `The previous work on branch "${job.branch ?? '(unknown)'}" did not pass functional review:`,
+      ...diagnosis.map((d) => `- ${d}`),
+      ``,
+      `Requirements that must hold (test output must visibly show each anchor):`,
+      ...requirements.map((r) => `- ${r.id}: ${r.description} (show: ${r.testAnchors.join(' / ')})`),
+      ...(impl.length > 0 ? [`Changed implementation files: ${impl.join(', ')}`] : []),
+      ...(testFiles.length > 0
+        ? [`Changed test files: ${testFiles.join(', ')}`]
+        : [`No test file was changed — add or extend tests that exercise the requirements above.`]),
+      `Instructions:`,
+      `1. Fix the implementation and/or tests on this branch so every requirement above is visibly exercised by the test output (name tests after the requirement).`,
+      `2. Do NOT weaken tests to force approval: if a previous test was wrong, record why in the commit message.`,
+      `3. Commit your corrections and report completion.`,
+    ].join('\n');
+  }
+
+  /**
+   * F08/R08: conclude integration locally on the destination branch.
    * After verifications, the destination (baseBranch or default) receives
    * the integration branch WITHOUT push/PR. Protects preexisting changes
    * (dirty tree refuses), and re-verifies with the test command when the
-   * destination advanced since the plan base. Test-only fakes (unknown
-   * branches in a non-repo worktree) return null to preserve the legacy
-   * PR path in unit tests; real repos enforce strictly.
+   * destination advanced since the plan base.
+   * R08: the candidate is verified BEFORE the destination ref moves, and ANY
+   * failure after the ref moved rolls the destination back to its recorded
+   * HEAD (restoring the checkout alone never undoes a merge). The reset only
+   * ever targets the recorded pre-merge destination HEAD — never an
+   * uncontrolled reset — and the original checkout is always restored.
+   * Test-only fakes (unknown branches in a non-repo worktree) return null to
+   * preserve the legacy PR path in unit tests; real repos enforce strictly.
    */
   private async completeLocalDestination(plan: PlanSpec): Promise<{
     destinationBranch: string;
@@ -576,7 +878,20 @@ export class Orchestrator {
     if (checkoutDest.exitCode !== 0) {
       throw new Error(`Cannot checkout destination "${destination}": ${checkoutDest.stderr || checkoutDest.stdout}`);
     }
+    const recordedDestHead = destHead.head;
+    let merged = false;
     try {
+      // R08 preflight: when the destination advanced since the plan base, the
+      // re-verification command must resolve BEFORE the ref moves — a missing
+      // command refuses completion without touching the destination.
+      const advanced = recordedDestHead !== plan.baseCommit;
+      if (advanced) {
+        const preConfigured = this.getEffectiveTestCommand();
+        const preCmd = preConfigured ?? await detectTestCommand(repoRoot);
+        if (!preCmd) {
+          throw new Error('Destination advanced since plan base but no test command exists to reverify — refusing to complete (destination untouched)');
+        }
+      }
       const mergeRes = await gitCommand(
         ['merge', '--no-ff', '-m', `Merge ${integrationBranch} (local autonomous completion)`, integrationBranch],
         { cwd: repoRoot },
@@ -585,8 +900,9 @@ export class Orchestrator {
         await gitCommand(['merge', '--abort'], { cwd: repoRoot }).catch(() => {});
         throw new Error(`Local destination merge conflicts (${destination} <- ${integrationBranch}): ${mergeRes.stderr || mergeRes.stdout}`);
       }
+      merged = true;
       let reverified = false;
-      if (destHead.head !== plan.baseCommit) {
+      if (advanced) {
         // Destination advanced since the plan base: re-run tests on the merged tree.
         const configured = this.getEffectiveTestCommand();
         const cmd = configured ?? await detectTestCommand(repoRoot);
@@ -597,14 +913,18 @@ export class Orchestrator {
         const retest = await runTestCommand(repoRoot, cmd, timeout);
         reverified = true;
         if (!retest.success) {
-          await gitCommand(['reset', '--hard', destHead.head], { cwd: repoRoot }).catch(() => {});
           throw new Error(`Reverification on advanced destination failed (${cmd}): ${retest.output.slice(0, 500)}`);
         }
       }
       const newHead = await gitCommand(['rev-parse', 'HEAD'], { cwd: repoRoot });
       return { destinationBranch: destination, destinationHead: newHead.stdout.trim(), integratedHead: intHead.head, reverified };
     } catch (e) {
-      // Restore the original checkout on failure (best-effort).
+      // R08 rollback: any failure after the ref moved restores the recorded
+      // destination HEAD (checkout restore alone never undoes a merge).
+      if (merged) {
+        await gitCommand(['reset', '--hard', recordedDestHead], { cwd: repoRoot }).catch(() => {});
+      }
+      // Restore the original checkout (best-effort).
       if (original && original !== destination) {
         await gitCommand(['checkout', original], { cwd: repoRoot }).catch(() => {});
       }
@@ -673,29 +993,88 @@ export class Orchestrator {
         .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
         .map((job) => job.name);
       const evidenceList = Object.values(mergeEvidence);
-      // Verified = merged AND backed by passing product evidence (command +
-      // exit 0 + observed output). Merged without evidence stays under Gaps.
+      // R05: Verified = merged AND backed by TASK-scoped passing product
+      // evidence (scoped review run on the candidate). Jobs covered only by
+      // the repo-wide integration smoke stay out of Verified — a shared
+      // integration run is one integration test, not per-task verification.
+      // Pins (reviewedCommit/reviewedBase/changedFiles) merge by field, never
+      // reset by the global write.
+      type EvidenceView = { testStatus?: string; scope?: string; testCommand?: string; reviewedCommit?: string; acceptanceLess?: boolean };
+      const evOf = (name: string): EvidenceView => (mergeEvidence as Record<string, EvidenceView>)[name] ?? {};
+      const taskVerified = (name: string): boolean => {
+        const rec = evOf(name);
+        // Manual fallback (no acceptance criteria) never verifies: evidence
+        // allowed the merge, but there was no criterion to judge coverage.
+        return rec.testStatus === 'passed' && rec.scope === 'task' && Boolean(rec.reviewedCommit) && !rec.acceptanceLess;
+      };
+      const acceptanceLessEntries = merged
+        .filter((name) => evOf(name).acceptanceLess)
+        .map((name) => `${name} [merged] — no acceptance criteria defined, outcome not verified by criterion`);
       const verified = merged
-        .filter((name) => {
-          const rec = (mergeEvidence as Record<string, { testStatus?: string }>)[name];
-          return rec?.testStatus === 'passed';
-        })
+        .filter(taskVerified)
         .map((name) => {
-          const rec = (mergeEvidence as Record<string, { testCommand?: string; reviewedCommit?: string }>)[name];
-          return `${name} [merged]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+          const rec = evOf(name);
+          return `${name} [merged, task-scoped]${rec.testCommand ? ` ${rec.testCommand} passed` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+        });
+      const integrationCovered = merged
+        .filter((name) => !taskVerified(name) && evOf(name).testStatus === 'passed')
+        .map((name) => {
+          const rec = evOf(name);
+          return `${name} [merged] — covered only by global integration smoke${rec.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
         });
       const unmet = plan.jobs
         .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
         .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
-      const unverified = plan.jobs
-        .filter((job) => job.status !== 'merged')
-        .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
-        .map((job) => `${job.name} [${job.status}] — outcome not verified`);
+      // R05: Gaps also surface pending human decisions and requirements
+      // without integrated work — a complement awaiting decision blocks
+      // acceptance of its requirement.
+      let pendingQuestions: string[] = [];
+      try {
+        const persisted = snap?.pendingQuestions ?? [];
+        pendingQuestions = [
+          ...(intake?.questions ?? []),
+          ...persisted.map((q) => `[${q.jobId}] ${q.question}`),
+        ];
+      } catch {
+        pendingQuestions = [...(intake?.questions ?? [])];
+      }
+      const mergedPrompts = plan.jobs
+        .filter((job) => job.status === 'merged')
+        .map((job) => job.prompt ?? '');
+      // A requirement is met only when some merged job carries one of its
+      // acceptance anchors (tasks embed acceptance verbatim at launch).
+      const unmetRequirements = (intake?.requirements ?? [])
+        .filter((r) => {
+          const needles = [...(r.acceptance ?? []), r.id].map((s) => s.trim()).filter(Boolean);
+          if (needles.length === 0) {
+            const probe = r.text.trim().toLowerCase().slice(0, 40);
+            return !probe || !mergedPrompts.some((p) => p.toLowerCase().includes(probe));
+          }
+          return !needles.some((n) => mergedPrompts.some((p) => p.includes(n)));
+        })
+        .map((r) => `requirement "${r.id}" without merged work: ${r.text}`);
+      const pendingGaps = pendingQuestions.map((q) => `pending human decision (blocks acceptance): ${q}`);
+      const unverified = [
+        ...plan.jobs
+          .filter((job) => job.status !== 'merged')
+          .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
+          .map((job) => `${job.name} [${job.status}] — outcome not verified`),
+        ...integrationCovered.map((entry) => `${entry}`),
+        ...acceptanceLessEntries.map((entry) => `${entry}`),
+        ...unmetRequirements.map((entry) => `${entry}`),
+        ...pendingGaps,
+      ];
       const files = [...new Set(evidenceList.flatMap((r) => r.changedFiles ?? []))];
-      const installUsage = [...new Set(evidenceList.flatMap((r) => [...(r.setupCommands ?? []), ...(r.testCommand ? [r.testCommand] : [])]))];
+      const configuredCmd = this.getEffectiveTestCommand();
+      const installNotes = await this.detectInstallNotes(plan.integrationWorktree).catch(() => [] as string[]);
+      const installUsage = [...new Set([
+        ...installNotes,
+        ...evidenceList.flatMap((r) => [...(r.setupCommands ?? []), ...(r.testCommand ? [r.testCommand] : [])]),
+        ...(configuredCmd && !evidenceList.some((r) => r.testCommand === configuredCmd) ? [`configured test command (not yet executed in this run): ${configuredCmd}`] : []),
+      ])];
       const tests = evidenceList
         .filter((r) => r.testCommand)
-        .map((r) => ({ command: r.testCommand!, result: r.testStatus, output: r.testOutput }));
+        .map((r) => ({ command: `${r.scope === 'integration' ? '[integration] ' : r.scope === 'task' ? '[task] ' : ''}${r.testCommand!}`, result: r.testStatus, output: r.testOutput }));
       const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
       const markdown = buildFinalReportMarkdown({
         title: plan.name,
@@ -780,12 +1159,16 @@ export class Orchestrator {
     if (this.planModelSnapshot) return { ...this.planModelSnapshot };
     // Single effective resolution (env → tracked → config): same chain as the
     // planner, never unknown/unknown silently. Fallback warns explicitly.
+    // The env string may carry #variant (parsed by parseModelRef); the tracked
+    // lookup is session-scoped when the plan knows its launching session
+    // (tools/plan+launch read the same session), falling back to the global
+    // tracked model otherwise — identical behavior when untracked.
     const env = process.env.MC_PLANNER_MODEL?.trim();
     if (env) {
       const parsed = parseModelRef(env);
       if (parsed) return parsed;
     }
-    const ref = getCurrentModelRef();
+    const ref = getCurrentModelRef(this.planLaunchSessionID);
     if (ref) return { ...ref };
     console.warn(
       '[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).',
@@ -1364,6 +1747,13 @@ export class Orchestrator {
         plan.status = 'merging';
 
         const nextJob = this.mergeTrain.getQueue()[0];
+        // R01: a head job whose correction worker is still fixing (status left
+        // 'running' by an autonomous review fix) must not be re-reviewed yet —
+        // defer this pass; reverification happens when it reports again.
+        const headNow = byName.get(nextJob.name) ?? nextJob;
+        if (headNow.status !== 'merging' && headNow.status !== 'ready_to_merge') {
+          return;
+        }
         this.showToast('Mission Control', `Merging job "${nextJob.name}"...`, 'info');
         this.notify(`⇄ Merging job "${nextJob.name}" into integration branch...`);
         // Per-task gate is structural-only (diff pins via
@@ -1386,6 +1776,16 @@ export class Orchestrator {
             this.showToast('Mission Control', `Job "${nextJob.name}" blocked by review. Plan paused.`, 'error');
             this.notify(`❌ Job "${nextJob.name}" blocked by review: ${msg}. Fix the branch and retry with mc_plan_approve(checkpoint: "on_error", retry: "${nextJob.name}").`);
             await this.setCheckpoint('on_error', plan, { jobName: nextJob.name, failureKind: 'test_failure' });
+            return;
+          }
+          // R01: autonomous correction dispatched (worker re-oriented, bounded
+          // attempts left) — defer the merge WITHOUT pausing. Escalations
+          // (reserved/no-progress/exhausted) fall through to the pause below.
+          if (this.lastReviewAutoFix === nextJob.name) {
+            const current = byName.get(nextJob.name);
+            if (current) current.status = 'running';
+            this.showToast('Mission Control', `Job "${nextJob.name}" review failed — correction dispatched.`, 'warning');
+            this.notify(`🔧 Job "${nextJob.name}" failed functional review; a correction worker was dispatched (bounded fix loop, no pause). Merge deferred until it reports again.`);
             return;
           }
           if (!verdict || verdict.verdict !== 'pass' || verdict.blocking) {
@@ -1532,23 +1932,24 @@ export class Orchestrator {
           }
           // Final gate passed where it can pass (integration, all siblings):
           // conserve product-observed evidence so the final report lists real
-          // commands/outputs instead of empties. Scoped merges that deferred
-          // their per-merge run are now verified by this combined run.
+          // commands/outputs instead of empties. R05: this run is INTEGRATION
+          // evidence — it never promotes a job to Verified and never erases
+          // task-scoped pins (merge by field). Jobs already verified by their
+          // task-scoped review keep that evidence untouched.
           try {
             const { loadMergeEvidence } = await import('./durable-state');
             const existing = await loadMergeEvidence().catch(() => ({}));
             for (const job of latestPlan.jobs) {
-              const prev = (existing as Record<string, { testStatus?: string }>)[job.name];
-              if (!prev || prev.testStatus !== 'passed') {
-                await saveMergeEvidence({
-                  jobName: job.name,
-                  mergedAt: job.mergedAt ?? new Date().toISOString(),
-                  changedFiles: undefined,
-                  testCommand: verifyCommand,
-                  testStatus: 'passed',
-                  testOutput: verifyResult.output || undefined,
-                }).catch(() => {});
-              }
+              const prev = (existing as Record<string, { testStatus?: string; scope?: string }>)[job.name];
+              if (prev && prev.testStatus === 'passed' && prev.scope === 'task') continue;
+              await saveMergeEvidence({
+                jobName: job.name,
+                mergedAt: job.mergedAt ?? new Date().toISOString(),
+                testCommand: verifyCommand,
+                testStatus: 'passed',
+                testOutput: verifyResult.output || undefined,
+                scope: 'integration',
+              }).catch(() => {});
             }
           } catch {}
           try {
@@ -1864,6 +2265,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     jobName: string,
     violations: string[],
     touchSetPatterns: string[],
+    opts?: { functional?: { title: string; body: string } },
   ): Promise<void> {
     const plan = await loadPlan(this.effectiveRepoRoot());
     if (!plan) {
@@ -1908,8 +2310,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
 
     // Build correction prompt with context from the original task
-    const correctionPrompt =
-      `CORRECTION TASK — TouchSet Violation\n\n` +
+    const correctionPrompt = opts?.functional
+      ? `${opts.functional.title}\n\nThe previous task in this worktree was:\n"${job.prompt}"\n\n${opts.functional.body}`
+      : `CORRECTION TASK — TouchSet Violation\n\n` +
       `The previous task in this worktree was:\n"${job.prompt}"\n\n` +
       `It completed successfully but modified files outside the allowed scope.\n\n` +
       `Violations (files you must revert):\n${violations.map((v) => `  - ${v}`).join('\n')}\n\n` +
@@ -2166,15 +2569,20 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     return await withRepoRoot(repoRoot, async () => {
       this.repoRoot = repoRoot;
       this.applyCeiling(validCeiling);
-      // F07: persist before long ops — crash during planner/base still resumes.
-      const preId = randomUUID();
+      // R04: stable identity + full entry BEFORE long ops — the pre-generate
+      // record already carries request/repo/docs/contextDocs/config/model so
+      // a crash during planner/base still resumes the complete entry, and the
+      // id never changes after generation (intakeId pinned through retry).
+      const stableId = randomUUID();
       const preNow = new Date().toISOString();
       await saveAutoIntake({
-        id: preId,
+        id: stableId,
         request: enrichedInput.request,
         repo: repoRoot,
         targetBranch: enrichedInput.targetBranch,
         ceiling: Object.keys(validCeiling).length > 0 ? validCeiling : enrichedInput.ceiling,
+        docs: enrichedInput.docs,
+        contextDocs: loadedDocs,
         requirements: [],
         decisions: [`effective model ${effectiveStr}${effective.variant ? ` (variant ${effective.variant})` : ''} resolved once for planner+workers`],
         questions: [],
@@ -2189,6 +2597,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const { intake, draft, attempts } = await runAutoIntakeWithRetry(enrichedInput, generate, {
         maxAttempts: 3,
         baseDelayMs: 1000,
+        intakeId: stableId,
       });
       // Re-anchor the early record to the real intake id (same request, no fork).
       const base = await ensureBaseReady(repoRoot, input.targetBranch);
@@ -2284,6 +2693,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
    * never reintegrates merged work. Never touches user sessions.
    * F07: public boot reconciles (reconcileOnBoot), awaiting-plan generates,
    * merging/creating_pr reativa, messages distinguish retomou/aguardou/inconsistência.
+   * R04: the intake↔plan link (planId) is verified before driving anything;
+   * completed is reported as terminal (never "reativado"); the awaiting-plan
+   * regeneration replaces the pending requirements with the new draft.
    */
   async resumeAutonomousIntake(intakeId: string, generate?: PlannerGenerate): Promise<string> {
     // Cross-repo search (third-folder resume): active scope first, then XDG scan.
@@ -2345,7 +2757,18 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           };
           if (tgt) spec.baseBranch = base.baseBranch;
           await this.startPlan(spec, { repoRoot });
-          await saveAutoIntake({ ...record!, planId: spec.id, status: 'running', updatedAt: now }).catch(() => {});
+          // R04: the regenerated draft REPLACES the pending requirements (never
+          // keeps the empty pre-plan list while a plan exists for it).
+          await saveAutoIntake({
+            ...record!,
+            planId: spec.id,
+            requirements: draft.requirements.map((r) => ({ ...r })),
+            decisions: [...(record!.decisions ?? []), ...draft.decisions],
+            questions: [...(record!.questions ?? []), ...draft.questions],
+            nextSteps: nextStepsFor(draft),
+            status: 'running',
+            updatedAt: now,
+          }).catch(() => {});
           await appendAutoDecision(record!.id, `resumed by generating plan ${spec.id} from awaiting-plan (attempts ${attempts})`).catch(() => {});
           const progress = await this.autonomousProgress(record!.id);
           return [`Resumido: planejamento interrompido gerou plano ${spec.id} (${jobSpecs.length} task(s)).`, progress].join('\n');
@@ -2356,6 +2779,23 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         ].join('\n');
       }
       const beforeStatus = plan.status;
+      // R04: verify the intake↔plan link before driving anything — resuming
+      // the wrong plan (stale disk state from another intake) is refused
+      // explicitly instead of silently advancing it.
+      if (record.planId && plan.id !== record.planId) {
+        return [
+          `Inconsistência: intake ${record.id} aponta para plano ${record.planId}, mas o disco tem plano ${plan.id} (nada despachado, nada reintegrado).`,
+          `Verifique o repo ${record.repo ?? repoRoot} ou gere novamente.`,
+          await this.autonomousProgress(record.id),
+        ].join('\n');
+      }
+      // R04: completed is terminal — report it as completed, never as
+      // "reativado". There is no conductor to restart for a finished run.
+      if (beforeStatus === 'completed') {
+        await appendAutoDecision(record.id, `resume on completed plan ${plan.id}: terminal, no conductor restarted`).catch(() => {});
+        const progress = await this.autonomousProgress(record.id);
+        return [`Concluído: plano ${plan.id} já está completed (terminal, nada a reativar, nada duplicado).`, progress].join('\n');
+      }
       await this.resumePlan(repoRoot);
       await appendAutoDecision(record.id, `resumed via public path (plan ${plan.id}, no new JSON)`).catch(() => {});
       // F11: context preserved — never re-declared from a bare path.
@@ -2404,16 +2844,21 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
   /**
    * Extend the persisted NL request; the same work continues, nothing rebuilds.
-   * F03: complement triggers a real plan revision via the model (same slot as
-   * intake): new requirements persist as a version, new tasks/corrections go
-   * through existing paths (addJob/applyModelAdjustment), pause/decisions are
-   * preserved. Never announces the scheduler before scheduling.
+   * R02: complement triggers a real plan revision via the model (same slot as
+   * intake) WITH the original entry (request/target/ceiling/context docs):
+   * new requirements persist as a version; same-name tasks with changed
+   * content change the work (reoriented in place when not started, linked
+   * correction task when delivered — never silently ignored); new
+   * tasks/corrections go through existing paths
+   * (addJob/applyModelAdjustment); pending proposals persist as open
+   * questions that block acceptance. Pause/decisions are preserved. Never
+   * announces the scheduler before scheduling.
    */
   async complementAutonomousRequest(
     intakeId: string,
     text: string,
     generate?: PlannerGenerate,
-  ): Promise<{ added: string[]; message: string }> {
+  ): Promise<{ added: string[]; updated: string[]; message: string }> {
     let record = await loadAutoIntake(intakeId).catch(() => null);
     if (!record) record = await this.findIntakeAcrossRepos(intakeId).catch(() => null);
     if (!record) {
@@ -2440,7 +2885,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const plan = await loadPlan(repoRoot).catch(() => null);
       if (!plan) {
         await appendAutoDecision(intakeId, `complement (no plan yet): "${followUp.slice(0, 120)}"`).catch(() => {});
-        return { added: [], message: `Complement recorded on intake ${intakeId} (no plan yet, nothing rebuilt).` };
+        return { added: [], updated: [], message: `Complement recorded on intake ${intakeId} (no plan yet, nothing rebuilt).` };
       }
       const paused = plan.status === 'paused' || !!plan.checkpoint;
       if (paused) {
@@ -2448,6 +2893,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         await appendAutoQuestion(intakeId, followUp).catch(() => {});
         return {
           added: [],
+          updated: [],
           message: `Complement recorded on intake ${intakeId} (pause respected, follow-up kept as open question, nothing dispatched).`,
         };
       }
@@ -2462,35 +2908,111 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         } catch {}
         return {
           added: [],
+          updated: [],
           message: `Complement recorded on intake ${intakeId} (reconciler active, no model revision without generate).`,
         };
       }
+      // R02: the revision sees the ORIGINAL entry — updated request, target,
+      // ceiling AND the loaded context docs — never just the follow-up text.
+      // Same-name tasks with changed content change the work (reorient when
+      // not started, linked correction when delivered); nothing is ignored.
+      const ctxDocs = record!.contextDocs ?? [];
       const input: AutoIntakeInput = {
         request: updatedRequest,
         repo: repoRoot,
-        targetBranch: (record as unknown as { targetBranch?: string }).targetBranch,
-        ceiling: (record as unknown as { ceiling?: { maxParallel?: number; testCommand?: string } }).ceiling,
+        targetBranch: record!.targetBranch,
+        ceiling: record!.ceiling,
+        ...(ctxDocs.length > 0 ? { docs: ctxDocs.map((d) => d.content) } : {}),
       };
       const { draft } = await runAutoIntakeWithRetry(input, generate, { maxAttempts: 3, baseDelayMs: 1000 });
       const live = (await loadPlan(repoRoot)) ?? plan;
-      const existing = new Set(live.jobs.map((j) => j.name));
+      const byName = new Map(live.jobs.map((j) => [j.name, j]));
       const added: string[] = [];
+      const updated: string[] = [];
       let needsUser = 0;
+      const promptCore = (prompt: string): string =>
+        prompt.includes('\n\nAcceptance criteria:')
+          ? prompt.split('\n\nAcceptance criteria:')[0].trim()
+          : prompt.trim();
+      const acceptanceBlock = (prompt: string): string =>
+        prompt.includes('\n\nAcceptance criteria:')
+          ? prompt.split('\n\nAcceptance criteria:')[1]
+          : '';
       for (const t of draft.tasks) {
-        if (existing.has(t.name)) continue;
+        const current = byName.get(t.name);
+        if (!current) {
+          // New task: existing path (validated, autonomous or question).
+          const res = await this.applyModelAdjustment(
+            { action: 'add_task', task: { ...t }, reason: followUp },
+            { intakeId },
+          ).catch((e) => ({ route: 'needs-user' as const, message: e instanceof Error ? e.message : String(e) }));
+          if (res.route === 'autonomous') {
+            added.push(t.name);
+            const created = (await loadPlan(repoRoot).catch(() => null))?.jobs.find((j) => j.name === t.name);
+            if (created) byName.set(t.name, created);
+          } else needsUser += 1;
+          continue;
+        }
+        // Same name: compare work content (prompt core + acceptance + deps).
+        const samePrompt = promptCore(current.prompt) === t.prompt.trim();
+        const currentAcceptance = acceptanceBlock(current.prompt)
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => /^-\s*\[\s*\]\s+/.test(l))
+          .map((l) => l.replace(/^-\s*\[\s*\]\s+/, '').trim())
+          .filter((l) => l.length > 0);
+        const nextAcceptance = t.acceptance.map((a) => a.trim()).filter((a) => a.length > 0);
+        // Set equality BOTH ways: adding AND removing a criterion change the
+        // work. A one-way subset check silently drops removals (the draft
+        // without the criterion still matches) and the loop skips the update.
+        const sameAcceptance =
+          currentAcceptance.length === nextAcceptance.length &&
+          nextAcceptance.every((a) => currentAcceptance.includes(a));
+        const sameDeps =
+          JSON.stringify([...(current.dependsOn ?? [])].sort()) ===
+          JSON.stringify([...(t.dependsOn ?? [])].sort());
+        if (samePrompt && sameAcceptance && sameDeps) continue;
+        if (current.status === 'queued' || current.status === 'waiting_deps') {
+          // Not started: reorient in place (new prompt/acceptance/deps).
+          const newPrompt =
+            `${t.prompt.trim()}\n\nAcceptance criteria:\n` +
+            t.acceptance.map((a) => `- [ ] ${a}`).join('\n');
+          await updatePlanJob(live.id, current.name, {
+            prompt: newPrompt,
+            dependsOn: t.dependsOn?.length ? [...t.dependsOn] : undefined,
+            ...(t.touchSet?.length ? { touchSet: [...t.touchSet] } : {}),
+          }, undefined, repoRoot);
+          current.prompt = newPrompt;
+          current.dependsOn = t.dependsOn?.length ? [...t.dependsOn] : undefined;
+          if (t.touchSet?.length) current.touchSet = [...t.touchSet];
+          await appendAutoDecision(intakeId, `complement reoriented not-started task "${t.name}" (prompt/acceptance updated before start)`).catch(() => {});
+          updated.push(t.name);
+          continue;
+        }
+        // Started/delivered: linked correction task (never rewrites history).
+        let correctionName = `${t.name}-correction`;
+        let suffix = 2;
+        while (byName.has(correctionName)) correctionName = `${t.name}-correction-${suffix++}`;
         const res = await this.applyModelAdjustment(
-          { action: 'add_task', task: { ...t }, reason: followUp },
+          {
+            action: 'add_task',
+            task: { ...t, name: correctionName, dependsOn: [t.name, ...(t.dependsOn ?? [])] },
+            reason: `${followUp} (correction for delivered task "${t.name}")`,
+          },
           { intakeId },
         ).catch((e) => ({ route: 'needs-user' as const, message: e instanceof Error ? e.message : String(e) }));
-        if (res.route === 'autonomous') added.push(t.name);
-        else needsUser += 1;
+        if (res.route === 'autonomous') {
+          added.push(correctionName);
+          const created = (await loadPlan(repoRoot).catch(() => null))?.jobs.find((j) => j.name === correctionName);
+          if (created) byName.set(correctionName, created);
+        } else needsUser += 1;
       }
       // Deps adjustments for existing tasks (functional change without new tasks).
       const depMap: Record<string, string[]> = {};
       let depsChanged = false;
       for (const t of draft.tasks) {
-        if (!existing.has(t.name)) continue;
-        const cur = live.jobs.find((j) => j.name === t.name)?.dependsOn ?? [];
+        if (!byName.has(t.name)) continue;
+        const cur = byName.get(t.name)?.dependsOn ?? [];
         const nxt = t.dependsOn ?? [];
         if (JSON.stringify([...cur].sort()) !== JSON.stringify([...nxt].sort())) {
           depMap[t.name] = [...nxt];
@@ -2513,7 +3035,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         nextSteps: nextStepsFor(draft),
         updatedAt: new Date().toISOString(),
       }).catch(() => {});
-      await appendAutoDecision(intakeId, `complement revision: ${draft.requirements.length} requirements, +${added.length} tasks${needsUser ? `, ${needsUser} needs-user` : ''}`).catch(() => {});
+      await appendAutoDecision(intakeId, `complement revision: ${draft.requirements.length} requirements, +${added.length} tasks, ~${updated.length} reoriented${needsUser ? `, ${needsUser} needs-user` : ''}`).catch(() => {});
       // Ensure the loop is alive only after scheduling (never announce before).
       try {
         const latest = await loadPlan(repoRoot);
@@ -2522,13 +3044,17 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         }
       } catch {}
       const reconciled = this.isRunning ? 'reconciler active' : 'reconciler will advance on next pass';
-      if (added.length > 0) {
-        return { added, message: `Complement revised plan: added ${added.length} task(s) [${added.join(', ')}] (${reconciled}).` };
+      const effect = [
+        ...(added.length > 0 ? [`added ${added.length} task(s) [${added.join(', ')}]`] : []),
+        ...(updated.length > 0 ? [`reoriented ${updated.length} not-started task(s) [${updated.join(', ')}]`] : []),
+      ].join(', ');
+      if (effect) {
+        return { added, updated, message: `Complement revised plan: ${effect} (${reconciled}).` };
       }
       if (needsUser > 0) {
-        return { added, message: `Complement recorded as human decision (${needsUser} proposal(s) need review, ${reconciled}).` };
+        return { added, updated, message: `Complement recorded as human decision (${needsUser} proposal(s) need review, kept as open questions blocking acceptance, ${reconciled}).` };
       }
-      return { added, message: `Complement noted: requirements version persisted (${draft.requirements.length}), no new tasks (${reconciled}).` };
+      return { added, updated, message: `Complement noted: requirements version persisted (${draft.requirements.length}), no new tasks (${reconciled}).` };
     });
   }
 

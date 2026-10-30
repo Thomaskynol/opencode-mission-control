@@ -589,9 +589,18 @@ export function resolvePlannerModel(): string {
 export function resolveEffectiveModelRef(): { providerID: string; id: string; variant?: string } {
   const env = process.env.MC_PLANNER_MODEL?.trim();
   if (env) {
-    const slash = env.indexOf('/');
-    if (slash > 0) return { providerID: env.slice(0, slash), id: env.slice(slash + 1) };
-    return { providerID: 'unknown', id: env };
+    // Supported form: provider/model[#variant]. The variant rides the argv
+    // (`opencode run --model provider/model#variant`); the TUI root has no
+    // -m/--model in v2.1.4 so it inherits the default and records the triple.
+    const hash = env.indexOf('#');
+    const base = hash > 0 ? env.slice(0, hash) : env;
+    const variant = hash > 0 ? env.slice(hash + 1).trim() : undefined;
+    const slash = base.indexOf('/');
+    const ref =
+      slash > 0
+        ? { providerID: base.slice(0, slash), id: base.slice(slash + 1) }
+        : { providerID: 'unknown', id: base };
+    return variant ? { ...ref, variant } : ref;
   }
   const ref = getCurrentModelRef();
   if (ref) return ref;
@@ -613,6 +622,12 @@ export interface PlannerRetryOptions {
   /** Base backoff in ms, doubled per retry (default 1000). */
   baseDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * R04: stable intake id supplied by the caller. When set, the returned
+   * intake keeps this id so the pre-generate persisted record and the final
+   * record are the same identity (no id swap across the long operation).
+   */
+  intakeId?: string;
 }
 
 /**
@@ -642,7 +657,7 @@ export async function runAutoIntakeWithRetry(
       assertLocalWorkerPrompts(draft);
       return {
         intake: {
-          id: randomUUID(),
+          id: opts?.intakeId ?? randomUUID(),
           request,
           repo: input.repo,
           targetBranch: input.targetBranch,
@@ -828,6 +843,11 @@ export function extractPlannerText(raw: string): string {
   throw new Error('Planner model output contains no strict-JSON draft — refusing to create tasks.');
 }
 
+/** Render an effective triple for `opencode run --model` (variant preserved). */
+export function formatModelRefForArgv(ref: { providerID: string; id: string; variant?: string }): string {
+  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ''}`;
+}
+
 export interface RunPlannerOptions {
   model?: string;
   timeoutMs?: number;
@@ -839,12 +859,20 @@ export interface RunPlannerOptions {
  * Build the configured-model slot on top of a real product session.
  * Default runs `opencode run --standalone` (a private server, never the
  * shared background service holding user sessions) with the pinned planner
- * model. Auth flows through the normal opencode mechanisms — no keys asked.
+ * model triple. Auth flows through the normal opencode mechanisms — no keys asked.
+ * Supported pinning: `run --model provider/id#variant` (variant preserved end
+ * to end). The TUI root (`opencode --prompt`) has no -m/--model in v2.1.4, so
+ * TUI workers inherit the session default and record the effective triple
+ * instead of faking a pin; serve/SDK paths pin the full triple.
  * shortcut: text extraction is heuristic, upgrade to a typed envelope when
  * `opencode run --format json` stabilizes its schema.
  */
 export function createRunPlannerGenerate(opts?: RunPlannerOptions): PlannerGenerate {
-  const model = opts?.model ?? resolvePlannerModel();
+  const explicit = opts?.model?.trim() || undefined;
+  // Explicit model wins verbatim (may already carry #variant). Otherwise the
+  // effective triple (env → tracked → config) is rendered WITH variant so a
+  // pinned variant survives the argv instead of being dropped silently.
+  const model = explicit ?? formatModelRefForArgv(resolveEffectiveModelRef());
   const timeoutMs = opts?.timeoutMs ?? 300_000;
   const opencodeBin = opts?.opencodeBin ?? process.env.OPENCODE_BIN ?? 'opencode';
   const run = opts?.run;

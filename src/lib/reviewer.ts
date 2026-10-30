@@ -75,6 +75,41 @@ export interface ReviewVerdict {
   reviewedBase: string;
 }
 
+/**
+ * True when a task prompt carries at least one `- [ ]` acceptance line.
+ * Autonomous plans always do (draft validation + launch append); manual
+ * MCP plans may not. Absence of criteria is explicit — never a silent pass.
+ */
+export function hasAcceptanceCriteria(prompt: string): boolean {
+  return prompt.split('\n').some((l) => /^-\s*\[\s*\]\s+\S/.test(l.trim()));
+}
+
+/**
+ * Derive essential requirements from a task prompt's acceptance criteria
+ * (`- [ ] ...` lines appended at launch). Each line becomes one requirement
+ * whose test anchor is the line itself: a green suite only counts when its
+ * observed output visibly exercises the criterion (e.g. a test named after
+ * it). A prompt without acceptance yields one explicit fallback requirement
+ * so the absence of criteria fails closed instead of passing silently.
+ * NOTE: the orchestrator applies a documented manual-plan fallback for this
+ * case (see reviewJobWithFixLoop) instead of judging coverage against the
+ * artificial anchor — absence of criteria is reported, never graded.
+ */
+export function requirementsFromAcceptance(jobName: string, prompt: string): EssentialRequirement[] {
+  const lines = prompt
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => /^-\s*\[\s*\]\s+/.test(l))
+    .map((l) => l.replace(/^-\s*\[\s*\]\s+/, '').trim())
+    .filter((l) => l.length > 0);
+  const uniq = [...new Set(lines)];
+  if (uniq.length === 0) {
+    const first = prompt.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? jobName;
+    return [{ id: `${jobName}-acceptance`, description: first.slice(0, 200), testAnchors: [jobName] }];
+  }
+  return uniq.map((a, i) => ({ id: `${jobName}-req-${i + 1}`, description: a, testAnchors: [a] }));
+}
+
 function matchesTouchSet(file: string, touchSet: string[]): boolean {
   return touchSet.some((pattern) => {
     const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;

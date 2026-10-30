@@ -38,11 +38,14 @@ export async function writeLauncherScript(
 ): Promise<string> {
   const launcherPath = join(worktreePath, LAUNCHER_FILENAME);
   const opencodeBin = resolveOpencodePath();
-  // F06: the TUI root (`opencode --prompt ...`) has no -m/--model flag in
-  // v2.1.4 (`Unrecognized flag: -m`, exit 1) — only `opencode run` pins via
-  // --model. So the TUI launcher never emits -m: it inherits the session
-  // default and records the effective triple explicitly instead of faking a
-  // pin. Serve/SDK paths keep the full triple pin.
+  // F06/R03 supported pinning matrix (verified against the installed CLI):
+  // - `opencode run --standalone --model provider/id#variant` PINS the triple
+  //   (planner slot uses this form; variant preserved end to end).
+  // - TUI root (`opencode --prompt ...`) has NO -m/--model flag in v2.1.4
+  //   (`Unrecognized flag: -m`, exit 1), so the TUI launcher MUST NOT emit -m:
+  //   it inherits the session default and records the effective triple below
+  //   explicitly instead of faking a pin. Never silently keep a default.
+  // - serve/SDK paths pin the full triple programmatically.
   const cliModel = typeof model === 'string' ? model : model ? `${model.providerID}/${model.id}` : undefined;
   const variant = typeof model === 'object' ? model.variant : undefined;
   const triple = [cliModel, variant ? `#${variant}` : ''].join('');

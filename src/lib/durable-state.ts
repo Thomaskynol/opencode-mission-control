@@ -67,6 +67,9 @@ export interface AutoIntakeRecord {
   /** F06: effective model once per execution (provider/model + variant when pinned). */
   effectiveModel?: string;
   effectiveVariant?: string;
+  /** F11: original --context (prompt docs + loaded refs for resume). */
+  docs?: string[];
+  contextDocs?: Array<{ ref: string; content: string; hash: string; scope: string }>;
 }
 
 export interface RuntimeSnapshot {
@@ -101,6 +104,21 @@ export interface MergeEvidenceRecord {
   testOutput?: string;
   setupCommands?: string[];
   setupStatus?: 'passed' | 'failed' | 'skipped';
+  /**
+   * R05: which verification produced this record. Task-scoped evidence comes
+   * from the per-task review (scoped test run on the candidate); integration
+   * evidence comes from the repo-wide post-merge gate. Only task-scoped
+   * passes verify a job — a global smoke never promotes jobs to Verified.
+   */
+  scope?: 'task' | 'integration';
+  /**
+   * Manual-plan fallback: the reviewed prompt carried no `- [ ]` acceptance
+   * lines, so no coverage anchor existed to judge against. The merge was
+   * allowed on product-observed test evidence alone (never on diff alone)
+   * and this job must stay out of Verified — the report lists it under Gaps
+   * as "merged without acceptance criteria".
+   */
+  acceptanceLess?: boolean;
 }
 
 export interface ReconcileReport {
@@ -482,16 +500,28 @@ export async function setAutoIntakeStatus(id: string, status: AutoIntakeStatus):
 // and changed files instead of empties.
 // ---------------------------------------------------------------------------
 
-/** Persist (or replace) one job's merge evidence. */
+/** Persist one job's merge evidence, merging fields (never replace). */
 export async function saveMergeEvidence(record: MergeEvidenceRecord): Promise<void> {
-  await updateRuntimeSnapshot((current) => ({
-    pendingQuestions: current.pendingQuestions ?? [],
-    messageBus: current.messageBus ?? {},
-    accumulators: current.accumulators ?? {},
-    sseCursor: current.sseCursor ?? {},
-    autoIntake: current.autoIntake ?? null,
-    mergeEvidence: { ...(current.mergeEvidence ?? {}), [record.jobName]: record },
-  }));
+  await updateRuntimeSnapshot((current) => {
+    const prev = current.mergeEvidence?.[record.jobName] ?? {};
+    // Merge by field, skipping undefined: a later global-integration write
+    // must never erase reviewedCommit/reviewedBase/changedFiles from the
+    // earlier task-scoped review (R05: no field loss on save).
+    const defined = Object.fromEntries(
+      Object.entries(record).filter(([, v]) => v !== undefined),
+    ) as Partial<MergeEvidenceRecord>;
+    return {
+      pendingQuestions: current.pendingQuestions ?? [],
+      messageBus: current.messageBus ?? {},
+      accumulators: current.accumulators ?? {},
+      sseCursor: current.sseCursor ?? {},
+      autoIntake: current.autoIntake ?? null,
+      mergeEvidence: {
+        ...(current.mergeEvidence ?? {}),
+        [record.jobName]: { ...prev, ...defined, jobName: record.jobName },
+      },
+    };
+  });
 }
 
 /** Load all conserved merge evidence (empty when none persisted yet). */
