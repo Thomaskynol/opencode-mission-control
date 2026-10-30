@@ -810,3 +810,84 @@ Ressalva (não bloqueante, follow-up): warning pós-conclusão local
 espúria p/ `creating_pr` rejeitada sem efeito. Registrar como follow-up
 (máquina de estados: não tentar `creating_pr` após entrega local sem
 `humanAuth`).
+
+## 31. Adendo host-context-isolation-manifesto (R06+R07+R09, lane fixer, sem commit)
+
+Escopo exclusivo desta lane: `src/index.ts` (só adaptador V2), `src/lib/sdk-client.ts`
+(intocado — não foi preciso), `tests/` (só `monitor*.test.ts` + novo
+`v2-host-context.test.ts`), `docs/matrix-final.md` (§31), `docs/review-packet-2/MANIFESTO.md`.
+Não tocado (outra lane é dona): `orchestrator.ts`, `reviewer.ts`, `auto-plan.ts`,
+`prompt-file.ts` (só lido p/ R03), `durable-state.ts`, `auto-commands.ts`.
+
+| ID | Correção | Evidência |
+| --- | --- | --- |
+| R06 | Adaptador V2 propaga sessão/localização/cancelamento por chamada: `v1ToolToV2(name, v1, host)` + `buildV1ToolContext(callCtx, host)` (call `sessionID/messageID/agent/directory/worktree/abort` → V1; fallback p/ `host.directory/worktree/signal` + `getActiveSessionID()` rastreado em `event.subscribe`/`tool.hook`/`session.hook`; `AbortSignal.any` combina call+host; `resolveV2Directory/resolveV2Worktree` com fallbacks `location.directory`); shim sem `catch{}` silencioso: `session.*` propaga erro, `config.get`/`tui.showToast` ausentes lançam explícito, `config` do V1 loga warn em vez de silêncio | `tests/v2-host-context.test.ts` (7 pass: forward per-call, fallback host, abort call/host pré-abortados, `mc_launch` real persiste `launchSessionID=[REDACTED-SESSION-ID]`); `tests/v2-contract.test.ts` segue 26/0 |
+| R07 | Isolamento dos mocks: `tests/lib/monitor.test.ts` + `monitor-v2.test.ts` convertidos de `mock.module` global p/ `spyOn`+`mock.restore()` (variantes `.bak` de `/tmp/opencode/v2/` como referência; corpos dos testes idênticos, sem enfraquecimento); `z-workflows.test.ts` mantido (outer sem mocks + inner em subprocesso `MC_WORKFLOWS_ISOLATED=1`, sem vazamento p/ o processo principal) | par monitor 34/0; trio monitor+wire 45/0; minicombo monitor+dest-branch+review-destination 36/0; full `bun test` exit 1 — 1125 pass / 2 fail / 1127 / 78 (`/tmp/opencode/r07-full.log`): wire `createPR` 11/0 isolado, orchestration 1/0 isolado — padrão isolamento/ordenação; **0 fails tmux no full** (6 flakes do baseline eliminados) |
+| R09 | `docs/review-packet-2/MANIFESTO.md` com HEAD+branch+estado+SHA256 (165 arquivos `src/tests/docs`, lista em `/tmp/opencode/manifesto-sha256.txt`)+tamanho (3.1M útil)+correspondência `c2759a1→3b49a95` (só docs, 4 arquivos +175) | este § + MANIFESTO.md; ZIP pendente (aguarda sinal da lane core; sem `.git`) |
+| R03 | Só leitura/documentação (outra lane é dona, sem edição): launcher TUI raiz nunca emite `-m` (CLI 2.1.4 rejeita `Unrecognized flag: -m`, exit 1 — `src/lib/prompt-file.ts:41-52` + teste `launcher-flag-regression` travam o comportamento); triplo efetivo vive só em comentário `# effective model: … (not pinned…)` e herda o default; pin real suportado em `opencode run --model provider/model#variant` (planner usa `--model provider/id` sem variant, cf. `auto-plan.ts:854-857`) — sem troca de modelo proposta | retorno da lane (este adendo); `prompt-file.ts` intocado |
+
+Verificação desta lane: `bun run build` exit 0 (222 modules, 1.44 MB);
+focados exit 0 (v2-contract 26/0, host-context 7/0, monitor pair 34/0);
+full exit 1 com 2 fails só-full (prova de isolamento acima). Sem commit/push/PR,
+sem perfil global, sem segredos. Pendente: ZIP final pós-sinal da lane core.
+
+## 32. Adendo R01-test-update (lane fixer, TDD RED→GREEN, sem commit)
+
+Escopo: só `tests/lib/gate-resume-approve.test.ts` (defect-1→R01) e
+`tests/lib/gap1-integration-context.test.ts`. `src/` da core intocado
+(verificação RED usou `git stash` temporário dos 6 arquivos da core + pop).
+
+| Teste | Novo contrato | RED (gate antigo) | GREEN (gate funcional) |
+| --- | --- | --- | --- |
+| defect-1 → `R01: wrong implementation ... rejected, correction merges after reverification` | `total()` errada + suite verde irrelevante → `failed` + `paused` (motivo cobre `do not cover requirement`); correção (código+teste que exercita `total([1,2])===3`) → `merged`, global `completed` | FAIL (`sum-total:merged` — funde a errada) | 7/0 (`r01-green-defect1.log`) |
+| gap1 → `R01 gap1: wrong sibling ... blocks the queue until corrected` | `a()` errada + trivial verde → `helper-a:failed`, fila bloqueada (`merged` ausente), `paused`; correção (fix + check relevante idêntico nos 2 branches, sibling ausente = skip) → ambos `merged`, repo-wide `PASS` com os 2 anchors | FAIL (`helper-a:merged,helper-b:merged`) | 1/0 (`r01-green-gap1b.log`) |
+
+Sem enfraquecimento: rejeição é por cobertura (anchor ausente no output
+observado), não por diff vazio/touchSet; correção exige teste que exercita o
+requisito + reverificação pelo caminho público (`reconcile` + MergeTrain real).
+Defeitos 2–4 do mesmo arquivo seguem verdes (6/6 no RED-run além do novo).
+
+Verificação: `bun run build` exit 0 (223 modules, 1.46 MB);
+`bun test` full exit 1 — 1125/2/1127/78 (`r01-final-full.log`):
+wire `createPR` isolado 11/0 (isolamento pré-existente);
+`orchestration integration` falha TAMBÉM isolada (4 internos, jobs presos em
+`running`): prompts sem `- [ ]` × gate funcional — determinístico, dono é a
+lane core (§24 limitação 2: manual sem intake × test-gate). Sem push/PR,
+sem segredos. Pendente: ZIP + commit (reconciliação da core).
+
+## 33. Adendo acceptanceLess (lane fixer, TDD RED→GREEN, sem commit)
+
+Escopo: só `tests/lib/acceptance-less-regression.test.ts` (novo). `src/` da
+core intocado (RED via `git stash` temporário dos 6 arquivos + pop).
+
+| Teste | Contrato | RED (sem fallback) | GREEN (com fallback) |
+| --- | --- | --- | --- |
+| `acceptanceLess: job without acceptance merges unverified, out of Verified and in Gaps` | Prompt sem `- [ ]` + evidência de escopo (exit 0) → merge com `acceptanceLess:true`, pino `reviewedCommit`==job HEAD; fora de Verified; Gaps com `no acceptance criteria defined` | exit 1 (sem `scope:task`/flag — registro antigo sem o conceito) | 1/0 (`accless-green2.log`); vizinhos R01 intactos: 16/0 em 4 arquivos |
+
+Observação à core (sem editar `src/`): o smoke global pós-merge refaz
+field-merge com `scope:'integration'` sobre o `scope:'task'` da revisão
+(o write do merge-sucesso precede com `testStatus:'skipped'`), de modo que
+o registro final carrega `scope:'integration'` + `acceptanceLess:true`;
+o contrato de relatório chaveia na flag e segue correto. Se o `scope`
+final devesse permanecer `'task'`, o ajuste é no bloco merge-sucesso/global
+de `orchestrator.ts` (dono: core).
+
+Verificação: novo teste isolado exit 0; `bun run build` exit 0 (223 modules,
+1.46 MB). Sem push/PR, sem segredos. Pendente: ZIP + commit (reconciliação).
+
+## 34. Fechamento R01–R09 / F01–F12 (2026-10-30, lane docs — só acréscimo)
+
+| ID | Situação final | O que falta |
+| --- | --- | --- |
+| R01 / F01 | Gate funcional + fix-loop + acceptanceLess verificados (RED→GREEN + demo-R rejeitou/pediu correção) | Demo-R: `approve` do touchSet pendente |
+| R02 / F03 | `sameAcceptance` aplicado | — |
+| R03 / F06 | Variant preservada + sessionID propagado | — |
+| R04 / F07 | ID estável + handoff registrado | — |
+| R05 / F09 | Pins + Verified/Gaps separados | — |
+| R06 / F10 | Contexto V2 por chamada | 17 tools com side effects via LLM vivo (pendência antiga) |
+| R07 / — | spyOn; full 1127/1 (wire só-no-full, pré-existente) | wire createPR só-no-full |
+| R08 / F08 | Preflight + rollback | — |
+| R09 / — | Manifesto; SHAs selados no commit/ZIP | commit + ZIP (orquestrador) |
+| F02 / F04 / F05 / F11 / F12 | Sem regressão (suíte verde nos recortes) | E2E-E fase a fase (pendência antiga) |
+
+Verificação reportada: `bun run build` exit 0 (1.46 MB); `bun test` 1127/1/1128/79; revisor independente: aceitar.
