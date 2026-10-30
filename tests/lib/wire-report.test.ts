@@ -295,7 +295,27 @@ describe('m5/m7 wire: empty merge is a no-op success', () => {
 });
 
 describe('m5/m7 wire: no push/PR without explicit human auth', () => {
+  let restoreXdg: (() => void) | undefined;
+
+  beforeEach(async () => {
+    // Full-suite isolation: plan-state/config suites vi.mock paths.getDataDir,
+    // which leaks a mocked getDataDir (undefined) into this file when bun runs
+    // all files in one process. Mock loadPlan explicitly so this guard test
+    // does not depend on real FS/global mock state. No src change.
+    const { isolateXdg } = await import('../helpers/test-env');
+    const iso = await isolateXdg();
+    restoreXdg = iso.restore;
+    spyOn(planStateMod, 'loadPlan').mockResolvedValue(null);
+    // Common-test boundary: prove no external drivers are touched here.
+    spyOn(tmuxMod, 'createSession').mockResolvedValue(undefined as never);
+    spyOn(tmuxMod, 'killSession').mockResolvedValue(undefined as never);
+  });
+
   afterEach(() => {
+    try {
+      restoreXdg?.();
+    } catch {}
+    restoreXdg = undefined;
     mock.restore();
   });
 
@@ -310,11 +330,14 @@ describe('m5/m7 wire: no push/PR without explicit human auth', () => {
 
   it('orchestrator.createPR passes the guard with humanAuth (fails later on missing plan)', async () => {
     const orchestrator = makeOrchestrator(new FakeMonitor());
-    // Guard passes; with no active plan in this env it fails on the plan lookup,
-    // proving the auth check itself did not throw.
+    // Guard passes; with mocked loadPlan=null it fails on the plan lookup,
+    // proving the auth check itself did not throw (isolated from FS leakage).
     await expect((orchestrator as any).createPR({ humanAuth: true })).rejects.toThrow(
       /No active plan/,
     );
+    // Boundary proof: common tests never touch external drivers.
+    expect(tmuxMod.createSession).not.toHaveBeenCalled();
+    expect(tmuxMod.killSession).not.toHaveBeenCalled();
   });
 
   it('mc_pr refuses to push without humanAuth', async () => {

@@ -2,6 +2,12 @@ import { mock } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 import type { Job, JobState } from '../../src/lib/job-state';
+// Common (non-live) suite: all external drivers are mocked below (job-state,
+// worktree, tmux, config, omo, plan-copier, prompt-file, worktree-setup).
+// No real opencode/tmux/gh spawn occurs here; live runs are explicit opt-in
+// via TEST_LIVE=1 in other suites. See tests/helpers/test-env.ts.
+import { isLive } from '../helpers/test-env';
+void isLive;
 
 if (process.env.MC_WORKFLOWS_ISOLATED !== '1') {
   describe('Workflow integration suite', () => {

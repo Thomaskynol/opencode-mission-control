@@ -510,6 +510,36 @@ export async function saveMergeEvidence(record: MergeEvidenceRecord): Promise<vo
     const defined = Object.fromEntries(
       Object.entries(record).filter(([, v]) => v !== undefined),
     ) as Partial<MergeEvidenceRecord>;
+    // R05 trail: a task-scoped pass is immutable verification. A later
+    // `skipped` write (per-merge success path with skipTest) or a global
+    // `integration` write must never downgrade it or flip its scope.
+    const prevPassedTask = prev.testStatus === 'passed' && prev.scope === 'task';
+    let next: MergeEvidenceRecord;
+    if (prevPassedTask) {
+      const incomingDowngrades =
+        defined.testStatus === 'skipped' ||
+        (defined.scope !== undefined && defined.scope !== 'task');
+      if (incomingDowngrades) {
+        const { testStatus: _ts, scope: _sc, testCommand: _tc, testOutput: _to, setupCommands: _shc, setupStatus: _shs, ...rest } = defined;
+        void _ts; void _sc; void _tc; void _to; void _shc; void _shs;
+        next = { ...prev, ...rest, jobName: record.jobName } as MergeEvidenceRecord;
+      } else {
+        next = { ...prev, ...defined, jobName: record.jobName } as MergeEvidenceRecord;
+      }
+      // Belt-and-braces: never let a merge preserve a skipped status over a
+      // proven pass, even when the incoming scope was also 'task'.
+      if (next.testStatus !== 'passed') next.testStatus = 'passed';
+      if (next.scope !== 'task') next.scope = 'task';
+    } else {
+      // General monotonicity: a proven pass is never replaced by skipped.
+      if (prev.testStatus === 'passed' && defined.testStatus === 'skipped') {
+        const { testStatus: _ts, ...rest } = defined;
+        void _ts;
+        next = { ...prev, ...rest, jobName: record.jobName } as MergeEvidenceRecord;
+      } else {
+        next = { ...prev, ...defined, jobName: record.jobName } as MergeEvidenceRecord;
+      }
+    }
     return {
       pendingQuestions: current.pendingQuestions ?? [],
       messageBus: current.messageBus ?? {},
@@ -518,7 +548,7 @@ export async function saveMergeEvidence(record: MergeEvidenceRecord): Promise<vo
       autoIntake: current.autoIntake ?? null,
       mergeEvidence: {
         ...(current.mergeEvidence ?? {}),
-        [record.jobName]: { ...prev, ...defined, jobName: record.jobName },
+        [record.jobName]: next,
       },
     };
   });

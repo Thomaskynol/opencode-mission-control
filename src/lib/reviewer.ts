@@ -6,9 +6,13 @@
  * - touchSet respected (no file outside the allowed globs)
  * - test evidence present: command + exit 0 + observable output +
  *   testedCommit === jobHead (the exact code that was tested)
- * - every essential requirement has a test anchor visible in the test
- *   output (green tests that do not cover the requirement fail — a
- *   matching filename in the diff is not coverage)
+ * - every essential requirement is functionally covered: a coordinator-side
+ *   sufficiency check reads implementation + test content and requires a test
+ *   assertion that actually calls the implementation (stdout anchor text
+ *   alone NEVER decides pass — title without coverage fails, real coverage
+ *   with a different title passes). Structure prepared for a future OpenCode
+ *   revisor (ReviewInput.sufficiency); this round uses the local coordinator
+ *   check, no external model.
  * - claimed success without evidence fails (optimistic report, no proof)
  * - test-file changes that weaken coverage require a written record of
  *   why the previous test was incorrect
@@ -36,6 +40,24 @@ export interface TestEvidence {
   testedCommit: string;
   /** Where it ran, e.g. "worktree:/tmp/x (bun 1.3.14, linux)". Optional but recorded. */
   environment?: string;
+  /**
+   * R01 identity: true when the tested tree was dirty (uncommitted changes).
+   * Dirty evidence never verifies a commit.
+   */
+  dirty?: boolean;
+  /** R01 identity: job commit included in an integration candidate. */
+  taskHead?: string;
+  /** R01 identity: base commit an integration candidate was built on. */
+  candidateBase?: string;
+  /** R01 identity: observed HEAD of the candidate actually executed. */
+  candidateHead?: string;
+}
+
+/** Future OpenCode revisor hook: structured external sufficiency decision. */
+export interface SufficiencyDecision {
+  reviewer: 'coordinator' | 'opencode';
+  decision: 'pass' | 'fail';
+  reasons: string[];
 }
 
 export interface TestChangeRecord {
@@ -63,6 +85,23 @@ export interface ReviewInput {
   testChange?: TestChangeRecord | null;
   /** Code paths that were reviewed (optional, for audit). */
   reviewedPaths?: string[];
+  /**
+   * R01 sufficiency: path -> content for implementation + test files as
+   * observed on the tested candidate. Required whenever requirements are
+   * graded — stdout anchors alone never decide pass.
+   */
+  fileContents?: Record<string, string>;
+  /**
+   * Paths inside fileContents that act as tests for this run (e.g. files
+   * referenced by the test command). When provided, coverage is searched
+   * there; otherwise test-likeness is guessed from the file name.
+   */
+  testPaths?: string[];
+  /**
+   * Future OpenCode revisor decision (structured, linked to the candidate).
+   * Reserved for a later round; the local coordinator check decides now.
+   */
+  sufficiency?: SufficiencyDecision | null;
 }
 
 export interface ReviewVerdict {
@@ -125,6 +164,9 @@ function matchesTouchSet(file: string, touchSet: string[]): boolean {
  * test counts) around the requirement string. Trivial echoes fail here;
  * the authoritative guarantee comes from the orchestrator re-running the
  * test command itself and feeding THAT output in (never a worker claim).
+ *
+ * NOTE (R01): anchor presence is only a locating signal. It NEVER decides
+ * pass alone — see assessFunctionalCoverage below.
  */
 function anchorCovered(anchor: string, output: string): boolean {
   if (!anchor || anchor.trim().length < 3) return false;
@@ -136,6 +178,187 @@ function anchorCovered(anchor: string, output: string): boolean {
   // shortcut: heuristic on runner tokens — upgrade to a structured parser if it misfires.
   if (!/pass|fail|ok\b|test|✓|✔|assert|expect|bun|vitest|jest/i.test(output)) return false;
   return true;
+}
+
+function isTestPath(path: string): boolean {
+  return /test|spec|__tests__|\.test\.|\.spec\./i.test(path);
+}
+
+/** Runner pass signal in observed output (no anchor required). */
+function hasPassSignal(output: string): boolean {
+  if (!output || output.trim().length < 3) return false;
+  return /pass|ok\b|✓|✔|#[a-z]*pass/i.test(output);
+}
+
+const REQUIREMENT_STOPWORDS = new Set([
+  'test', 'tests', 'assert', 'asserts', 'expect', 'expects', 'should', 'must',
+  'with', 'without', 'when', 'then', 'than', 'that', 'this', 'from', 'into',
+  'true', 'false', 'null', 'undefined', 'pass', 'passed', 'fail', 'failed',
+  'and', 'the', 'for', 'are', 'not',
+]);
+
+function extractRequirementSymbols(description: string, anchors: string[]): string[] {
+  const text = `${description} ${anchors.join(' ')}`;
+  const found = text.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+  const uniq: string[] = [];
+  for (const token of found) {
+    const lower = token.toLowerCase();
+    if (REQUIREMENT_STOPWORDS.has(lower)) continue;
+    if (/^\d+$/.test(token)) continue;
+    // Single-letter code symbols (a(), b()) are legitimate — keep them.
+    if (!uniq.some((s) => s.toLowerCase() === lower)) uniq.push(token);
+  }
+  // Prefer symbols actually called in the criterion text (`a()` over prose).
+  const called = uniq.filter((s) => new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`).test(text));
+  return [...called, ...uniq.filter((s) => !called.includes(s))].slice(0, 12);
+}
+
+function findDefinedSymbols(content: string, symbols: string[]): string[] {
+  const defined: string[] = [];
+  for (const sym of symbols) {
+    const escaped = sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(
+      `(function\\s+${escaped}\\b|class\\s+${escaped}\\b|(?:const|let|var)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(?:function|\\(|=>)|def\\s+${escaped}\\b|fn\\s+${escaped}\\b|export\\s+(?:default\\s+)?(?:function|const|let|var|class)?\\s*${escaped}\\b)`,
+    );
+    if (pattern.test(content)) defined.push(sym);
+  }
+  return defined;
+}
+
+/**
+ * Strip string literals and comments so a requirement symbol mentioned only
+ * in a test title (e.g. `test('total([1,2])===3', ...)`) is never mistaken
+ * for a real call. Short heuristic — upgrade to a structured parser if it
+ * misfires.
+ */
+function stripStringsAndComments(source: string): string {
+  let out = '';
+  let i = 0;
+  const n = source.length;
+  let quote: string | null = null;
+  while (i < n) {
+    const ch = source[i]!;
+    if (quote !== null) {
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && i + 1 < n) {
+      const next = source[i + 1]!;
+      if (next === '/') {
+        while (i < n && source[i] !== '\n') i++;
+        continue;
+      }
+      if (next === '*') {
+        i += 2;
+        while (i + 1 < n && !(source[i] === '*' && source[i + 1] === '/')) i++;
+        i += 2;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * True when test code really invokes `symbol(` — after stripping strings and
+ * comments, so a title string alone never counts. Covers both assert-style
+ * suites (`assert.equal(total([1,2]), 3)`) and exit-code harnesses
+ * (`const got = total([1,2]); if (got !== 3) process.exit(1)`): what matters
+ * is the implementation is called and the product-observed run passes.
+ */
+function testCallsSymbol(testContent: string, symbol: string): boolean {
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stripped = stripStringsAndComments(testContent);
+  return new RegExp(`\\b${escaped}\\s*\\(`).test(stripped);
+}
+
+export interface FunctionalCoverage {
+  covered: boolean;
+  reason: string;
+}
+
+/**
+ * R01 coordinator sufficiency: implementation + test content decide, never
+ * stdout text. Covered only when:
+ *  1. observed output carries a runner pass signal, AND
+ *  2. some requirement symbol is defined in implementation files, AND
+ *  3. some test file asserts through a call to that symbol.
+ * Diagnostics name whether the implementation or the tests must change —
+ * never "print the anchor".
+ */
+export function assessFunctionalCoverage(
+  requirement: EssentialRequirement,
+  fileContents: Record<string, string> | undefined,
+  testOutput: string,
+  opts?: { testPaths?: string[] },
+): FunctionalCoverage {
+  const contents = fileContents ?? {};
+  const paths = Object.keys(contents);
+  if (paths.length === 0) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): missing functional evidence (implementation/test content not examined — stdout text alone never verifies)`,
+    };
+  }
+  if (!hasPassSignal(testOutput)) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no passing test execution observed in product-run output`,
+    };
+  }
+  const symbols = extractRequirementSymbols(requirement.description, requirement.testAnchors);
+  if (symbols.length === 0) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no code symbol to link requirement to implementation`,
+    };
+  }
+  const explicit = (opts?.testPaths ?? []).filter((p) => p in contents);
+  const testPool = explicit.length > 0 ? explicit : paths.filter((p) => isTestPath(p));
+  if (testPool.length === 0) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test file to examine (no test in scope) — add a test that calls the implementation`,
+    };
+  }
+  const implPool = paths.filter((p) => !testPool.includes(p));
+  const implSources = (implPool.length > 0 ? implPool : paths.filter((p) => !testPool.includes(p)))
+    .map((p) => contents[p] ?? '').join('\n');
+  const defined = findDefinedSymbols(implSources, symbols);
+  if (defined.length === 0) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation does not define ${symbols.join('/')} — fix the implementation (changed files: ${implPool.join(', ') || 'none'})`,
+    };
+  }
+  for (const sym of defined) {
+    for (const tp of testPool) {
+      const tc = contents[tp] ?? '';
+      if (testCallsSymbol(tc, sym)) {
+        return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} calls ${sym}()` };
+      }
+    }
+  }
+  const anchorHint = requirement.testAnchors.some((a) => testOutput.includes(a))
+    ? ' (output mentions the anchor text but no test calls the implementation — title without coverage)'
+    : '';
+  return {
+    covered: false,
+    // Legacy phrase kept: downstream automation matches /do not cover requirement/.
+    reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test calls ${defined.join('/')}() — fix the tests to exercise the implementation${anchorHint}`,
+  };
 }
 
 /**
@@ -189,22 +412,48 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
   }
   if (!ev.testedCommit || ev.testedCommit.trim() === '') {
     reasons.push('missing tested commit: unknown which code was tested');
+  } else if (ev.taskHead !== undefined || ev.candidateBase !== undefined || ev.candidateHead !== undefined) {
+    // Integration candidate: the executed tree is base+job, not job alone.
+    // testedCommit must be the observed candidate HEAD; task/base pins must match.
+    if (!ev.candidateHead || ev.candidateHead.trim() === '') {
+      reasons.push('missing candidate identity: integration evidence without observed candidate HEAD');
+    } else if (ev.testedCommit !== ev.candidateHead) {
+      reasons.push(
+        `candidate identity mismatch: testedCommit ${ev.testedCommit} is not the observed candidate ${ev.candidateHead}`,
+      );
+    }
+    if (!ev.taskHead || ev.taskHead !== input.jobHead) {
+      reasons.push(
+        `candidate does not contain the reviewed job: taskHead ${ev.taskHead ?? '(missing)'} but job HEAD is ${input.jobHead}`,
+      );
+    }
+    if (!ev.candidateBase || ev.candidateBase !== input.baseHead) {
+      reasons.push(
+        `candidate base diverges: evidence built on ${ev.candidateBase ?? '(missing)'} but review base is ${input.baseHead} (stale)`,
+      );
+    }
   } else if (ev.testedCommit !== input.jobHead) {
     reasons.push(
       `tested code diverges: evidence covers ${ev.testedCommit} but job HEAD is ${input.jobHead} (stale)`,
     );
+  }
+  if (ev.dirty) {
+    reasons.push('tested tree was dirty: uncommitted changes present — refusing to attribute the run to a commit');
   }
   if (ev.exitCode !== 0) {
     reasons.push(`tests did not pass: exit code ${ev.exitCode}`);
     if (input.claimedPass) reasons.push('optimistic report without proof: claimed pass but tests failed');
   }
 
+  // R01 sufficiency: stdout anchor text NEVER decides pass. Each requirement
+  // must be functionally exercised (test code calls the implementation).
+  // gradedRequirements empty = manual-plan fallback (no criterion to judge).
   for (const req of input.requirements) {
-    const covered = req.testAnchors.some((a) => anchorCovered(a, ev.output ?? ''));
-    if (!covered) {
-      reasons.push(
-        `green tests do not cover requirement "${req.id}": none of [${req.testAnchors.join(', ')}] in test output`,
-      );
+    const assessment = assessFunctionalCoverage(req, input.fileContents, ev.output ?? '', {
+      testPaths: input.testPaths,
+    });
+    if (!assessment.covered) {
+      reasons.push(assessment.reason);
     }
   }
 

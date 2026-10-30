@@ -27,7 +27,9 @@ import {
   killSession,
   killWindow,
   sendKeys,
+  sessionExists,
   setPaneDiedHook,
+  windowExists,
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
 import { createV2Client, v2ForkSession, v2Prompt, type V2ModelRef } from './sdk-client';
@@ -600,10 +602,15 @@ export class Orchestrator {
       fix: async (_attempt, _last, input) => {
         // Evidence present but insufficient: needs a worker, not another probe.
         if (input.evidence) return null;
-        const evidence = await this.gatherScopeEvidence(job, pins.jobHead, plan.integrationBranch).catch(() => null);
-        if (!evidence) return null; // grounded impediment: surface the fail, escalate downstream
-        observed = evidence;
-        return { ...input, evidence };
+        let gathered: { evidence: TestEvidence; fileContents: Record<string, string>; testPaths: string[] } | null = null;
+        try {
+          gathered = await this.gatherScopeEvidence(job, pins.jobHead, plan.integrationBranch, pins.changedFiles);
+        } catch {
+          gathered = null;
+        }
+        if (!gathered) return null; // grounded impediment: surface the fail, escalate downstream
+        observed = gathered.evidence;
+        return { ...input, evidence: gathered.evidence, fileContents: gathered.fileContents, testPaths: gathered.testPaths };
       },
       sleep: async () => {},
     });
@@ -654,7 +661,7 @@ export class Orchestrator {
     const reasonsText = loop.verdict.reasons.join(' ');
     const reserved =
       requiresUserReview(reasonsText) ||
-      /touchSet violation|missing test command|missing execution environment|tested code diverges|no test command exists/i.test(reasonsText);
+      /touchSet violation|missing test command|missing execution environment|tested code diverges|candidate .*diverges|tested tree was dirty|missing functional evidence|no test command exists/i.test(reasonsText);
     const canRelaunch = Boolean(job.branch && job.worktreePath);
     if (!reserved && !noProgress && prev.attempts < Orchestrator.REVIEW_MAX_AUTO_FIX && canRelaunch) {
       const instruction = this.buildFunctionalCorrection(job, gradedRequirements, pins.changedFiles, loop.verdict.reasons);
@@ -712,7 +719,8 @@ export class Orchestrator {
    * R01: product-observed scoped verification. Runs the effective test
    * command in a candidate worktree and returns evidence built by the
    * product — never a worker claim. Two scopes, in order:
-   *  1. job scope: the job's own worktree (or a temporary detached
+   *  1. job scope: the job's own worktree (only when it is clean and its
+   *     HEAD equals the job HEAD — otherwise a temporary detached
    *     worktree at the job HEAD);
    *  2. integration candidate: a temporary worktree at the integration
    *     branch with the job's changes merged in (temp area, discarded
@@ -721,8 +729,110 @@ export class Orchestrator {
    * A pass in either scope verifies the candidate; both failing returns
    * combined failing evidence for the diagnosis. Null only when no command
    * can be resolved or executed (grounded impediment).
+   *
+   * Identity (R01/P3): never labels dirty or divergent trees with the desired
+   * commit. Job scope records the observed HEAD (must equal jobHead); the
+   * integration candidate records taskHead + candidateBase + candidateHead
+   * separately so no pass is ever attributed to the wrong commit.
    */
-  private async gatherScopeEvidence(job: JobSpec, jobHead: string, integrationBranch: string): Promise<TestEvidence | null> {
+  private async observeCandidateState(dir: string): Promise<{ head: string | null; dirty: boolean }> {
+    const headRes = await gitCommand(['-C', dir, 'rev-parse', 'HEAD']);
+    const head = headRes.exitCode === 0 && headRes.stdout.trim() !== '' ? headRes.stdout.trim() : null;
+    const statusRes = await gitCommand(['-C', dir, 'status', '--porcelain']);
+    // Fail-closed: an unreadable status is treated as dirty, never as clean.
+    const dirty = statusRes.exitCode !== 0 || statusRes.stdout.trim() !== '';
+    return { head, dirty };
+  }
+
+  private async readCandidateContents(dir: string, changedFiles: string[]): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const fs = await import('fs');
+    const pathMod = await import('path');
+    for (const rel of changedFiles.slice(0, 24)) {
+      const safe = rel.replace(/^\/+/, '');
+      if (safe === '' || safe.includes('..')) continue;
+      const full = pathMod.join(dir, safe);
+      let stat: { isFile(): boolean; size: number };
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        // Deleted or unreadable on the candidate — skip; the review fails
+        // closed on absent proof rather than inventing content.
+        continue;
+      }
+      if (!stat.isFile() || stat.size > 40000) continue;
+      try {
+        out[rel] = fs.readFileSync(full, 'utf8').slice(0, 20000);
+      } catch {
+        // Unreadable file — skip without inventing content (see above).
+        continue;
+      }
+    }
+    return out;
+  }
+
+  /** File paths referenced by a test command (`node check.mjs` → check.mjs). */
+  private extractCommandFileRefs(command: string): string[] {
+    const refs: string[] = [];
+    const tokenPattern = /"([^"]+)"|'([^']+)'|`([^`]+)`|(\S+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = tokenPattern.exec(command)) !== null) {
+      const token = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
+      if (!token || token.startsWith('-')) continue;
+      if (!/\.(m?[jt]s|[jt]sx|mts|cts|cjs)$/.test(token)) continue;
+      const cleaned = token.replace(/^[./\\]+/, '').replace(/\\/g, '/');
+      if (cleaned === '' || cleaned.includes('..')) continue;
+      if (!refs.includes(cleaned)) refs.push(cleaned);
+      if (refs.length >= 8) break;
+    }
+    return refs;
+  }
+
+  /** Test-like tracked files present in a candidate (existing suite cover). */
+  private async discoverCandidateTests(dir: string): Promise<string[]> {
+    const ls = await gitCommand(['-C', dir, 'ls-files']);
+    if (ls.exitCode !== 0) return [];
+    const isTest = (p: string): boolean => /test|spec|__tests__|\.test\.|\.spec\./i.test(p);
+    return ls.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l !== '' && isTest(l) && !l.includes('..'))
+      .slice(0, 10);
+  }
+
+  private async readScopeContents(
+    dir: string,
+    changedFiles: string[],
+    command: string | undefined,
+  ): Promise<{ contents: Record<string, string>; testPaths: string[] }> {
+    const refs = command !== undefined ? this.extractCommandFileRefs(command) : [];
+    let discovered: string[] = [];
+    try {
+      discovered = await this.discoverCandidateTests(dir);
+    } catch {
+      discovered = [];
+    }
+    const wanted = [...changedFiles];
+    for (const extra of [...refs, ...discovered]) {
+      if (!wanted.includes(extra)) wanted.push(extra);
+      if (wanted.length >= 24) break;
+    }
+    const contents = await this.readCandidateContents(dir, wanted);
+    const available = new Set(Object.keys(contents));
+    const testPaths = [
+      ...changedFiles.filter((p) => /test|spec|__tests__|\.test\.|\.spec\./i.test(p) && available.has(p)),
+      ...refs.filter((p) => available.has(p)),
+      ...discovered.filter((p) => available.has(p)),
+    ].filter((p, i, arr) => arr.indexOf(p) === i);
+    return { contents, testPaths };
+  }
+
+  private async gatherScopeEvidence(
+    job: JobSpec,
+    jobHead: string,
+    integrationBranch: string,
+    changedFiles: string[],
+  ): Promise<{ evidence: TestEvidence; fileContents: Record<string, string>; testPaths: string[] } | null> {
     const repoRoot = this.effectiveRepoRoot();
     const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
     const configured = this.getEffectiveTestCommand();
@@ -741,52 +851,91 @@ export class Orchestrator {
       }
     };
     try {
-      // Scope 1: job tree.
+      // Scope 1: job tree — only when clean and at the reviewed commit.
+      // A dirty worktree or a divergent HEAD is never tested under the job
+      // HEAD label; fall back to an immutable detached worktree instead.
       let jobCandidate = job.worktreePath;
       if (jobCandidate) {
         const probe = await gitCommand(['-C', jobCandidate, 'rev-parse', '--git-dir']);
-        if (probe.exitCode !== 0) jobCandidate = undefined;
+        if (probe.exitCode !== 0) {
+          jobCandidate = undefined;
+        } else {
+          const observed = await this.observeCandidateState(jobCandidate);
+          if (observed.dirty || observed.head !== jobHead) jobCandidate = undefined;
+        }
       }
       if (!jobCandidate) {
         const base = await makeTemp('mc-review-job-');
         const add = await gitCommand(['worktree', 'add', '--detach', base, jobHead], { cwd: repoRoot });
         if (add.exitCode !== 0) return null;
+        const observed = await this.observeCandidateState(base);
+        if (observed.dirty || observed.head !== jobHead) return null;
         jobCandidate = base;
       }
+      const observedJob = await this.observeCandidateState(jobCandidate);
       const cmdA = configured ?? await detectTestCommand(jobCandidate);
       let evidenceA: TestEvidence | null = null;
+      let contentsA: Record<string, string> = {};
+      let testsA: string[] = [];
       if (cmdA) {
         const result = await runTestCommand(jobCandidate, cmdA, timeout);
-        evidenceA = this.toScopeEvidence(cmdA, result, jobHead, `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`);
-        if (result.success) return evidenceA;
+        const scoped = await this.readScopeContents(jobCandidate, changedFiles, cmdA);
+        contentsA = scoped.contents;
+        testsA = scoped.testPaths;
+        evidenceA = this.toScopeEvidence(
+          cmdA,
+          result,
+          { testedCommit: observedJob.head ?? jobHead, dirty: observedJob.dirty },
+          `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`,
+        );
+        if (result.success && !observedJob.dirty && observedJob.head === jobHead) {
+          return { evidence: evidenceA, fileContents: contentsA, testPaths: testsA };
+        }
       }
       // Scope 2: integration candidate (base + job changes, temp area).
       const candidateDir = await makeTemp('mc-review-int-');
       const addB = await gitCommand(['worktree', 'add', '--detach', candidateDir, integrationBranch], { cwd: repoRoot });
-      if (addB.exitCode !== 0) return evidenceA;
+      if (addB.exitCode !== 0) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
+      const baseObserved = await this.observeCandidateState(candidateDir);
+      if (baseObserved.dirty) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
       const mergeB = await gitCommand(['merge', '--no-ff', '--no-edit', jobHead], { cwd: candidateDir });
       if (mergeB.exitCode !== 0) {
         await gitCommand(['merge', '--abort'], { cwd: candidateDir }).catch(() => {});
-        return evidenceA;
+        return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
       }
+      const candidateObserved = await this.observeCandidateState(candidateDir);
       const cmdB = configured ?? await detectTestCommand(candidateDir);
-      if (!cmdB) return evidenceA;
+      if (!cmdB) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
       const resultB = await runTestCommand(candidateDir, cmdB, timeout);
+      const scopedB = await this.readScopeContents(candidateDir, changedFiles, cmdB);
+      const contentsB = scopedB.contents;
+      const testsB = scopedB.testPaths;
       const evidenceB = this.toScopeEvidence(
         cmdB,
         resultB,
-        jobHead,
-        `integration-candidate:${candidateDir} (base ${integrationBranch} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
+        {
+          testedCommit: candidateObserved.head ?? jobHead,
+          taskHead: jobHead,
+          candidateBase: baseObserved.head ?? undefined,
+          candidateHead: candidateObserved.head ?? undefined,
+          dirty: candidateObserved.dirty,
+        },
+        `integration-candidate:${candidateDir} (base ${integrationBranch}@${(baseObserved.head ?? '').slice(0, 8)} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
       );
-      if (resultB.success) return evidenceB;
+      if (resultB.success) return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
       // Both scopes failed: combined evidence so the diagnosis names both.
       if (evidenceA) {
-        return {
+        const combined: TestEvidence = {
           ...evidenceB,
           output: `[job scope] ${cmdA}\n${evidenceA.output}\n\n[integration candidate] ${cmdB}\n${evidenceB.output}`.slice(0, 8000),
         };
+        return {
+          evidence: combined,
+          fileContents: { ...contentsA, ...contentsB },
+          testPaths: [...new Set([...testsA, ...testsB])],
+        };
       }
-      return evidenceB;
+      return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
     } finally {
       await cleanup();
     }
@@ -795,18 +944,30 @@ export class Orchestrator {
   private toScopeEvidence(
     command: string,
     result: { success: boolean; output: string; timedOut: boolean },
-    jobHead: string,
+    identity: { testedCommit: string; taskHead?: string; candidateBase?: string; candidateHead?: string; dirty?: boolean },
     environment: string,
   ): TestEvidence {
     const output = `${result.timedOut ? '[timed out] ' : ''}${result.output}`.slice(0, 8000).trim()
       || `(no output; ${result.success ? 'exit 0' : 'non-zero exit'})`;
-    return { command, exitCode: result.success ? 0 : 1, output, testedCommit: jobHead, environment };
+    return {
+      command,
+      exitCode: result.success ? 0 : 1,
+      output,
+      testedCommit: identity.testedCommit,
+      environment,
+      ...(identity.taskHead !== undefined ? { taskHead: identity.taskHead } : {}),
+      ...(identity.candidateBase !== undefined ? { candidateBase: identity.candidateBase } : {}),
+      ...(identity.candidateHead !== undefined ? { candidateHead: identity.candidateHead } : {}),
+      ...(identity.dirty !== undefined ? { dirty: identity.dirty } : {}),
+    };
   }
 
   /**
    * R01: worker instruction for a functional review failure. Names the failing
-   * reasons, the requirements (with the anchors the test output must show),
-   * and the changed scope — never a bare "fix it".
+   * reasons, the requirements, and the changed scope — never a bare "fix it"
+   * and never "print the anchor". The diagnosis already says whether the
+   * implementation or the tests must change; the worker fixes that side and
+   * proves it with a test that calls the implementation.
    */
   private buildFunctionalCorrection(
     job: JobSpec,
@@ -821,14 +982,14 @@ export class Orchestrator {
       `The previous work on branch "${job.branch ?? '(unknown)'}" did not pass functional review:`,
       ...diagnosis.map((d) => `- ${d}`),
       ``,
-      `Requirements that must hold (test output must visibly show each anchor):`,
-      ...requirements.map((r) => `- ${r.id}: ${r.description} (show: ${r.testAnchors.join(' / ')})`),
+      `Requirements that must hold (each needs a test that calls the implementation and asserts the result):`,
+      ...requirements.map((r) => `- ${r.id}: ${r.description}`),
       ...(impl.length > 0 ? [`Changed implementation files: ${impl.join(', ')}`] : []),
       ...(testFiles.length > 0
         ? [`Changed test files: ${testFiles.join(', ')}`]
         : [`No test file was changed — add or extend tests that exercise the requirements above.`]),
       `Instructions:`,
-      `1. Fix the implementation and/or tests on this branch so every requirement above is visibly exercised by the test output (name tests after the requirement).`,
+      `1. Fix the implementation and/or tests on this branch per the diagnosis above so every requirement is exercised by a test assertion that calls the implementation (a matching test name alone is not coverage).`,
       `2. Do NOT weaken tests to force approval: if a previous test was wrong, record why in the commit message.`,
       `3. Commit your corrections and report completion.`,
     ].join('\n');
@@ -1821,6 +1982,11 @@ export class Orchestrator {
             current.mergedAt = mergeResult.mergedAt;
           }
           // F09: conserve product-observed evidence for the final report.
+          // R05 trail: the per-merge write carries merge metadata only. When
+          // the merge ran with skipTest (no repo-wide run here), verification
+          // fields are omitted so the earlier task-scoped pass/scope is never
+          // downgraded to skipped by this write (guarded in saveMergeEvidence
+          // too). The global integration gate writes its own scope below.
           try {
             const tr = (mergeResult as { testReport?: MergeTestReport }).testReport;
             const fullJob = byName.get(nextJob.name) ?? nextJob;
@@ -1835,11 +2001,11 @@ export class Orchestrator {
               reviewedCommit: verdict?.reviewedCommit,
               reviewedBase: verdict?.reviewedBase,
               changedFiles,
-              testCommand: tr?.command,
-              testStatus: tr?.status ?? 'skipped',
-              testOutput: tr?.output,
-              setupCommands: tr?.setup.commands,
-              setupStatus: tr?.setup.status,
+              ...(tr?.command !== undefined ? { testCommand: tr.command } : {}),
+              ...(tr?.status !== undefined ? { testStatus: tr.status } : {}),
+              ...(tr?.output !== undefined ? { testOutput: tr.output } : {}),
+              ...(tr?.setup?.commands !== undefined ? { setupCommands: tr.setup.commands } : {}),
+              ...(tr?.setup?.status !== undefined ? { setupStatus: tr.setup.status } : {}),
             }).catch(() => {});
           } catch {}
           this.showToast('Mission Control', `Job "${nextJob.name}" merged successfully.`, 'success');
@@ -2283,7 +2449,13 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     const placement = this.planPlacement ?? this.config.defaultPlacement ?? 'session';
     const mode = job.mode ?? this.config.omo?.defaultMode ?? 'vanilla';
     const sanitizedName = job.name.replace(/[^a-zA-Z0-9_-]/g, '-');
-    const tmuxSessionName = `mc-${sanitizedName}`;
+    // R01 relaunch ownership: session per execution (plan+job ids), never the
+    // bare job name that collides across projects/runs. The predecessor is
+    // killed only through the recorded tmuxTarget (ownership marker) after a
+    // has-session check — never an unrecorded same-name session.
+    const execTag = `${plan.id.slice(0, 8)}-${job.id.slice(0, 8)}`;
+    const tmuxSessionName = `mc-${sanitizedName}-${execTag}`;
+    const windowName = `${sanitizedName}-${execTag}`;
     const tmuxTarget =
       placement === 'session'
         ? tmuxSessionName
@@ -2292,21 +2464,41 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
             if (!currentSession && !isInsideTmux()) {
               throw new Error('Window placement requires running inside tmux');
             }
-            return `${currentSession}:${sanitizedName}`;
+            return `${currentSession}:${windowName}`;
           })();
 
-    // Kill old tmux session if still alive
+    // Kill the predecessor session/window if still alive (ownership-checked).
     try {
+      const previousTarget = job.tmuxTarget;
       if (placement === 'session') {
-        await killSession(tmuxSessionName);
-      } else {
-        const [session, window] = tmuxTarget.split(':');
-        if (session && window) {
-          await killWindow(session, window);
+        // Only touch sessions this lane recorded (or the legacy bare name for
+        // the same job, pre-upgrade). Anything else is foreign: never kill.
+        const candidates = [previousTarget, `mc-${sanitizedName}`].filter(
+          (t): t is string => typeof t === 'string' && t.startsWith(`mc-${sanitizedName}`),
+        );
+        for (const cand of new Set(candidates)) {
+          let exists = false;
+          try {
+            exists = await sessionExists(cand);
+          } catch {
+            exists = false;
+          }
+          if (exists) await killSession(cand);
+        }
+      } else if (previousTarget) {
+        const [session, window] = previousTarget.split(':');
+        if (session && window && window.startsWith(sanitizedName)) {
+          let exists = false;
+          try {
+            exists = await windowExists(session, window);
+          } catch {
+            exists = false;
+          }
+          if (exists) await killWindow(session, window);
         }
       }
     } catch {
-      // Session may already be dead — that's fine
+      // Predecessor may already be dead — that's fine
     }
 
     // Build correction prompt with context from the original task
@@ -2348,6 +2540,32 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     const worktreePath = job.worktreePath;
     let promptFilePath: string | undefined;
 
+    // Never silently reuse a dirty worktree: checkpoint visible (add+commit)
+    // so the correction starts from a recorded state. Refuse when the
+    // checkpoint itself fails.
+    const dirtyProbe = await gitCommand(['-C', worktreePath, 'status', '--porcelain']);
+    if (dirtyProbe.exitCode !== 0) {
+      throw new Error(
+        `Cannot relaunch correction for job "${jobName}": cannot inspect worktree (${dirtyProbe.stderr || 'unknown'}) — refusing to reuse an unknown tree state`,
+      );
+    }
+    if (dirtyProbe.stdout.trim() !== '') {
+      const addRes = await gitCommand(['-C', worktreePath, 'add', '-A']);
+      if (addRes.exitCode !== 0) {
+        throw new Error(
+          `Cannot relaunch correction for job "${jobName}": worktree has uncommitted changes and staging failed (${addRes.stderr || addRes.stdout}) — refusing to reuse a dirty worktree silently`,
+        );
+      }
+      const checkpointRes = await gitCommand(
+        ['-C', worktreePath, 'commit', '-m', `chore(${job.name}): checkpoint uncommitted work before correction relaunch`],
+      );
+      if (checkpointRes.exitCode !== 0) {
+        throw new Error(
+          `Cannot relaunch correction for job "${jobName}": worktree has uncommitted changes and the checkpoint commit failed (${checkpointRes.stderr || checkpointRes.stdout}) — refusing to reuse a dirty worktree silently`,
+        );
+      }
+    }
+
     try {
       promptFilePath = await writePromptFile(worktreePath, fullPrompt);
       const effective = this.ensureEffectiveModel();
@@ -2363,7 +2581,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       } else {
         await createWindow({
           session: getCurrentSession()!,
-          name: sanitizedName,
+          name: windowName,
           workdir: worktreePath,
           command: initialCommand,
         });

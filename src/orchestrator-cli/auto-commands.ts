@@ -41,6 +41,11 @@ import {
  * stays only as an advanced diagnostic (never required).
  */
 
+export interface ConductorEvidence {
+  live: number;
+  total: number;
+}
+
 export interface AutoCommandDeps {
   generate?: PlannerGenerate;
   startAutonomous?: (
@@ -48,6 +53,11 @@ export interface AutoCommandDeps {
     generate: PlannerGenerate,
   ) => Promise<{ intakeId: string; tasks: string[]; launched: boolean }>;
   resumeAutonomous?: (intakeId: string) => Promise<string>;
+  /**
+   * Independent worker-liveness check used by the approve handoff. Defaults
+   * to a best-effort tmux pane scan (never throws). Tests inject a stub.
+   */
+  verifyWorkers?: () => Promise<ConductorEvidence>;
 }
 
 /** Absolute CLI entry so help/answers print full copyable commands. */
@@ -525,13 +535,45 @@ function applyEffectiveConfig(
 }
 
 /**
+ * Best-effort worker continuity check: counts running-job tmux panes that
+ * are still alive. Independent of any single Orchestrator instance's
+ * self-report, so a dying temp controller cannot vouch for itself. Never
+ * throws — unknown liveness is reported as 0/0, not as a false negative.
+ */
+async function checkWorkerContinuity(): Promise<ConductorEvidence> {
+  try {
+    const [{ getRunningJobs }, { isPaneRunning }] = await Promise.all([
+      import('../lib/job-state'),
+      import('../lib/tmux'),
+    ]);
+    const jobs = await getRunningJobs().catch(() => []);
+    let live = 0;
+    for (const job of jobs) {
+      try {
+        if (job.tmuxTarget && (await isPaneRunning(job.tmuxTarget))) live++;
+      } catch {
+        // Best-effort per pane: one unreadable target never fails the check.
+      }
+    }
+    return { live, total: jobs.length };
+  } catch {
+    // Best-effort: without job state there is no evidence either way.
+    return { live: 0, total: 0 };
+  }
+}
+
+/**
  * R04: verifiable conductor handoff after a CLI resumePlan.
  * A one-shot CLI cannot stay alive as the conductor, so approve/resume must
  * not do resumePlan+shutdown silently: this re-reads the plan AFTER the
- * resume, verifies what actually continues (live workers + plan state +
- * reconciler), persists the transfer as an intake decision, and returns the
- * proof. The caller still shuts down its own loops afterwards (CLI hygiene),
- * but only after the handoff is recorded and reported.
+ * resume, verifies what actually continues (independent worker liveness +
+ * plan state, never the temp instance's self-report alone), persists the
+ * transfer as an intake decision, and returns the proof. The record is
+ * fail-closed: when it cannot persist, this throws instead of reporting a
+ * handoff that never landed. The caller shuts down its own loops only after
+ * this confirmation (CLI hygiene), but continuity never depends on the temp
+ * instance: in-flight workers persist in tmux and the next driver pass
+ * resumes the persisted plan without duplicating them.
  */
 async function recordConductorHandoff(
   ctl: {
@@ -541,11 +583,19 @@ async function recordConductorHandoff(
   record: AutoIntakeRecord,
   repoRoot: string,
   action: string,
+  opts?: { verifyWorkers?: () => Promise<ConductorEvidence> },
 ): Promise<string> {
   await ctl.resumePlan(repoRoot);
   const { loadPlan } = await import('../lib/plan-state');
   const plan = await loadPlan(repoRoot).catch(() => null);
   const alive = (ctl as unknown as { isRunning?: boolean }).isRunning === true;
+  let workers: ConductorEvidence = { live: 0, total: 0 };
+  try {
+    workers = await (opts?.verifyWorkers ?? checkWorkerContinuity)();
+  } catch {
+    // Best-effort: worker evidence is reported, never fatal.
+    workers = { live: 0, total: 0 };
+  }
   let handoff: string;
   if (!plan) {
     handoff = `${action}: no active plan in ${repoRoot} — nothing to conduct (intake ${record.id} kept).`;
@@ -554,12 +604,20 @@ async function recordConductorHandoff(
   } else if (plan.status === 'completed' || plan.status === 'failed' || plan.status === 'canceled') {
     handoff = `${action}: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report.`;
   } else {
-    const running = plan.jobs.filter((j) => j.status === 'running' || j.status === 'merging').length;
     handoff =
-      `${action}: conductor handed off (plan ${plan.id} [${plan.status}], reconciler ${alive ? 'running' : 'armed for next pass'} in pid ${process.pid}, ` +
-      `${running} job(s) in flight, state persisted; re-attach with: bun ${cliPath()} resume --intake ${record.id}).`;
+      `${action}: conductor detached (reporter pid ${process.pid}) — plan ${plan.id} [${plan.status}] owned via persisted state (intake ${record.id}); ` +
+      `reconciler ${alive ? `live in pid ${process.pid} at handoff` : 'armed for next pass'}; ` +
+      `workers live ${workers.live}/${workers.total} (tmux); one-shot controller detaches after this sync pass — ` +
+      `in-flight workers persist and the next driver pass resumes without duplication.`;
   }
-  await appendAutoDecision(record.id, `handoff: ${handoff}`).catch(() => {});
+  // Fail-closed: a handoff that cannot persist is thrown, never announced.
+  try {
+    await appendAutoDecision(record.id, `handoff: ${handoff}`);
+  } catch (error) {
+    throw new Error(
+      `handoff not confirmed for intake ${record.id}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   let progress = '';
   try {
     if (ctl.autonomousProgress) progress = await ctl.autonomousProgress(record.id);
@@ -579,7 +637,6 @@ async function recordConductorHandoff(
  * or a non-paused plan throws explicitly — never a silent success.
  */
 export async function approveIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
-  void deps;
   const { flags } = parseFlags(args);
   const retry = flags.get('retry');
   const relaunch = flags.get('relaunch');
@@ -645,10 +702,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
         let handoff: string;
         try {
-          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`);
-        } finally {
+          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`, { verifyWorkers: deps?.verifyWorkers });
+        } catch (error) {
           ctl.shutdown();
+          throw error;
         }
+        ctl.shutdown();
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${relaunch}" relaunched with correction prompt.`,
           handoff,
@@ -701,10 +760,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         let retryHandoff: string;
         try {
-          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`);
-        } finally {
+          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`, { verifyWorkers: deps?.verifyWorkers });
+        } catch (error) {
           ctl.shutdown();
+          throw error;
         }
+        ctl.shutdown();
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${retry}" reset to ready_to_merge.`,
           retryHandoff,
@@ -745,10 +806,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
       let clearHandoff: string;
       try {
-        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear');
-      } finally {
+        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear', { verifyWorkers: deps?.verifyWorkers });
+      } catch (error) {
         ctl.shutdown();
+        throw error;
       }
+      ctl.shutdown();
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
       return [
         `Checkpoint "${checkpoint}" cleared.${acceptMsg} Plan "${plan.name}" resuming (intake ${record.id}).`,
@@ -796,10 +859,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
     let startHandoff: string;
     try {
-      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start');
-    } finally {
+      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start', { verifyWorkers: deps?.verifyWorkers });
+    } catch (error) {
       ctl.shutdown();
+      throw error;
     }
+    ctl.shutdown();
     return [
       `Plan "${plan.name}" approved and started (intake ${record.id}).`,
       startHandoff,

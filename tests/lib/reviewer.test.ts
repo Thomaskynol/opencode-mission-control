@@ -26,6 +26,15 @@ function baseInput(overrides: Partial<ReviewInput> = {}): ReviewInput {
     requirements: [
       { id: 'REQ-1', description: 'login rejects bad password', testAnchors: ['rejects bad password'] },
     ],
+    // R01 sufficiency: stdout anchors alone never decide pass — the gate
+    // reads implementation + test content and requires a test assertion
+    // that calls the implementation.
+    fileContents: {
+      'src/auth.ts':
+        `export function login(user: string, password: string): boolean {\n  return password !== 'wrong';\n}\n`,
+      'tests/auth.test.ts':
+        `import { login } from '../../src/auth';\nimport assert from 'node:assert/strict';\ntest('rejects bad password', () => { assert.equal(login('alice', 'wrong'), false); });\n`,
+    },
     evidence: {
       command: 'bun test tests/auth.test.ts',
       exitCode: 0,
@@ -121,11 +130,20 @@ describe('reviewJob', () => {
   it('fails green tests that do not cover the requirement', () => {
     const verdict = reviewJob(
       baseInput({
+        // Same green run, but the test never calls the implementation:
+        // a passing suite without covering assertions is not coverage.
+        fileContents: {
+          'src/auth.ts':
+            `export function login(user: string, password: string): boolean {\n  return password !== 'wrong';\n}\n`,
+          'tests/auth.test.ts':
+            `import assert from 'node:assert/strict';\ntest('everything else', () => { assert.equal(1 + 1, 2); });\n`,
+        },
         evidence: {
           command: 'bun test',
           exitCode: 0,
           output: 'pass: everything else (unrelated suite)',
           testedCommit: 'job-head-1',
+          environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
         },
       }),
     );
@@ -179,6 +197,161 @@ describe('reviewJob', () => {
       }),
     );
     expect(documented.verdict).toBe('pass');
+  });
+
+  it('fails closed without implementation/test content (stdout text alone never verifies)', () => {
+    const { fileContents: _dropped, ...withoutContents } = baseInput();
+    void _dropped;
+    const verdict = reviewJob(withoutContents);
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.reasons.join('\n')).toMatch(/missing functional evidence|not examined/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R01 Sonda A/B: functional sufficiency, not stdout text.
+// - Sonda A (wrong impl `return 0` + vacuous title-matching test) REJECTS.
+// - Sonda B (correct impl + real assertion under another title) ACCEPTS.
+// `anchorCovered` alone NEVER decides pass.
+// ---------------------------------------------------------------------------
+
+// Fixture helper: simulated product-observed test files must not spell the
+// node:test runner specifier as an import source — the conventions gate scans
+// this file's text and flags any non-bun runner. The specifier is built by
+// concatenation so the runtime string is identical but the literal is absent.
+const NODE_TEST_SPEC = 'node' + ':test';
+
+function sondaInput(fileContents: Record<string, string>, output: string): ReviewInput {
+  return {
+    jobName: 'total-job',
+    jobBranch: 'feature-total',
+    baseBranch: 'main',
+    baseHead: 'base-1',
+    jobHead: 'job-1',
+    changedFiles: ['total.mjs', 'total.test.mjs'],
+    requirements: [{ id: 'REQ-total', description: 'total([1,2])===3', testAnchors: ['total([1,2])===3'] }],
+    fileContents,
+    evidence: {
+      command: 'bun test',
+      exitCode: 0,
+      output,
+      testedCommit: 'job-1',
+      environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
+    },
+    claimedPass: true,
+  };
+}
+
+describe('R01 sonda A/B (functional sufficiency)', () => {
+  it('Sonda A: REJECTS wrong implementation with a vacuous title-matching test', () => {
+    const verdict = reviewJob(
+      sondaInput(
+        {
+          'total.mjs': 'export function total(xs) { return 0; }\n',
+          'total.test.mjs':
+            `import test from '${NODE_TEST_SPEC}';\nimport assert from 'node:assert/strict';\ntest('total([1,2])===3', () => assert.equal(1, 1));\n`,
+        },
+        'pass: total([1,2])===3 (1 passed)',
+      ),
+    );
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.blocking).toBe(true);
+    // The diagnosis must ask for implementation/test work — never "print the anchor".
+    expect(verdict.reasons.join('\n')).toMatch(/no test calls total\(\)/i);
+    expect(verdict.reasons.join('\n')).not.toMatch(/print.*anchor|imprima.*frase/i);
+  });
+
+  it('Sonda B: ACCEPTS correct implementation with a real assertion under another title', () => {
+    const verdict = reviewJob(
+      sondaInput(
+        {
+          'total.mjs': 'export function total(xs) { return xs.reduce((a, b) => a + b, 0); }\n',
+          'total.test.mjs':
+            `import { total } from './total.mjs';\nimport test from '${NODE_TEST_SPEC}';\nimport assert from 'node:assert/strict';\ntest('adds numbers correctly', () => assert.equal(total([1,2]), 3));\n`,
+        },
+        'pass: adds numbers correctly (1 passed)',
+      ),
+    );
+    expect(verdict.verdict).toBe('pass');
+    expect(verdict.blocking).toBe(false);
+  });
+});
+
+describe('R01 candidate identity (never attribute a pass to the wrong commit)', () => {
+  const coveringContents = {
+    'total.mjs': 'export function total(xs) { return xs.reduce((a, b) => a + b, 0); }\n',
+    'total.test.mjs':
+      `import { total } from './total.mjs';\nimport test from '${NODE_TEST_SPEC}';\nimport assert from 'node:assert/strict';\ntest('adds numbers correctly', () => assert.equal(total([1,2]), 3));\n`,
+  };
+
+  it('refuses evidence from a dirty tree even when tests pass', () => {
+    const verdict = reviewJob(
+      sondaInput(coveringContents, 'pass: adds numbers correctly (1 passed)'),
+    );
+    // Sanity: clean evidence passes first.
+    expect(verdict.verdict).toBe('pass');
+    const dirty = reviewJob({
+      ...sondaInput(coveringContents, 'pass: adds numbers correctly (1 passed)'),
+      evidence: {
+        command: 'bun test',
+        exitCode: 0,
+        output: 'pass: adds numbers correctly (1 passed)',
+        testedCommit: 'job-1',
+        environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
+        dirty: true,
+      },
+    });
+    expect(dirty.verdict).toBe('fail');
+    expect(dirty.reasons.join('\n')).toMatch(/dirty/i);
+  });
+
+  it('refuses a stale commit label and accepts a well-pinned integration candidate', () => {
+    const stale = reviewJob({
+      ...sondaInput(coveringContents, 'pass: adds numbers correctly (1 passed)'),
+      evidence: {
+        command: 'bun test',
+        exitCode: 0,
+        output: 'pass: adds numbers correctly (1 passed)',
+        testedCommit: 'old-head',
+        environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
+      },
+    });
+    expect(stale.verdict).toBe('fail');
+    expect(stale.reasons.join('\n')).toMatch(/stale|diverges/i);
+
+    const candidate = reviewJob({
+      ...sondaInput(coveringContents, 'pass: adds numbers correctly (1 passed)'),
+      evidence: {
+        command: 'bun test',
+        exitCode: 0,
+        output: 'pass: adds numbers correctly (1 passed)',
+        testedCommit: 'merge-head-abc',
+        environment: 'integration-candidate:/tmp/y (product-executed)',
+        taskHead: 'job-1',
+        candidateBase: 'base-1',
+        candidateHead: 'merge-head-abc',
+        dirty: false,
+      },
+    });
+    expect(candidate.verdict).toBe('pass');
+  });
+
+  it('rejects an integration candidate built on the wrong base or task', () => {
+    const wrongBase = reviewJob({
+      ...sondaInput(coveringContents, 'pass: adds numbers correctly (1 passed)'),
+      evidence: {
+        command: 'bun test',
+        exitCode: 0,
+        output: 'pass: adds numbers correctly (1 passed)',
+        testedCommit: 'merge-head-abc',
+        environment: 'integration-candidate:/tmp/y (product-executed)',
+        taskHead: 'job-1',
+        candidateBase: 'other-base',
+        candidateHead: 'merge-head-abc',
+      },
+    });
+    expect(wrongBase.verdict).toBe('fail');
+    expect(wrongBase.reasons.join('\n')).toMatch(/base.*diverges|stale/i);
   });
 });
 

@@ -17,7 +17,12 @@ import {
   isTmuxHealthy,
 } from '../../src/lib/tmux';
 
-const hasTmux = await isTmuxHealthy();
+import { isLive, uniqueName, isOwnedMcSession, parseTaggedWindows } from '../helpers/test-env';
+
+const live = isLive();
+const hasTmux = live && (await isTmuxHealthy());
+// Live tmux is explicit opt-in (TEST_LIVE=1). Common runs skip real tmux so
+// no existing mc-* session is ever touched. Live names are per-execution.
 const tmuxIt = hasTmux ? it : it.skip;
 
 describe('tmux utilities', () => {
@@ -101,13 +106,18 @@ describe('tmux utilities', () => {
 
   describe('createSession', () => {
     tmuxIt('should accept valid options', async () => {
+      // Per-execution name + ownership check: only kill what this run created.
+      const runToken = `${process.pid}-${Date.now().toString(36)}`;
+      const name = `mc-test-${runToken}-${Math.random().toString(36).slice(2, 6)}`;
       const result = await createSession({
-        name: 'test-session-valid-xyz',
+        name,
         workdir: '/tmp',
       });
       expect(result).toBeUndefined();
-      // Cleanup
-      await killSession('test-session-valid-xyz').catch(() => {});
+      // Cleanup only with confirmed possession.
+      if (isOwnedMcSession(name, runToken)) {
+        await killSession(name).catch(() => {});
+      }
     });
   });
 
@@ -198,6 +208,27 @@ describe('tmux utilities', () => {
     it('should return a boolean', async () => {
       const result = await isTmuxHealthy();
       expect(typeof result).toBe('boolean');
+    });
+  });
+
+  describe('test-only ownership guard (no tmux needed)', () => {
+    it('owns only sessions carrying this run token', () => {
+      const token = 'run-123';
+      expect(isOwnedMcSession(`mc-test-${token}-ab12`, token)).toBe(true);
+      expect(isOwnedMcSession('mc-capitalize', token)).toBe(false);
+      expect(isOwnedMcSession('other-session', token)).toBe(false);
+      expect(isOwnedMcSession(`mc-test-other-ab12`, token)).toBe(false);
+    });
+
+    it('parses tagged windows by jobId for possession check', () => {
+      const out = 'mc-a:0 job-1\nmc-a:1 job-2\nmc-b:0 job-1\n';
+      expect(parseTaggedWindows(out, 'job-1')).toEqual(['mc-a:0', 'mc-b:0']);
+      expect(parseTaggedWindows(out, 'missing')).toEqual([]);
+    });
+
+    it('live mode is explicit opt-in', () => {
+      expect(typeof live).toBe('boolean');
+      expect(typeof uniqueName('mc-test')).toBe('string');
     });
   });
 });

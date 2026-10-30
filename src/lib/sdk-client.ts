@@ -298,6 +298,59 @@ export async function v2GetSession(
   return unwrapData<V2SessionInfo>(payload, 'get session');
 }
 
+/** Normalize an empty variant to undefined so "no pin" compares cleanly. */
+function normalizeVariant(variant?: string): string | undefined {
+  return variant && variant.trim() ? variant : undefined;
+}
+
+/**
+ * Create a worker session with the pinned model triple and verify it back.
+ * Two modes (R03 observable pin, mock-compatible):
+ * - 'echo' (default): compares the create-response echo against the
+ *   requested triple — no extra calls, so unit tests that mock only
+ *   v2CreateSession keep passing. Verified live against opencode 2.1.4
+ *   `serve`: create echoes the full triple. An absent echo (mocks, older
+ *   servers) proceeds: the POST already carried the pin.
+ * - 'get': strict POST + GET /session/:id round-trip; any mismatch throws.
+ * A silent server default is never reported as pinned in either mode:
+ * a present-but-different echo/mismatch throws fail-closed.
+ */
+export type ServeModelVerifyMode = 'echo' | 'get';
+
+export function assertServeSessionModelEcho(
+  created: V2SessionInfo,
+  want: V2ModelRef,
+): void {
+  const got = created.model;
+  if (!got) return;
+  if (
+    got.providerID !== want.providerID ||
+    got.id !== want.id ||
+    normalizeVariant(got.variant) !== normalizeVariant(want.variant)
+  ) {
+    throw new Error(
+      `v2 session model mismatch: requested ${want.providerID}/${want.id}${want.variant ? `#${want.variant}` : ''}, ` +
+        `observed ${got.providerID}/${got.id}${got.variant ? `#${got.variant}` : ''} (session ${created.id}).`,
+    );
+  }
+}
+
+export async function v2CreateSessionWithVerifiedModel(
+  client: V2Client,
+  body: V2CreateSessionBody,
+  verify: ServeModelVerifyMode = 'echo',
+): Promise<V2SessionInfo> {
+  const created = await v2CreateSession(client, body);
+  if (!body.model) return created;
+  if (verify === 'echo') {
+    assertServeSessionModelEcho(created, body.model);
+    return created;
+  }
+  const observed = await v2GetSession(client, created.id);
+  assertServeSessionModelEcho(observed, body.model);
+  return observed;
+}
+
 export async function v2ActiveSessions(client: V2Client): Promise<V2SessionInfo[]> {
   const payload = await v2Request(client, 'GET', '/session/active');
   return unwrapData<V2SessionInfo[]>(payload, 'active sessions');

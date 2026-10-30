@@ -102,7 +102,24 @@ bun test
 Retomada do intake: ler `docs/review-packet-2/REVISAO-ENTRADA.md` (onde responder cada pergunta) + `matrix §29.2` (nível por F01–F12) + `§29.3` (8 limitações) antes de qualquer código; reproduzir a sonda R correspondente antes do fix; fechar com build+test frescos e log com exit capturado.
 
 ---
-Skipped: full `bun test`/`bun run build` e qualquer re-demo live (read-only + sem checkout por instrução). Risk: processos/demos legados ainda vivos (`mc-is-even`, `demo-fixes2`, `resume --intake 74e22607`) — coordenar antes de matar/limpar; `logs/v2/` só existe em `/tmp/opencode/v2/`, não na árvore.
+## 10. Rodada REVISAO_b99c25c (2026-10-30, HEAD b99c25c → novo commit)
+
+Lanes paralelos com propriedade exclusiva; explorers antes, 3 fixers depois (fix-1 gate/evidência, fix-2 modelo/handoff, fix-3 isolamento/wire). Full final: `bun run build` exit 0; `bun test` 1142 pass / 11 skip / 0 fail / 83 arquivos (logs em docs/evidencias-R01-R09/{build-R2,full-test-R2,demo-R2,lane-R2}.log).
+
+| Relatório | Correção | Prova |
+| --- | --- | --- |
+| §3 Sonda A (título sem cobertura → pass) | `assessFunctionalCoverage` (símbolo do requisito definido no impl + chamado no teste, strings/comentários removidos + sinal de pass no output); âncora sozinha nunca decide | tests/lib/reviewer.test.ts Sonda A rejeita |
+| §3 Sonda B (cobertura real, outro título → fail) | mesma suficiência: aceita quando assert chama a implementação | reviewer.test.ts Sonda B aceita |
+| §4 worktree sujo etiquetado no commit errado | gather observa HEAD/sujeira (recusa divergente), detached imutável, taskHead/baseHead/candidateHead separados; nunca `testedCommit=jobHead` cego | sonda manual exit 1, dirty=false, FAIL got=0 |
+| §5 TUI só comentário | serve POSTa triplo completo via `v2CreateSessionWithVerifiedModel` (echo default, GET estrito opt-in); TUI declara `TUI_MODEL_BLOCKADE {pinned:false}` sem recolocar `-m`; variant propagada em launch.ts | model-serve-verify + model-tui-blockade verdes; `opencode -m` exit 1; serve real ecoa triplo |
+| §6 handoff encerra o próprio condutor | handoff registra dono durável + evidência de workers vivos (tmux), persiste fail-closed, só então shutdown do temporário; sem prometer `resume` manual | approve-handoff.test.ts 3/3 |
+| §7 testes disparam workers reais | helper tests/helpers/test-env.ts (isLive/uniqueName/posse/XDG); live só com TEST_LIVE=1; kill só com posse; sessão por execução | lane 30 pass 11 skip; tmux ls inalterado (8 mc-* preservadas) |
+| §7 wire createPR só-no-full | causa provada: `vi.mock getDataDir` de plan-state/config/port-allocator vaza entre arquivos → `join(undefined)` = `paths[0] must be string`; fix sem mascarar: wire mocka loadPlan→null + XDG isolado | wire 11/0 isolado e no full |
+| §9 scope sobrescrito | saveMergeEvidence monotônico (task passed imutável contra skipped/integration); registros separados | evidence-trail-regression verde |
+
+Pendências honestas: suficiência é sintática (chama sem asserir pode passar; revisor OpenCode futuro endurece); echo ausente pula verificação (2.1.4 sempre ecoa, gap teórico); continuidade pós-approve = workers em tmux + próxima passada retoma (contrato estado/mensagem, sem run multi-processo live).
+
+Skipped: live E2E multi-processo e despacho com consumo de modelo. Risk: sessões tmux legadas preservadas de propósito; full 35s.
 
 ## 9. Progresso final por achado (2026-10-30, lane docs — só acréscimo, sem reescrever §§1–8)
 

@@ -9,7 +9,7 @@ import {
   refreshIntegrationFromMain,
 } from '../../src/lib/integration';
 
-const TEST_REPO_DIR = join(tmpdir(), '.tmp-integration-test-repo');
+let TEST_REPO_DIR = '';
 
 async function exec(
   args: string[],
@@ -93,21 +93,33 @@ async function cleanupTestRepo(): Promise<void> {
 }
 
 describe('integration', () => {
+  // Git-only suite (local git/worktrees in temp dirs). Never touches tmux or
+  // opencode drivers; XDG + repo path are unique per test to avoid leaking
+  // cwd/state into other files in the shared bun process.
   let originalCwd: string;
   let mainRepoDir: string;
 
   beforeEach(async () => {
+    const fs = await import('fs');
     originalCwd = process.cwd();
+    // Unique per-test base: no fixed .tmp-integration-test-repo path.
+    TEST_REPO_DIR = await fs.promises.mkdtemp(join(tmpdir(), 'mc-integration-test-'));
     await setupTestRepo();
     mainRepoDir = join(TEST_REPO_DIR, 'main');
-    vi.spyOn(paths, 'getProjectId').mockResolvedValue('test-project');
+    vi.spyOn(paths, 'getProjectId').mockResolvedValue(`test-project-${Date.now().toString(36)}`);
     vi.spyOn(paths, 'getXdgDataDir').mockReturnValue(
       join(TEST_REPO_DIR, '.xdg-data'),
     );
   });
 
   afterEach(async () => {
-    process.chdir(originalCwd);
+    try {
+      process.chdir(originalCwd);
+    } catch {
+      try {
+        process.chdir(tmpdir());
+      } catch {}
+    }
     vi.restoreAllMocks();
     await cleanupTestRepo();
   });

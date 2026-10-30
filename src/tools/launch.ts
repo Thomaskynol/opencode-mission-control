@@ -23,7 +23,7 @@ import { getCurrentModel, getCurrentModelInfo } from '../lib/model-tracker';
 import { allocatePort, releasePort } from '../lib/port-allocator';
 import {
   quoteShellPath,
-  v2CreateSession,
+  v2CreateSessionWithVerifiedModel,
   v2Prompt,
   v2WaitForServer,
 } from '../lib/sdk-client';
@@ -315,10 +315,17 @@ export const mc_launch: ToolDefinition = tool({
           autoCommit: config.autoCommit,
         });
         const modelInfo = getCurrentModelInfo(context?.sessionID);
-        const created = await v2CreateSession(client, {
+        // R03: the full triple (variant included) is pinned and verified
+        // back via GET — a silent server default throws instead of running
+        // under the wrong model.
+        const created = await v2CreateSessionWithVerifiedModel(client, {
           agent: undefined,
           model: modelInfo
-            ? { providerID: modelInfo.providerID, id: modelInfo.modelID }
+            ? {
+                providerID: modelInfo.providerID,
+                id: modelInfo.modelID,
+                ...(modelInfo.variant ? { variant: modelInfo.variant } : {}),
+              }
             : undefined,
           location: { directory: worktreePath },
           // Allow-inside ruleset: reads/writes/shell within the worktree
@@ -362,6 +369,9 @@ export const mc_launch: ToolDefinition = tool({
           autoCommit: config.autoCommit,
         });
         promptFilePath = await writePromptFile(worktreePath, fullPrompt);
+        // TUI root cannot apply a model pin (no -m/--model in v2.1.4): pass
+        // the tracked string through unchanged — writeLauncherScript records
+        // it as NOT pinned. Serve mode is the pinned path.
         const model = getCurrentModel(context?.sessionID);
         launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
       } catch (error) {
