@@ -1,34 +1,17 @@
-import { mock, describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as paths from '../../src/lib/paths';
-
-mock.module('../../src/lib/job-state', () => ({
-  getRunningJobs: mock(),
-  getJob: mock(),
-  updateJob: mock(),
-  // Pulled in transitively via durable-state; unused on this file's paths.
-  migrateJobState: mock(() => ({ version: 3, jobs: [], updatedAt: new Date().toISOString() })),
-}));
-
-mock.module('../../src/lib/tmux', () => ({
-  isPaneRunning: mock(),
-  capturePane: mock(),
-  captureExitStatus: mock(),
-}));
-
-mock.module('../../src/lib/reports', () => ({
-  readReport: mock(),
-}));
-
-const { JobMonitor } = await import('../../src/lib/monitor');
-const { eventBelongsToSession } = await import('../../src/lib/monitor');
-const jobState = await import('../../src/lib/job-state');
+import * as jobState from '../../src/lib/job-state';
+import * as tmuxMod from '../../src/lib/tmux';
+import * as reportsMod from '../../src/lib/reports';
+import { JobMonitor } from '../../src/lib/monitor';
+import { eventBelongsToSession } from '../../src/lib/monitor';
 const { getPendingQuestionsForJob } = await import('../../src/lib/question-relay');
 const { loadRuntimeSnapshot } = await import('../../src/lib/durable-state');
 
-const mockGetJob = (jobState as any).getJob as Mock<any>;
-const mockUpdateJob = jobState.updateJob as Mock<any>;
+let mockGetJob: Mock<any>;
+let mockUpdateJob: Mock<any>;
 
 const realFetch = globalThis.fetch;
 let testBaseDir = '';
@@ -55,8 +38,13 @@ function v2Job(overrides: Record<string, unknown> = {}): any {
 
 describe('monitor v2 events', () => {
   beforeEach(async () => {
-    mockGetJob.mockReset();
-    mockUpdateJob.mockReset();
+    mockGetJob = spyOn(jobState, 'getJob').mockResolvedValue(undefined as any);
+    mockUpdateJob = spyOn(jobState, 'updateJob').mockResolvedValue(undefined as any);
+    // Isolate tmux/reports without leaking module mocks to other files.
+    spyOn(tmuxMod, 'isPaneRunning').mockResolvedValue(false as never);
+    spyOn(tmuxMod, 'capturePane').mockResolvedValue('' as never);
+    spyOn(tmuxMod, 'captureExitStatus').mockResolvedValue(undefined as never);
+    spyOn(reportsMod, 'readReport').mockResolvedValue(null as never);
     const fs = await import('fs');
     testBaseDir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-monitor-v2-test-'));
     testStateDir = join(testBaseDir, 'state');
@@ -67,7 +55,7 @@ describe('monitor v2 events', () => {
 
   afterEach(async () => {
     globalThis.fetch = realFetch;
-    (paths.getDataDir as Mock<any>).mockRestore?.();
+    mock.restore();
     const fs = await import('fs');
     if (testBaseDir && fs.existsSync(testBaseDir)) {
       fs.rmSync(testBaseDir, { recursive: true, force: true });

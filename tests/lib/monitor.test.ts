@@ -1,53 +1,36 @@
-import { mock, describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
 import type { Job } from '../../src/lib/job-state';
+import * as jobState from '../../src/lib/job-state';
+import * as tmux from '../../src/lib/tmux';
+import * as reports from '../../src/lib/reports';
+import { JobMonitor } from '../../src/lib/monitor';
 
-mock.module('../../src/lib/job-state', () => ({
-  getRunningJobs: mock(),
-  getJob: mock(),
-  updateJob: mock(),
-  // Linked transitively via durable-state; unused on this file's paths.
-  migrateJobState: mock(),
-  migrateV2ToV3: mock(),
-}));
-
-mock.module('../../src/lib/tmux', () => ({
-  isPaneRunning: mock(),
-  capturePane: mock(),
-  captureExitStatus: mock(),
-}));
-
-mock.module('../../src/lib/reports', () => ({
-  readReport: mock(),
-}));
-
-const { JobMonitor } = await import('../../src/lib/monitor');
-const jobState = await import('../../src/lib/job-state');
-const tmux = await import('../../src/lib/tmux');
-const reports = await import('../../src/lib/reports');
-
-const mockGetRunningJobs = jobState.getRunningJobs as Mock<any>;
-const mockGetJob = (jobState as any).getJob as Mock<any>;
-const mockUpdateJob = jobState.updateJob as Mock<any>;
-const mockIsPaneRunning = tmux.isPaneRunning as Mock<any>;
-const mockCapturePane = (tmux as any).capturePane as Mock<any>;
-const mockCaptureExitStatus = (tmux as any).captureExitStatus as Mock<any>;
-const mockReadReport = reports.readReport as Mock<any>;
+let mockGetRunningJobs: Mock<any>;
+let mockGetJob: Mock<any>;
+let mockUpdateJob: Mock<any>;
+let mockIsPaneRunning: Mock<any>;
+let mockCapturePane: Mock<any>;
+let mockCaptureExitStatus: Mock<any>;
+let mockReadReport: Mock<any>;
 
 const IDLE_OUTPUT = 'Some response\n  ctrl+t variants  tab agents  ctrl+p commands\n';
 const STREAMING_OUTPUT = 'Working...\n  ⬝⬝⬝⬝  esc interrupt  ctrl+p commands\n';
 
 describe('JobMonitor', () => {
   beforeEach(() => {
-    mockGetRunningJobs.mockReset();
-    mockGetJob.mockReset();
-    mockUpdateJob.mockReset();
-    mockIsPaneRunning.mockReset();
-    mockCapturePane.mockReset();
-    mockCaptureExitStatus.mockReset();
-    mockReadReport.mockReset();
-    mockGetRunningJobs.mockResolvedValue([]);
+    mockGetRunningJobs = spyOn(jobState, 'getRunningJobs').mockResolvedValue([]);
+    mockGetJob = spyOn(jobState, 'getJob').mockResolvedValue(undefined as any);
+    mockUpdateJob = spyOn(jobState, 'updateJob').mockResolvedValue(undefined as any);
+    mockIsPaneRunning = spyOn(tmux, 'isPaneRunning').mockResolvedValue(false as never);
+    mockCapturePane = spyOn(tmux, 'capturePane').mockResolvedValue('' as never);
+    mockCaptureExitStatus = spyOn(tmux, 'captureExitStatus').mockResolvedValue(undefined as never);
+    mockReadReport = spyOn(reports, 'readReport').mockResolvedValue(null as never);
     mockGetJob.mockResolvedValue(undefined);
     mockReadReport.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    mock.restore();
   });
 
   describe('constructor', () => {

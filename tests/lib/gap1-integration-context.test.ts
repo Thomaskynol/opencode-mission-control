@@ -41,82 +41,104 @@ function makeJob(name: string, overrides: Partial<JobSpec> = {}): JobSpec {
 }
 
 /**
- * Gap1 TDD: repo-wide test that only passes with siblings.
- * Two scoped tasks (helpers/a.js, helpers/b.js); global `node check.mjs`
- * requires BOTH. Isolated worktrees have only one sibling -> CHECK FAIL.
- * Integration post-merge (both present) -> CHECK PASS.
- * Must run via the public orchestrator merge path (reconcile with a real
- * MergeTrain), never a harness calling reviewJob directly.
+ * R01 gap1: sibling tasks under the functional gate. A sibling delivered
+ * with the wrong implementation and a green-but-irrelevant suite must NOT
+ * merge (the queue blocks behind it, the plan pauses for correction) — even
+ * though the old structural gate merged both and only checked post-merge.
+ * After correcting the code AND making the test exercise the requirement
+ * (missing siblings only skip, never fail), each task re-verifies in its own
+ * scope and both merge; the repo-wide check passes post-merge.
+ *
+ * Via the public orchestrator merge path (reconcile with a real MergeTrain),
+ * never a harness calling reviewJob directly. TDD: this test FAILS on the old
+ * structural-only gate (wrong sibling merges) and PASSES on the functional
+ * gate + correction loop.
  */
-describe('gap1: repo-wide test runs in integration context, not isolated worktree', () => {
+describe('R01 gap1: wrong sibling with irrelevant green suite blocks the queue until corrected', () => {
   let rootDir: string;
   let repoDir: string;
   let integrationWorktree: string;
-  let wtA: string;
-  let wtB: string;
   let planState: PlanSpec | null;
   let monitor: EventEmitter;
   let testStateDir: string;
   let restoreDataDir: () => void = () => {};
 
-  const checkMjs = `import fs from 'node:fs';
-const fail=(m)=>{console.error('CHECK FAIL: '+m);process.exit(1)};
-const must=(c,m)=>{if(!c)fail(m)};
-must(fs.existsSync('helpers/a.js'),'missing helpers/a.js');
-must(fs.existsSync('helpers/b.js'),'missing helpers/b.js');
-const {a}=await import('./helpers/a.js');
-const {b}=await import('./helpers/b.js');
-must(a()===1,'a() behavior');
-must(b()===2,'b() behavior');
-console.log('CHECK PASS: siblings present');
+  const trivialCheckMjs = `console.log('CHECK PASS: trivial');\n`;
+  // Relevant check: asserts each PRESENT helper, skips missing siblings
+  // (a sibling merged later must not fail this task's gate), always prints
+  // the acceptance anchor next to runner tokens when exercised.
+  const relevantCheckMjs = `let failed = false;
+const lines = [];
+try {
+  const { a } = await import('./helpers/a.js');
+  if (a() === 1) lines.push('test a()===1: PASS');
+  else { lines.push('test a()===1: FAIL'); failed = true; }
+} catch { lines.push('note: helpers/a.js missing (sibling pending), skipping'); }
+try {
+  const { b } = await import('./helpers/b.js');
+  if (b() === 2) lines.push('test b()===2: PASS');
+  else { lines.push('test b()===2: FAIL'); failed = true; }
+} catch { lines.push('note: helpers/b.js missing (sibling pending), skipping'); }
+console.log(lines.join('\\n'));
+if (failed) process.exit(1);
 `;
 
+  function makeConfig() {
+    return {
+      defaultPlacement: 'session',
+      pollInterval: 10000,
+      idleThreshold: 300000,
+      worktreeBasePath: '/tmp',
+      omo: { enabled: false, defaultMode: 'vanilla' },
+      testCommand: 'node check.mjs',
+    } as never;
+  }
+
+  function driveRound(orchestrator: Orchestrator): Promise<void> {
+    return (async () => {
+      for (let i = 0; i < 15; i++) {
+        await (orchestrator as unknown as { reconcile: () => Promise<void> }).reconcile();
+        const cur = planState!;
+        if (cur.jobs.every((j) => j.status === 'merged')) break;
+        if (cur.status === 'paused') break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    })();
+  }
+
   beforeEach(async () => {
-    rootDir = mkdtempSync(join(tmpdir(), 'mc-gap1-'));
+    rootDir = mkdtempSync(join(tmpdir(), 'mc-gap1-')); 
     repoDir = join(rootDir, 'repo');
     mkdirSync(repoDir, { recursive: true });
     await mustExec(['git', 'init'], repoDir);
     await mustExec(['git', 'config', 'user.email', 'test@test.com'], repoDir);
     await mustExec(['git', 'config', 'user.name', 'Test'], repoDir);
-    writeFileSync(join(repoDir, 'check.mjs'), checkMjs);
+    writeFileSync(join(repoDir, 'check.mjs'), trivialCheckMjs);
     writeFileSync(join(repoDir, 'base.txt'), 'base\n');
     await mustExec(['git', 'add', '.'], repoDir);
     await mustExec(['git', 'commit', '-m', 'initial'], repoDir);
     await mustExec(['git', 'branch', '-M', 'main'], repoDir);
 
-    // Branch A: helpers/a.js only (isolated: missing b.js -> check FAILS).
+    // Branch A: WRONG helper (a() returns 0), suite stays green because the
+    // trivial check never exercises it.
     await mustExec(['git', 'checkout', '-b', 'feature-a', 'main'], repoDir);
     mkdirSync(join(repoDir, 'helpers'), { recursive: true });
-    writeFileSync(join(repoDir, 'helpers/a.js'), 'export function a(){return 1;}\n');
+    writeFileSync(join(repoDir, 'helpers/a.js'), 'export function a(){return 0;}\n');
     await mustExec(['git', 'add', '.'], repoDir);
-    await mustExec(['git', 'commit', '-m', 'add a'], repoDir);
+    await mustExec(['git', 'commit', '-m', 'add wrong a'], repoDir);
     await mustExec(['git', 'checkout', 'main'], repoDir);
 
-    // Branch B: helpers/b.js only (isolated: missing a.js -> check FAILS).
+    // Branch B: correct helper, same trivial (irrelevant) suite.
     await mustExec(['git', 'checkout', '-b', 'feature-b', 'main'], repoDir);
-    // helpers dir may not exist on main; recreate.
     try { mkdirSync(join(repoDir, 'helpers'), { recursive: true }); } catch {}
     writeFileSync(join(repoDir, 'helpers/b.js'), 'export function b(){return 2;}\n');
     await mustExec(['git', 'add', '.'], repoDir);
     await mustExec(['git', 'commit', '-m', 'add b'], repoDir);
     await mustExec(['git', 'checkout', 'main'], repoDir);
 
-    // Integration branch + worktree (post-merge: both siblings present -> PASS).
     await mustExec(['git', 'branch', 'integration'], repoDir);
     integrationWorktree = join(rootDir, 'integration-worktree');
     await mustExec(['git', 'worktree', 'add', integrationWorktree, 'integration'], repoDir);
-
-    // Isolated worktrees (each missing its sibling -> check FAILS in isolation).
-    wtA = join(rootDir, 'wt-a');
-    wtB = join(rootDir, 'wt-b');
-    await mustExec(['git', 'worktree', 'add', wtA, 'feature-a'], repoDir);
-    await mustExec(['git', 'worktree', 'add', wtB, 'feature-b'], repoDir);
-
-    // Sanity: isolated contexts fail, combined integration will pass after merges.
-    const isolatedA = await exec(['node', 'check.mjs'], wtA);
-    expect(isolatedA.exitCode).not.toBe(0);
-    const isolatedB = await exec(['node', 'check.mjs'], wtB);
-    expect(isolatedB.exitCode).not.toBe(0);
 
     // In-memory plan state with REAL repo paths; REAL MergeTrain (no fake).
     planState = null;
@@ -132,17 +154,15 @@ console.log('CHECK PASS: siblings present');
           status: 'completed',
           mergeOrder: 0,
           branch: 'feature-a',
-          worktreePath: wtA,
-          touchSet: ['helpers/a.js'],
-          prompt: `Create helpers/a.js worktree-local.\n\nAcceptance criteria:\n- [ ] helpers/a.js exists as ESM\n- [ ] node --check passes`,
+          touchSet: ['helpers/a.js', 'check.mjs'],
+          prompt: `Create helpers/a.js worktree-local.\n\nAcceptance criteria:\n- [ ] a()===1`,
         }),
         makeJob('helper-b', {
           status: 'completed',
           mergeOrder: 1,
           branch: 'feature-b',
-          worktreePath: wtB,
-          touchSet: ['helpers/b.js'],
-          prompt: `Create helpers/b.js worktree-local.\n\nAcceptance criteria:\n- [ ] helpers/b.js exists as ESM\n- [ ] node --check passes`,
+          touchSet: ['helpers/b.js', 'check.mjs'],
+          prompt: `Create helpers/b.js worktree-local.\n\nAcceptance criteria:\n- [ ] b()===2`,
         }),
       ],
       integrationBranch: 'integration',
@@ -201,33 +221,58 @@ console.log('CHECK PASS: siblings present');
     if (rootDir) rmSync(rootDir, { recursive: true, force: true });
   });
 
-  it('merges sibling tasks via integration verification (no isolated repo-wide gate)', async () => {
-    const orchestrator = new Orchestrator(monitor as never, {
-      defaultPlacement: 'session',
-      pollInterval: 10000,
-      idleThreshold: 300000,
-      worktreeBasePath: '/tmp',
-      omo: { enabled: false, defaultMode: 'vanilla' },
-      testCommand: 'node check.mjs',
-    } as never);
-    (orchestrator as unknown as { repoRoot: string }).repoRoot = repoDir;
-    (orchestrator as unknown as { activePlanId: string }).activePlanId = 'plan-gap1';
+  it('wrong sibling is rejected with the queue blocked; correction lets both merge with repo-wide check passing', async () => {
+    const newOrchestrator = () => {
+      const o = new Orchestrator(monitor as never, makeConfig());
+      (o as unknown as { repoRoot: string }).repoRoot = repoDir;
+      (o as unknown as { activePlanId: string }).activePlanId = 'plan-gap1';
+      return o;
+    };
 
-    // Drive the PUBLIC merge path (reconciler + real MergeTrain), repeatedly
-    // until quiescent: each pass merges at most one job, so loop.
-    for (let i = 0; i < 10; i++) {
-      await (orchestrator as unknown as { reconcile: () => Promise<void> }).reconcile();
-      const cur = planState!;
-      if (cur.jobs.every((j) => j.status === 'merged')) break;
-      if (cur.status === 'paused') break;
-      await new Promise((r) => setTimeout(r, 50));
+    // Round 1: helper-a is wrong, suite green-but-irrelevant → rejected, the
+    // queue blocks behind it (helper-b never attempted), plan pauses.
+    await driveRound(newOrchestrator());
+    const round1 = planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',');
+    expect(round1).not.toContain('merged');
+    expect(round1).toContain('helper-a:failed');
+    expect(planState!.status).toBe('paused');
+    expect(planState!.jobs.find((j) => j.name === 'helper-a')!.error ?? '').toMatch(/do not cover requirement|a\(\)===1/);
+
+    // Correction: fix a() and make the suite exercise the requirements
+    // (identical check on both branches so the later merge stays clean).
+    await mustExec(['git', 'checkout', 'feature-a'], repoDir);
+    writeFileSync(join(repoDir, 'helpers/a.js'), 'export function a(){return 1;}\n');
+    writeFileSync(join(repoDir, 'check.mjs'), relevantCheckMjs);
+    await mustExec(['git', 'add', '.'], repoDir);
+    await mustExec(['git', 'commit', '-m', 'correct a + relevant check'], repoDir);
+    await mustExec(['git', 'checkout', 'feature-b'], repoDir);
+    writeFileSync(join(repoDir, 'check.mjs'), relevantCheckMjs);
+    await mustExec(['git', 'add', '.'], repoDir);
+    await mustExec(['git', 'commit', '-m', 'relevant check'], repoDir);
+    await mustExec(['git', 'checkout', 'main'], repoDir);
+
+    // Retry: corrected jobs re-report completion, pause cleared.
+    for (const name of ['helper-a', 'helper-b']) {
+      await (planStateMod.updatePlanJob as (planId: string, jobName: string, updates: Partial<JobSpec>) => Promise<void>)(
+        'plan-gap1',
+        name,
+        { status: 'completed', error: undefined } as Partial<JobSpec>,
+      );
     }
+    await (planStateMod.updatePlanFields as (planId: string, updates: Partial<PlanSpec>) => Promise<void>)(
+      'plan-gap1',
+      { status: 'running', checkpoint: null, checkpointContext: null } as unknown as Partial<PlanSpec>,
+    );
 
-    // GREEN: both siblings merged; integration holds both; repo-wide check passes there.
-    expect(planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',')).toContain('helper-a:merged');
-    expect(planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',')).toContain('helper-b:merged');
+    // Round 2: each sibling re-verifies in its own scope, both merge, the
+    // repo-wide check passes post-merge.
+    await driveRound(newOrchestrator());
+    const round2 = planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',');
+    expect(round2).toContain('helper-a:merged');
+    expect(round2).toContain('helper-b:merged');
     const final = await exec(['node', 'check.mjs'], integrationWorktree);
     expect(final.exitCode).toBe(0);
-    expect(final.stdout).toMatch(/CHECK PASS/);
+    expect(final.stdout).toMatch(/a\(\)===1/);
+    expect(final.stdout).toMatch(/b\(\)===2/);
   });
 });

@@ -63,14 +63,19 @@ function stubDataDir(dir: string): () => void {
 }
 
 /**
- * Defect 1 (gate pré-merge imergeável): a task whose acceptance cites the
- * global test command must NOT be gated pre-merge on a repo-wide run in the
- * integration worktree WITHOUT its own change (deterministic fail for
- * aggregator tasks), and anchors must not demand acceptance verbatim text in
- * runner stdout. Pre-merge gate is structural-only; the global test runs once
- * post-all-merged. Via the public orchestrator merge path (real MergeTrain).
+ * R01 (functional gate): a task whose implementation is wrong but whose
+ * suite is green-yet-irrelevant must NOT merge. The gate runs the test
+ * command itself (product-observed evidence) and judges coverage: a green
+ * suite that does not exercise the acceptance requirement fails. After an
+ * explicit correction (fixed code + a test that exercises the requirement)
+ * the same path re-verifies and merges.
+ *
+ * Via the public orchestrator merge path (reconcile with a real MergeTrain),
+ * never a harness calling reviewJob directly. TDD: this test FAILS on the
+ * old structural-only gate (any non-empty diff merged) and PASSES on the
+ * functional gate + correction loop.
  */
-describe('defect 1: task citing the global test merges structurally pre-merge', () => {
+describe('R01: wrong implementation with green irrelevant suite is rejected, correction merges after reverification', () => {
   let rootDir: string;
   let repoDir: string;
   let integrationWorktree: string;
@@ -78,32 +83,59 @@ describe('defect 1: task citing the global test merges structurally pre-merge', 
   let monitor: EventEmitter;
   let restoreDataDir: () => void = () => {};
 
-  const checkMjs = `import fs from 'node:fs';
-const fail=(m)=>{console.error('CHECK FAIL: '+m);process.exit(1)};
-let readme=''; try{readme=fs.readFileSync('README.md','utf8');}catch{fail('missing README.md');}
-if(!readme.includes('helpers')) fail('README must document helpers');
-console.log('CHECK PASS: docs present');
+  const trivialCheckMjs = `console.log('CHECK PASS: trivial');\n`;
+  const wrongTotalMjs = `export function total(xs){ return 0; }\n`;
+  const fixedTotalMjs = `export function total(xs){ return xs.reduce((a, b) => a + b, 0); }\n`;
+  const relevantCheckMjs = `import { total } from './total.mjs';
+const got = total([1,2]);
+if (got === 3) { console.log('test total([1,2])===3: PASS'); }
+else { console.log('test total([1,2])===3: FAIL (got ' + got + ')'); process.exit(1); }
 `;
 
+  const acceptancePrompt = `Implement total().\n\nAcceptance criteria:\n- [ ] total([1,2])===3`;
+
+  function makeConfig() {
+    return {
+      defaultPlacement: 'session',
+      pollInterval: 10000,
+      idleThreshold: 300000,
+      worktreeBasePath: '/tmp',
+      omo: { enabled: false, defaultMode: 'vanilla' },
+      testCommand: 'node check.mjs',
+    } as never;
+  }
+
+  function driveRound(orchestrator: Orchestrator): Promise<void> {
+    return (async () => {
+      for (let i = 0; i < 15; i++) {
+        await (orchestrator as unknown as { reconcile: () => Promise<void> }).reconcile();
+        const cur = planState!;
+        if (cur.jobs.every((j) => j.status === 'merged')) break;
+        if (cur.status === 'paused') break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    })();
+  }
+
   beforeEach(async () => {
-    rootDir = mkdtempSync(join(tmpdir(), 'mc-gate1-'));
+    rootDir = mkdtempSync(join(tmpdir(), 'mc-r01-'));
     repoDir = join(rootDir, 'repo');
     mkdirSync(repoDir, { recursive: true });
     await mustExec(['git', 'init'], repoDir);
     await mustExec(['git', 'config', 'user.email', 'test@test.com'], repoDir);
     await mustExec(['git', 'config', 'user.name', 'Test'], repoDir);
-    writeFileSync(join(repoDir, 'check.mjs'), checkMjs);
+    writeFileSync(join(repoDir, 'check.mjs'), trivialCheckMjs);
     writeFileSync(join(repoDir, 'base.txt'), 'base\n');
     await mustExec(['git', 'add', '.'], repoDir);
     await mustExec(['git', 'commit', '-m', 'initial'], repoDir);
     await mustExec(['git', 'branch', '-M', 'main'], repoDir);
 
-    // Aggregator-style job branch: adds ONLY the README (integration without
-    // this change can never pass the global check — pre-merge probe fails).
-    await mustExec(['git', 'checkout', '-b', 'feature-docs', 'main'], repoDir);
-    writeFileSync(join(repoDir, 'README.md'), '# docs\nhelpers: a, b\n');
+    // Job branch: WRONG implementation (total returns 0), suite stays green
+    // because check.mjs never exercises the requirement.
+    await mustExec(['git', 'checkout', '-b', 'feature-total', 'main'], repoDir);
+    writeFileSync(join(repoDir, 'total.mjs'), wrongTotalMjs);
     await mustExec(['git', 'add', '.'], repoDir);
-    await mustExec(['git', 'commit', '-m', 'docs'], repoDir);
+    await mustExec(['git', 'commit', '-m', 'wrong total'], repoDir);
     await mustExec(['git', 'checkout', 'main'], repoDir);
 
     await mustExec(['git', 'branch', 'integration'], repoDir);
@@ -112,17 +144,19 @@ console.log('CHECK PASS: docs present');
 
     const baseCommit = await mustExec(['git', 'rev-parse', 'main'], repoDir);
     planState = {
-      id: 'plan-gate1',
-      name: 'gate1 docs',
+      id: 'plan-r01',
+      name: 'r01 total',
       mode: 'autopilot',
       status: 'running',
       jobs: [
-        makeJob('readme-docs', {
+        makeJob('sum-total', {
           status: 'completed',
           mergeOrder: 0,
-          branch: 'feature-docs',
-          touchSet: ['README.md'],
-          prompt: `Document helpers.\n\nAcceptance criteria:\n- [ ] README documents helpers\n- [ ] node check.mjs passes`,
+          branch: 'feature-total',
+          // No worktreePath: no autonomous relaunch in this env — the fail
+          // is explicit (failed + paused for an operator correction).
+          touchSet: ['total.mjs', 'check.mjs'],
+          prompt: acceptancePrompt,
         }),
       ],
       integrationBranch: 'integration',
@@ -174,30 +208,47 @@ console.log('CHECK PASS: docs present');
     if (rootDir) rmSync(rootDir, { recursive: true, force: true });
   });
 
-  it('global-citing task merges without an isolated repo-wide probe; global runs post-merge', async () => {
-    const orchestrator = new Orchestrator(monitor as never, {
-      defaultPlacement: 'session',
-      pollInterval: 10000,
-      idleThreshold: 300000,
-      worktreeBasePath: '/tmp',
-      omo: { enabled: false, defaultMode: 'vanilla' },
-      testCommand: 'node check.mjs',
-    } as never);
-    (orchestrator as unknown as { repoRoot: string }).repoRoot = repoDir;
-    (orchestrator as unknown as { activePlanId: string }).activePlanId = 'plan-gate1';
+  it('rejects the wrong implementation despite the green suite, then merges after correction + reverification', async () => {
+    const newOrchestrator = () => {
+      const o = new Orchestrator(monitor as never, makeConfig());
+      (o as unknown as { repoRoot: string }).repoRoot = repoDir;
+      (o as unknown as { activePlanId: string }).activePlanId = 'plan-r01';
+      return o;
+    };
 
-    for (let i = 0; i < 10; i++) {
-      await (orchestrator as unknown as { reconcile: () => Promise<void> }).reconcile();
-      const cur = planState!;
-      if (cur.jobs.every((j) => j.status === 'merged')) break;
-      if (cur.status === 'paused') break;
-      await new Promise((r) => setTimeout(r, 50));
-    }
+    // Round 1: wrong code, irrelevant-but-green suite → must NOT merge.
+    await driveRound(newOrchestrator());
+    expect(planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',')).not.toContain('merged');
+    expect(planState!.jobs[0].status).toBe('failed');
+    expect(planState!.status).toBe('paused');
+    expect(planState!.jobs[0].error ?? '').toMatch(/do not cover requirement|total\(\[1,2\]\)===3/);
 
-    expect(planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',')).toContain('readme-docs:merged');
+    // Correction (operator/worker): fix the code AND make the test exercise
+    // the requirement, on the job branch.
+    await mustExec(['git', 'checkout', 'feature-total'], repoDir);
+    writeFileSync(join(repoDir, 'total.mjs'), fixedTotalMjs);
+    writeFileSync(join(repoDir, 'check.mjs'), relevantCheckMjs);
+    await mustExec(['git', 'add', '.'], repoDir);
+    await mustExec(['git', 'commit', '-m', 'correct total + relevant check'], repoDir);
+    await mustExec(['git', 'checkout', 'main'], repoDir);
+
+    // Retry: job re-reports completion, pause cleared, fresh reconciler.
+    await (planStateMod.updatePlanJob as (planId: string, jobName: string, updates: Partial<JobSpec>) => Promise<void>)(
+      'plan-r01',
+      'sum-total',
+      { status: 'completed', error: undefined } as Partial<JobSpec>,
+    );
+    await (planStateMod.updatePlanFields as (planId: string, updates: Partial<PlanSpec>) => Promise<void>)(
+      'plan-r01',
+      { status: 'running', checkpoint: null, checkpointContext: null } as unknown as Partial<PlanSpec>,
+    );
+
+    // Round 2: reverification of the corrected candidate → merges.
+    await driveRound(newOrchestrator());
+    expect(planState!.jobs.map((j) => `${j.name}:${j.status}`).join(',')).toContain('sum-total:merged');
     const final = await exec(['node', 'check.mjs'], integrationWorktree);
     expect(final.exitCode).toBe(0);
-    expect(final.stdout).toMatch(/CHECK PASS/);
+    expect(final.stdout).toMatch(/total\(\[1,2\]\)===3/);
   });
 });
 
