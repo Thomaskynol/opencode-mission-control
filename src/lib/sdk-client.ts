@@ -351,6 +351,69 @@ export async function v2CreateSessionWithVerifiedModel(
   return observed;
 }
 
+// ---------------------------------------------------------------------------
+// Reusable serve worker launcher (autonomous path entry for the integrador).
+// Extracted from the mc_launch serve branch: same POST+prompt sequence, no
+// tmux side effects here (tmuxTarget is a passthrough owned by the caller).
+// ---------------------------------------------------------------------------
+
+/** Session profile for a serve worker: agent, permissions, title. */
+export interface ServeWorkerProfile {
+  agent?: string;
+  permissions?: V2PermissionRule[];
+  title?: string;
+}
+
+export interface ServeWorkerInput {
+  /** Worktree directory the worker session is scoped to. */
+  worktree: string;
+  /** Full worker prompt (already suffixed by the caller). */
+  prompt: string;
+  /** Pinned model triple (variant preserved). Absent = server default. */
+  model?: V2ModelRef;
+  /** Session profile: agent, permissions, title. */
+  profile?: ServeWorkerProfile;
+  /** Passthrough: tmux target created by the caller (caller owns tmux). */
+  tmuxTarget?: string;
+  /** Verification mode, default 'echo' (no extra GET; 'get' adds GET round-trip). */
+  verify?: ServeModelVerifyMode;
+}
+
+export interface ServeWorkerHandle {
+  sessionId: string;
+  tmuxTarget?: string;
+  /** Observed model (server echo) or, when the echo is absent, the requested pin. */
+  model?: V2ModelRef;
+}
+
+/**
+ * Create a serve session with the pinned triple (fail-closed via echo/GET),
+ * deliver the prompt, and return the handle.
+ * Echo mode performs exactly two calls (POST session + POST prompt) with no
+ * extra GET; get mode adds the verification GET. A present-but-different
+ * echo/mismatch throws before the prompt is sent.
+ */
+export async function launchWorkerViaServe(
+  client: V2Client,
+  input: ServeWorkerInput,
+): Promise<ServeWorkerHandle> {
+  const body: V2CreateSessionBody = {
+    ...(input.profile?.agent !== undefined ? { agent: input.profile.agent } : {}),
+    ...(input.model ? { model: { ...input.model } } : {}),
+    location: { directory: input.worktree },
+    ...(input.profile?.permissions ? { permissions: input.profile.permissions } : {}),
+    ...(input.profile?.title !== undefined ? { title: input.profile.title } : {}),
+  };
+  const created = await v2CreateSessionWithVerifiedModel(client, body, input.verify ?? 'echo');
+  await v2Prompt(client, created.id, input.prompt);
+  const model = created.model ? { ...created.model } : input.model ? { ...input.model } : undefined;
+  return {
+    sessionId: created.id,
+    ...(input.tmuxTarget !== undefined ? { tmuxTarget: input.tmuxTarget } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
 export async function v2ActiveSessions(client: V2Client): Promise<V2SessionInfo[]> {
   const payload = await v2Request(client, 'GET', '/session/active');
   return unwrapData<V2SessionInfo[]>(payload, 'active sessions');

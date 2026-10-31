@@ -23,8 +23,7 @@ import { getCurrentModel, getCurrentModelInfo } from '../lib/model-tracker';
 import { allocatePort, releasePort } from '../lib/port-allocator';
 import {
   quoteShellPath,
-  v2CreateSessionWithVerifiedModel,
-  v2Prompt,
+  launchWorkerViaServe,
   v2WaitForServer,
 } from '../lib/sdk-client';
 
@@ -304,6 +303,8 @@ export const mc_launch: ToolDefinition = tool({
       // Wait for the 2.1.4 /api surface, create the session with the pinned
       // model triple, and deliver the prompt. The legacy unprefixed SDK is
       // not served by 2.1.4 (session.create answered `{}`).
+      // Canonical path: launchWorkerViaServe (sdk-client) — same POST+prompt
+      // the integrador reuses for the autonomous launcher (orchestrator.ts).
       try {
         const client = await v2WaitForServer(allocatedPort, {
           password: config.serverPassword,
@@ -316,10 +317,11 @@ export const mc_launch: ToolDefinition = tool({
         });
         const modelInfo = getCurrentModelInfo(context?.sessionID);
         // R03: the full triple (variant included) is pinned and verified
-        // back via GET — a silent server default throws instead of running
+        // back via echo — a silent server default throws instead of running
         // under the wrong model.
-        const created = await v2CreateSessionWithVerifiedModel(client, {
-          agent: undefined,
+        const worker = await launchWorkerViaServe(client, {
+          worktree: worktreePath,
+          prompt: fullPrompt,
           model: modelInfo
             ? {
                 providerID: modelInfo.providerID,
@@ -327,13 +329,12 @@ export const mc_launch: ToolDefinition = tool({
                 ...(modelInfo.variant ? { variant: modelInfo.variant } : {}),
               }
             : undefined,
-          location: { directory: worktreePath },
           // Allow-inside ruleset: reads/writes/shell within the worktree
           // never ask; anything outside stays under the default policy.
-          permissions: buildWorktreePermissions(worktreePath),
+          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          tmuxTarget,
         });
-        remoteSessionId = created.id;
-        await v2Prompt(client, remoteSessionId, fullPrompt);
+        remoteSessionId = worker.sessionId;
       } catch (error) {
         await releasePort(allocatedPort).catch(() => {});
         try {

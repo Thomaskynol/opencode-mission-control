@@ -65,4 +65,38 @@ describe('TUI model blockade (R03: TUI root cannot pin, declared explicitly)', (
       fs.rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('TUI is explicitly not the model contract path: the pinned triple lives only on serve (why this file never emits -m)', async () => {
+    // Contract anchor: the autonomous launcher must use a verified serve
+    // session (launchWorkerViaServe), never the TUI root. This test pins the
+    // reason so a future -m re-add (rejected by v2.1.4 with exit 1) cannot
+    // slip back in as a silent "fix": the TUI exec line stays `opencode
+    // --prompt ...` with the triple recorded only as a NOT-pinned comment.
+    const fs = await import('fs');
+    const base = await createTempDir();
+    try {
+      const promptPath = join(base, '.mc-prompt.txt');
+      await fs.promises.writeFile(promptPath, 'hi', 'utf-8');
+      const desc = describeTuiModelPin({
+        providerID: 'opencode-go',
+        id: 'muse-spark-1.3-contributor',
+        variant: 'xhigh',
+      });
+      expect(desc.pinned).toBe(false);
+      expect(desc.mechanism).toBe('none');
+      await writeLauncherScript(base, promptPath, {
+        providerID: 'opencode-go',
+        id: 'muse-spark-1.3-contributor',
+        variant: 'xhigh',
+      });
+      const script = await fs.promises.readFile(join(base, '.mc-launch.sh'), 'utf-8');
+      const execLine = script.split('\n').filter((l) => l.startsWith('exec ')).join('\n');
+      expect(execLine).toMatch(/^exec \S+ --prompt /);
+      expect(execLine).not.toMatch(/(^|\s)(-m|--model)(\s|=|$)/);
+      expect(script).toMatch(/not pinned/i);
+      expect(script).toContain('opencode-go/muse-spark-1.3-contributor#xhigh');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
 });

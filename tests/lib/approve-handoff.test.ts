@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { spawn } from 'node:child_process';
 import type { PlanSpec } from '../../src/lib/plan-types';
 import * as planStateMod from '../../src/lib/plan-state';
 import * as paths from '../../src/lib/paths';
 import * as durableStateMod from '../../src/lib/durable-state';
 import { dispatchCommand } from '../../src/orchestrator-cli/commands';
+import { isConductorAlive } from '../../src/orchestrator-cli/auto-commands';
 import { Orchestrator } from '../../src/lib/orchestrator';
 
 function clone<T>(v: T): T {
@@ -27,6 +29,9 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
   let testStateDir = '';
   let restoreDataDir: () => void = () => {};
   let planState: PlanSpec | null;
+  // Real OS children spawned as conductor stand-ins (no tmux needed):
+  // liveness is verifiable via kill(pid, 0) and cleaned up after each test.
+  let liveChildren: number[] = [];
 
   const seedPlan = (): void => {
     planState = {
@@ -63,6 +68,12 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
 
   afterEach(() => {
     mock.restore();
+    for (const pid of liveChildren) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
+    liveChildren = [];
     try {
       restoreDataDir();
     } catch {}
@@ -75,6 +86,20 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
       } catch {}
     }
   });
+
+  /** Real detached child as conductor stand-in: alive and verifiable via pid (no tmux). */
+  async function spawnRealHolder(intakeId: string): Promise<{ pid: number; command: string }> {
+    const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    try {
+      (child as unknown as { unref?: () => void }).unref?.();
+    } catch {}
+    const pid = child.pid;
+    if (!pid || !isConductorAlive(pid)) {
+      throw new Error('test holder did not start');
+    }
+    liveChildren.push(pid);
+    return { pid, command: `resume --intake ${intakeId}` };
+  }
 
   async function startIntake(): Promise<string> {
     const started = await dispatchCommand(
@@ -90,7 +115,7 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     return (record?.decisions ?? []).join('\n');
   }
 
-  it('names the durable owner with worker evidence instead of claiming the dying temp reconciler', async () => {
+  it('names the durable owner with worker evidence plus a live conductor pid (never the dying temp)', async () => {
     const id = await startIntake();
 
     // Instrumented conductor like the review sonda: resumePlan reports live.
@@ -106,10 +131,18 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     ).mockImplementation(() => {});
     void resumeSpy;
 
+    let conductorPid = 0;
     const out = await dispatchCommand(
       `approve --intake ${id} --retry task-a`,
       fakeControls(),
-      { verifyWorkers: async () => ({ live: 1, total: 1 }) },
+      {
+        verifyWorkers: async () => ({ live: 1, total: 1 }),
+        spawnConductor: async (intakeId) => {
+          const c = await spawnRealHolder(intakeId);
+          conductorPid = c.pid;
+          return c;
+        },
+      },
     );
 
     expect(out).toMatch(/ready_to_merge/);
@@ -117,18 +150,24 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     // Durable owner + independent worker evidence are recorded...
     expect(out).toMatch(/workers live 1\/1/);
     expect(out).toMatch(new RegExp(`plan ${planState!.id}`));
-    // ...and the temp controller is never presented as the ongoing conductor,
-    // nor is a manual `resume` left as the continuity step.
+    // ...plus a verifiably live conductor (detached driver, auto-spawned —
+    // never a manual step for the user) and the preserved profile...
+    expect(out).toMatch(/conductor detached driver pid \d+/);
+    expect(out).toMatch(/auto-spawned/);
+    expect(out).toMatch(/model .*ceiling /);
+    expect(conductorPid).toBeGreaterThan(0);
+    expect(isConductorAlive(conductorPid)).toBe(true);
+    // ...and the temp controller is never presented as the ongoing conductor.
     expect(out).not.toMatch(/reconciler running in pid/);
-    expect(out).not.toMatch(/resume --intake/);
     // The handoff decision persisted before the temp controller detached.
     const decisions = await readDecisions(id);
     expect(decisions).toMatch(/handoff:/);
     expect(decisions).toMatch(/workers live 1\/1/);
+    expect(decisions).toMatch(new RegExp(`conductor detached driver pid ${conductorPid}`));
     expect(shutdownSpy).toHaveBeenCalled();
   });
 
-  it('previous conductor unavailable + pending work: new handoff without depending on the old coordinator', async () => {
+  it('previous conductor unavailable + pending work: new handoff with a live child, never the old coordinator', async () => {
     const id = await startIntake();
 
     // Old coordinator is dead: never live, already shut down.
@@ -148,20 +187,34 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
       'shutdown',
     ).mockImplementation(() => {});
 
+    let conductorPid = 0;
     const out = await dispatchCommand(
       `approve --intake ${id} --retry task-a`,
       fakeControls(),
-      { verifyWorkers: async () => ({ live: 2, total: 2 }) },
+      {
+        verifyWorkers: async () => ({ live: 2, total: 2 }),
+        spawnConductor: async (intakeId) => {
+          const c = await spawnRealHolder(intakeId);
+          conductorPid = c.pid;
+          return c;
+        },
+      },
     );
 
     expect(out).toMatch(/ready_to_merge/);
     expect(planState!.status).toBe('running');
-    // Handoff was established by the NEW controller instance, never the old one.
+    // Handoff was established by the NEW controller instance, never the old one...
     expect(seen).toHaveLength(1);
     expect(seen[0]).not.toBe(old as unknown as Orchestrator);
+    // ...and a real child owns the continuation: verifiably alive, not an
+    // object literal, without requiring tmux.
+    expect(conductorPid).toBeGreaterThan(0);
+    expect(isConductorAlive(conductorPid)).toBe(true);
+    expect(out).toMatch(new RegExp(`conductor detached driver pid ${conductorPid}`));
     const decisions = await readDecisions(id);
     expect(decisions).toMatch(new RegExp(`pid ${process.pid}`));
     expect(decisions).toMatch(/workers live 2\/2/);
+    expect(decisions).toMatch(new RegExp(`conductor detached driver pid ${conductorPid}`));
   });
 
   it('fails closed when the handoff record cannot persist (no false success)', async () => {
@@ -191,5 +244,102 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     expect(shutdownSpy).toHaveBeenCalled();
     const decisions = await readDecisions(id);
     expect(decisions).not.toMatch(/handoff:/);
+  });
+
+  it('fails explicitly when no conductor assumes responsibility (no false continuity)', async () => {
+    const id = await startIntake();
+
+    spyOn(
+      Orchestrator.prototype as unknown as { resumePlan: (r?: string) => Promise<void> },
+      'resumePlan',
+    ).mockImplementation(async () => {});
+    const shutdownSpy = spyOn(
+      Orchestrator.prototype as unknown as { shutdown: () => void },
+      'shutdown',
+    ).mockImplementation(() => {});
+
+    const err = await dispatchCommand(
+      `approve --intake ${id} --retry task-a`,
+      fakeControls(),
+      {
+        verifyWorkers: async () => ({ live: 2, total: 2 }),
+        spawnConductor: async () => {
+          throw new Error('no driver (probe)');
+        },
+      },
+    ).catch((e: unknown) => e as Error);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/no persistent conductor|not confirmed/i);
+    expect((err as Error).message).toMatch(/workers live 2\/2/);
+    // Temp hygiene runs, but nothing claims continuity.
+    expect(shutdownSpy).toHaveBeenCalled();
+    const decisions = await readDecisions(id);
+    expect(decisions).not.toMatch(/conductor detached driver/);
+  });
+
+  it('fails explicitly when the spawned conductor pid is not alive', async () => {
+    const id = await startIntake();
+
+    spyOn(
+      Orchestrator.prototype as unknown as { resumePlan: (r?: string) => Promise<void> },
+      'resumePlan',
+    ).mockImplementation(async () => {});
+    spyOn(
+      Orchestrator.prototype as unknown as { shutdown: () => void },
+      'shutdown',
+    ).mockImplementation(() => {});
+
+    const err = await dispatchCommand(
+      `approve --intake ${id} --retry task-a`,
+      fakeControls(),
+      {
+        verifyWorkers: async () => ({ live: 1, total: 1 }),
+        spawnConductor: async () => ({ pid: -1, command: 'dead (probe)' }),
+      },
+    ).catch((e: unknown) => e as Error);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/not alive|not confirmed/i);
+  });
+
+  it('preserves the effective profile/model in the handoff (never silently dropped)', async () => {
+    const id = await startIntake();
+    // Persist the effective profile the reconciler runs under (triple +
+    // ceiling), as startAutonomous does on the real path.
+    const { loadAutoIntake, saveAutoIntake } = await import('../../src/lib/durable-state');
+    const rec = await loadAutoIntake(id);
+    await saveAutoIntake({
+      ...rec!,
+      effectiveModel: 'opencode-go/muse-spark-1.3-contributor',
+      effectiveVariant: 'xhigh',
+      ceiling: { maxParallel: 1, testCommand: 'node check.mjs' },
+      updatedAt: new Date().toISOString(),
+    });
+
+    spyOn(
+      Orchestrator.prototype as unknown as { resumePlan: (r?: string) => Promise<void> },
+      'resumePlan',
+    ).mockImplementation(async () => {});
+    spyOn(
+      Orchestrator.prototype as unknown as { shutdown: () => void },
+      'shutdown',
+    ).mockImplementation(() => {});
+
+    const out = await dispatchCommand(
+      `approve --intake ${id} --retry task-a`,
+      fakeControls(),
+      {
+        verifyWorkers: async () => ({ live: 1, total: 1 }),
+        spawnConductor: (intakeId) => spawnRealHolder(intakeId),
+      },
+    );
+
+    expect(out).toMatch(/opencode-go\/muse-spark-1\.3-contributor#xhigh/);
+    expect(out).toMatch(/maxParallel=1/);
+    expect(out).toMatch(/node check\.mjs/);
+    const decisions = await readDecisions(id);
+    expect(decisions).toMatch(/opencode-go\/muse-spark-1\.3-contributor#xhigh/);
+    expect(decisions).toMatch(/maxParallel=1/);
   });
 });

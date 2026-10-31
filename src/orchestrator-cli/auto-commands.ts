@@ -58,6 +58,15 @@ export interface AutoCommandDeps {
    * to a best-effort tmux pane scan (never throws). Tests inject a stub.
    */
   verifyWorkers?: () => Promise<ConductorEvidence>;
+  /**
+   * Persistent-conductor starter used by the approve handoff. Defaults to a
+   * detached `resume --intake` driver that survives the one-shot controller's
+   * shutdown (child_process + CLI only — no orchestrator.ts dependency: the
+   * transfer never relies on the temp instance staying alive). Tests inject a
+   * stub that spawns a real lightweight child (no tmux needed) so possession
+   * is verifiable via pid liveness.
+   */
+  spawnConductor?: (intakeId: string, repoRoot: string) => Promise<PersistentConductor>;
 }
 
 /** Absolute CLI entry so help/answers print full copyable commands. */
@@ -575,6 +584,86 @@ async function checkWorkerContinuity(): Promise<ConductorEvidence> {
  * instance: in-flight workers persist in tmux and the next driver pass
  * resumes the persisted plan without duplicating them.
  */
+export interface PersistentConductor {
+  pid: number;
+  command: string;
+}
+
+/** True when the pid answers to signal 0 (alive). Never throws. */
+export function isConductorAlive(pid: number): boolean {
+  // pid <= 0 is never a conductor: kill(-1, 0) addresses every process the
+  // user may signal instead of probing one pid, so it must not count as alive.
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spawn the persistent conductor: a detached `resume --intake` driver that
+ * survives this one-shot controller's shutdown. child_process + CLI only —
+ * the transfer never depends on orchestrator.ts instance state (the temp
+ * instance is shut down right after this confirms). Throws explicitly when
+ * no live pid comes up, so the caller fails closed instead of declaring a
+ * handoff nobody owns.
+ */
+export async function spawnPersistentConductor(
+  intakeId: string,
+  repoRoot: string,
+): Promise<PersistentConductor> {
+  const { spawn } = await import('node:child_process');
+  const command = `resume --intake ${intakeId}`;
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(process.execPath, [cliPath(), 'resume', '--intake', intakeId], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: repoRoot,
+      env: { ...process.env },
+    });
+  } catch (error) {
+    throw new Error(
+      `persistent conductor for intake ${intakeId} did not start: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    child.unref();
+  } catch {
+    // Best-effort: detachment already requested; an unref failure must not
+    // mask a live pid.
+  }
+  const pid = child.pid;
+  if (!pid || !isConductorAlive(pid)) {
+    throw new Error(
+      `persistent conductor for intake ${intakeId} did not start (no live pid).`,
+    );
+  }
+  return { pid, command };
+}
+
+/**
+ * Profile/model line preserved in every handoff (never silently dropped):
+ * the effective triple (variant included) plus the ceiling the reactivated
+ * reconciler runs under. Unpinned is stated explicitly, never implied.
+ */
+function formatEffectiveConfigForHandoff(record: AutoIntakeRecord): string {
+  const rec = record as unknown as {
+    effectiveModel?: string;
+    effectiveVariant?: string;
+    ceiling?: { maxParallel?: number; testCommand?: string };
+  };
+  const model = rec.effectiveModel?.trim();
+  const variant = rec.effectiveVariant?.trim();
+  const triple = model ? `${model}${variant ? `#${variant}` : ''}` : '(unpinned, TUI default)';
+  const c = rec.ceiling;
+  const ceiling = c
+    ? `maxParallel=${c.maxParallel ?? 'default'} testCommand=${c.testCommand ?? 'none'}`
+    : 'default';
+  return `model ${triple}, ceiling ${ceiling}`;
+}
 async function recordConductorHandoff(
   ctl: {
     resumePlan: (r?: string) => Promise<void>;
@@ -583,12 +672,14 @@ async function recordConductorHandoff(
   record: AutoIntakeRecord,
   repoRoot: string,
   action: string,
-  opts?: { verifyWorkers?: () => Promise<ConductorEvidence> },
+  opts?: {
+    verifyWorkers?: () => Promise<ConductorEvidence>;
+    spawnConductor?: (intakeId: string, repoRoot: string) => Promise<PersistentConductor>;
+  },
 ): Promise<string> {
   await ctl.resumePlan(repoRoot);
   const { loadPlan } = await import('../lib/plan-state');
   const plan = await loadPlan(repoRoot).catch(() => null);
-  const alive = (ctl as unknown as { isRunning?: boolean }).isRunning === true;
   let workers: ConductorEvidence = { live: 0, total: 0 };
   try {
     workers = await (opts?.verifyWorkers ?? checkWorkerContinuity)();
@@ -596,18 +687,51 @@ async function recordConductorHandoff(
     // Best-effort: worker evidence is reported, never fatal.
     workers = { live: 0, total: 0 };
   }
+  const profileLine = formatEffectiveConfigForHandoff(record);
   let handoff: string;
   if (!plan) {
-    handoff = `${action}: no active plan in ${repoRoot} — nothing to conduct (intake ${record.id} kept).`;
+    handoff = `${action}: no active plan in ${repoRoot} — nothing to conduct (intake ${record.id} kept). ${profileLine}.`;
   } else if (plan.status === 'paused' || plan.checkpoint) {
-    handoff = `${action}: pause respected (plan ${plan.id} [${plan.status}] checkpoint ${plan.checkpoint ?? 'none'}) — no conductor started; approve to continue.`;
+    handoff = `${action}: pause respected (plan ${plan.id} [${plan.status}] checkpoint ${plan.checkpoint ?? 'none'}) — no conductor started; approve to continue. ${profileLine}.`;
   } else if (plan.status === 'completed' || plan.status === 'failed' || plan.status === 'canceled') {
-    handoff = `${action}: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report.`;
+    handoff = `${action}: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report. ${profileLine}.`;
   } else {
+    // Active plan: a persistent conductor must own the work BEFORE the
+    // one-shot controller detaches. Workers alive in tmux never assume the
+    // coordinator role on their own, and the temp instance dies on shutdown —
+    // so spawn/confirm a detached driver (auto-spawned, never a manual step
+    // for the user) and fail explicitly when nobody assumes responsibility.
+    // No conductor is required only when nothing is in flight (no running /
+    // merging jobs and no live workers): the next driver pass picks up the
+    // persisted plan on demand.
+    const running = (plan.jobs ?? []).filter(
+      (j) => j.status === 'running' || j.status === 'merging',
+    ).length;
+    const needsConductor = running > 0 || workers.live > 0;
+    let conductor: PersistentConductor | null = null;
+    if (needsConductor) {
+      const spawnFn = opts?.spawnConductor ?? spawnPersistentConductor;
+      try {
+        conductor = await spawnFn(record.id, repoRoot);
+      } catch (error) {
+        throw new Error(
+          `handoff not confirmed for intake ${record.id}: no persistent conductor assumed responsibility ` +
+            `(spawn failed: ${error instanceof Error ? error.message : String(error)}; ` +
+            `workers live ${workers.live}/${workers.total}, ${running} job(s) in flight) — refusing to declare success.`,
+        );
+      }
+      if (!conductor || !Number.isFinite(conductor.pid) || !isConductorAlive(conductor.pid)) {
+        throw new Error(
+          `handoff not confirmed for intake ${record.id}: conductor pid ${conductor?.pid} not alive after spawn ` +
+            `(workers live ${workers.live}/${workers.total}) — refusing to declare success.`,
+        );
+      }
+    }
     handoff =
-      `${action}: conductor detached (reporter pid ${process.pid}) — plan ${plan.id} [${plan.status}] owned via persisted state (intake ${record.id}); ` +
-      `reconciler ${alive ? `live in pid ${process.pid} at handoff` : 'armed for next pass'}; ` +
-      `workers live ${workers.live}/${workers.total} (tmux); one-shot controller detaches after this sync pass — ` +
+      `${action}: conductor ${conductor ? `detached driver pid ${conductor.pid} (${conductor.command}, auto-spawned by reporter pid ${process.pid})` : 'armed for next driver pass'} — ` +
+      `plan ${plan.id} [${plan.status}] owned via persisted state (intake ${record.id}); ` +
+      `workers live ${workers.live}/${workers.total} (tmux); ${profileLine}; ` +
+      `one-shot controller detaches after this sync pass — ` +
       `in-flight workers persist and the next driver pass resumes without duplication.`;
   }
   // Fail-closed: a handoff that cannot persist is thrown, never announced.
@@ -702,7 +826,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
         let handoff: string;
         try {
-          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`, { verifyWorkers: deps?.verifyWorkers });
+          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
@@ -760,7 +884,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         let retryHandoff: string;
         try {
-          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`, { verifyWorkers: deps?.verifyWorkers });
+          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
@@ -806,7 +930,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
       let clearHandoff: string;
       try {
-        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear', { verifyWorkers: deps?.verifyWorkers });
+        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear', { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
       } catch (error) {
         ctl.shutdown();
         throw error;
@@ -859,7 +983,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
     let startHandoff: string;
     try {
-      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start', { verifyWorkers: deps?.verifyWorkers });
+      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start', { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
     } catch (error) {
       ctl.shutdown();
       throw error;

@@ -149,19 +149,15 @@ export async function killTaggedWindows(jobId: string): Promise<number> {
     }
 
     let killed = 0;
-    for (const line of output.trim().split('\n')) {
-      if (!line.trim()) continue;
-      const [target, taggedId] = line.split(' ', 2);
-      if (taggedId === jobId && target) {
-        try {
-          const pids = await getPaneProcesses(target);
-          await killPaneProcesses(pids);
-          const killProc = spawn(["tmux", "kill-window", "-t", target], { stderr: "pipe" });
-          await killProc.exited;
-          killed++;
-        } catch {
-          // Best-effort: window may already be gone
-        }
+    for (const target of parseTaggedWindowTargets(output, jobId)) {
+      try {
+        const pids = await getPaneProcesses(target);
+        await killPaneProcesses(pids);
+        const killProc = spawn(["tmux", "kill-window", "-t", target], { stderr: "pipe" });
+        await killProc.exited;
+        killed++;
+      } catch {
+        // Best-effort: window may already be gone
       }
     }
     return killed;
@@ -518,4 +514,110 @@ export async function captureExitStatus(target: string): Promise<number | undefi
   } catch {
     return undefined;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ownership helpers for the kill guard (pure, no tmux calls).
+// The integrador uses these in the orchestrator relaunch/teardown paths so a
+// kill is issued ONLY for the recorded predecessor — never for a same-name
+// foreign session presumed by prefix similarity (revisão §7). Name similarity
+// (`mc-<job>`) is not possession; strict equality with the recorded
+// tmuxTarget (or an explicit job-tag match) is.
+// ---------------------------------------------------------------------------
+
+/** Session prefix for worker sessions (naming only, never proof of ownership). */
+export const MC_SESSION_PREFIX = 'mc-';
+
+/** tmux window option carrying the owning job id (see killTaggedWindows). */
+export const MC_JOB_TAG_OPTION = '@mc_job_id';
+
+/** Naming check only: does the session name carry the worker prefix? */
+export function isMcSessionName(name: string): boolean {
+  return name.startsWith(MC_SESSION_PREFIX) && name.length > MC_SESSION_PREFIX.length;
+}
+
+/**
+ * Pure parser for `tmux list-windows -a -F "#{session}:#{index} #{@mc_job_id}"`.
+ * Returns targets whose tag equals jobId. Ownership = tag match.
+ */
+export function parseTaggedWindowTargets(listOutput: string, jobId: string): string[] {
+  const out: string[] = [];
+  for (const line of listOutput.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [target, taggedId] = trimmed.split(' ', 2);
+    if (taggedId === jobId && target) out.push(target);
+  }
+  return out;
+}
+
+/** Execution tag scoping one session per plan+job run (never the bare job name). */
+export function formatExecTag(planId: string, jobId: string): string {
+  return `${planId.slice(0, 8)}-${jobId.slice(0, 8)}`;
+}
+
+/** Session name for a job, optionally scoped by the execution tag. */
+export function sessionNameForJob(sanitizedName: string, execTag?: string): string {
+  return execTag ? `mc-${sanitizedName}-${execTag}` : `mc-${sanitizedName}`;
+}
+
+/** True only when the session name carries this run's execution tag. */
+export function isOwnedSessionForExecTag(sessionName: string, execTag: string): boolean {
+  return sessionName.endsWith(`-${execTag}`);
+}
+
+/**
+ * Strict ownership: a candidate may be killed only when it IS the recorded
+ * target. Covers both session (`mc-…`) and window (`session:window`) forms.
+ * Anything else — including a legacy bare `mc-<job>` that merely shares the
+ * prefix — is foreign and must not be killed.
+ */
+export function isOwnedTmuxTarget(
+  candidate: string | undefined,
+  recordedTarget: string | undefined,
+): boolean {
+  if (!candidate || !recordedTarget) return false;
+  return candidate === recordedTarget;
+}
+
+/**
+ * Keep only candidates that equal the recorded target (deduplicated).
+ * No recorded target → no owned kills, never fall back to a name match.
+ */
+export function filterOwnedKillTargets(
+  candidates: Array<string | undefined>,
+  recordedTarget: string | undefined,
+): string[] {
+  if (!recordedTarget) return [];
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    if (typeof c !== 'string' || !c) continue;
+    if (c === recordedTarget && !seen.has(c)) seen.add(c);
+  }
+  return [...seen];
+}
+
+export interface OwnedKillListInput {
+  /** Recorded predecessor from the plan/job state (the only owned kill). */
+  previousTarget?: string;
+  /** Legacy bare `mc-<job>` name (pre-upgrade). Killed only on explicit opt-in. */
+  legacySessionName?: string;
+  /**
+   * Explicit migration opt-in: when there is NO recorded predecessor, kill
+   * the legacy name. Default false — similarity alone never grants ownership.
+   * shortcut: remove once all lanes record per-execution targets; upgrade to a
+   * tag-based (@mc_job_id) lookup when sessions outlive the plan record.
+   */
+  allowLegacyFallback?: boolean;
+}
+
+/**
+ * Owned kill list for relaunch/teardown: the recorded predecessor only.
+ * The legacy bare name is returned solely when there is no recorded
+ * predecessor AND the caller explicitly opts into the migration fallback.
+ */
+export function buildOwnedKillList(input: OwnedKillListInput): string[] {
+  if (input.previousTarget) return [input.previousTarget];
+  if (input.allowLegacyFallback && input.legacySessionName) return [input.legacySessionName];
+  return [];
 }

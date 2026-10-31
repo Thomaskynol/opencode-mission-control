@@ -1,0 +1,92 @@
+bun test v1.3.14 (0d9b296a)
+
+tests/lib/plan-state.test.ts:
+[MC] Invalid job transition: queued → failed (job: fix-login) (forced recovery)
+
+tests/lib/question-relay.test.ts:
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot escalate permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot escalate permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Auto-denied permission per-pub-1 for job job-pub-timeout
+[QuestionRelay] Auto-approved permission per-plain-1 for job job-plain-timeout
+
+tests/lib/monitor.test.ts:
+[Monitor] SSE connection lost for job Serve Job, reconnecting in 100ms (attempt 1)
+[Monitor] SSE connection lost for job Serve Job, reconnecting in 100ms (attempt 1)
+[Monitor] SSE connection lost for job Serve Job, reconnecting in 100ms (attempt 1)
+
+tests/lib/f03f05f06f07-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+tmux server is not responsive, skipping pane checks during resumePlan
+
+tests/lib/wire-report.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+
+tests/lib/acceptance-less-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/gate-resume-approve.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model (session/config) found — falling back to default "opencode-go/muse-spark-1.3-contributor" (triple). Set MC_PLANNER_MODEL or run inside the control center so planner and workers share the effective model.
+
+tests/lib/ceiling-context-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/orchestrator-modes.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/merge-train.test.ts:
+No test command configured or detected in /tmp/mc-merge-train-wxRbSq/integration-worktree. Skipping test gating.
+[MC] fix-before-rollback prompt failed for job "feature-sdk-fail": connection refused
+[MC] fix-before-rollback skipped for job "feature-no-session": no remote worker session (port/remoteSessionID missing), rolling back.
+
+tests/lib/gap1-integration-context.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/orchestrator.test.ts:
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): requested google/gemini-pro — TUI root (opencode --prompt) has no -m/--model in v2.1.4: the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+
+tests/lib/monitor-autocomplete.test.ts:
+[MC] auto final report failed: reports gone
+
+ 1162 pass
+ 15 skip
+ 0 fail
+ 2979 expect() calls
+Ran 1177 tests across 85 files. [35.37s]

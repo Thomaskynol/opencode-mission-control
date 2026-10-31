@@ -1,0 +1,9 @@
+bun test v1.3.14 (0d9b296a)
+
+tests/lib/toctou-kill-launcher-integration.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+ 51 pass
+ 0 fail
+ 175 expect() calls
+Ran 51 tests across 4 files. [392.00ms]

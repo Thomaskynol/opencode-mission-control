@@ -16,6 +16,18 @@ export function uniqueName(prefix: string): string {
 }
 
 /**
+ * Per-execution owned name: guarantees the `isOwnedMcSession` criterion holds.
+ * Returns the session name plus the runToken that proves ownership, so tests
+ * can kill only what this run created without duplicating token logic.
+ */
+export function ownedName(prefix = 'mc-test'): { name: string; runToken: string } {
+  const runToken = `${process.pid}-${Date.now().toString(36)}`;
+  const rand = Math.random().toString(36).slice(2, 6);
+  const safe = prefix.startsWith('mc-') ? prefix : `mc-${prefix}`;
+  return { name: `${safe}-${runToken}-${rand}`, runToken };
+}
+
+/**
  * Ownership criterion for safe kill (tested here, not in src).
  * Only a session that carries this run's token may be killed by the test.
  * Production auto-fix is untouched; this guards tests only.

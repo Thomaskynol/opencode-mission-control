@@ -143,3 +143,14 @@ Pendências honestas (ficam documentadas, não alegadas como feitas):
 1. `wire createPR` só-no-full (isolamento pré-existente; 11/0 isolado).
 2. Demo-R pausada em decisão humana legítima (touchSet — `approve` pendente, não executado).
 3. Nuance `scope:'integration'`+`acceptanceLess` documentada (§33 da matrix): smoke global refaz `scope` sobre o `'task'` da revisão; flag e relatório corretos.
+
+## 11. Rodada REVISAO_97af72d (2026-10-31, HEAD 97af72d → novo commit)
+
+Base: relatório /home/thomaskyn/Downloads/REVISAO_ORQUESTRADOR_97af72d.md (12 sondas). Explorers antes; 3 fixers paralelos + 1 integrador sequencial dono de orchestrator.ts. Full final: build exit 0 (1.50 MB); `bun test` 1162 pass / 15 skip / 0 fail / 85 arquivos (docs/evidencias-R01-R09/{build,full-test,demo}-R3.log + MANIFESTO-R3.txt com path→hash completo).
+- Bloq A (chamar sem asserir → pass; assert só vazio → pass; NL válido → fail): assess com asserção vinculada (assert/expect contém chamada + literais do critério) + caminho NL comportamental sem exigir vocabulário; filename-anchors fail-closed. Sondas A/B preservadas. Limite: NL comportamental aceita qualquer chamada asserida — endurecer com escore de valores/casos ou revisor OpenCode depois.
+- Bloq B (TOCTOU: observa antes, carimba depois): re-observação HEAD/sujeira+hash pós-teste nos 2 escopos; divergência/sujeira relevante recusa atribuição ao commit antigo; allowlist p/ artefatos (coverage/dist). Falha anterior vira fail, não pass.
+- Bloq C (approve sem condutor): spawnPersistentConductor (resume --intake destacado) confirmado vivo antes do shutdown; sem condutor → erro explícito; perfil/modelo preservado no handoff.
+- Bloq D (TUI sem pin no fluxo principal): launchJob/relaunch via `launchWorkerViaServe` (triple+variant verificados, tmuxTarget registrado, execTag); TUI só com useServeMode===false explícito + aviso unpinned. mc_launch serve extraído p/ helper reutilizável.
+- §7 kill sem posse: só alvos registrados (buildOwnedKillList/filterOwnedKillTargets); legado por existência removido; execTag no lançamento inicial serve; tmux-isPaneRunning gated por TEST_LIVE + nomes por execução + kill com posse.
+- §8 evidências: demo-R3.log = regressões Bun (51 pass, sem OpenCodes vivos — declarado); MANIFESTO-R3.txt gerado pelo script corrigido.
+Skipped: live E2E multiprocesso com modelo; rigor total em NL. Risk: fallback TUI compat em fakes (virar default-serve quando fakes mockarem serve); sessões tmux legadas preservadas.

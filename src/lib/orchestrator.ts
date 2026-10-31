@@ -13,7 +13,7 @@ import { JobMonitor } from './monitor';
 import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
 import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
-import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript } from './prompt-file';
+import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, describeTuiModelPin } from './prompt-file';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 import { detectOMO } from './omo';
 import { copyPlansToWorktree } from './plan-copier';
@@ -30,9 +30,15 @@ import {
   sessionExists,
   setPaneDiedHook,
   windowExists,
+  buildOwnedKillList,
+  filterOwnedKillTargets,
+  formatExecTag,
+  sessionNameForJob,
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
-import { createV2Client, v2ForkSession, v2Prompt, type V2ModelRef } from './sdk-client';
+import { createV2Client, v2ForkSession, v2Prompt, launchWorkerViaServe, v2WaitForServer, type V2ModelRef } from './sdk-client';
+import { allocatePort, releasePort } from './port-allocator';
+import { buildWorktreePermissions } from './permission-policy';
 import {
   runAutoIntakeWithRetry,
   ensureBaseReady,
@@ -91,6 +97,91 @@ export function parseModelRef(raw: string): V2ModelRef | undefined {
  */
 export function modelRefToCliString(ref: V2ModelRef): string {
   return `${ref.providerID}/${ref.id}`;
+}
+
+/**
+ * §4 TOCTOU identity: outputs the test runner may legitimately produce.
+ * These paths never prove an impl/test mutation — they are ignored for the
+ * dirty/content-mutation check, never confused with source changes.
+ * Anything else showing up in `git status --porcelain` after the test is a
+ * mutation of the candidate and refuses attribution to the pre-test commit.
+ */
+export const ALLOWED_TEST_ARTIFACT_PATTERNS: RegExp[] = [
+  /^coverage\//,
+  /^\.nyc_output\//,
+  /^dist\//,
+  /^build\//,
+  /^tmp\//,
+  /^\.coverage/,
+  /\.lcov$/,
+  /\.log$/,
+];
+
+/** True when a repo-relative path is a permitted test artifact (coverage/dist). */
+export function isAllowedTestArtifact(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^"+|"+$/g, '').trim();
+  if (!normalized) return false;
+  return ALLOWED_TEST_ARTIFACT_PATTERNS.some((re) => re.test(normalized));
+}
+
+/** Parse `git status --porcelain` into repo-relative paths (rename-aware). */
+export function parsePorcelainDirtyPaths(porcelain: string): string[] {
+  const out: string[] = [];
+  for (const line of porcelain.split('\n')) {
+    if (!line.trim()) continue;
+    const m = line.match(/^.{2}\s+(.*)$/);
+    const raw = (m ? m[1] : line.trim()).trim().replace(/^"+|"+$/g, '');
+    if (!raw) continue;
+    const arrow = raw.indexOf(' -> ');
+    const p = (arrow >= 0 ? raw.slice(arrow + 4) : raw).trim().replace(/^"+|"+$/g, '');
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+/** Dirty paths that are NOT permitted artifacts — the identity-relevant set. */
+export function filterRelevantDirtyPaths(paths: string[]): string[] {
+  return paths.filter((p) => !isAllowedTestArtifact(p));
+}
+
+/** Stable hash of the scope contents read for review (sorted keys + values). */
+export function hashScopeContents(contents: Record<string, string>): string {
+  const keys = Object.keys(contents).sort();
+  const payload = keys.map((k) => `${k}\0${contents[k]}`).join('\0\0');
+  let h = 5381;
+  for (let i = 0; i < payload.length; i++) {
+    h = ((h << 5) + h + payload.charCodeAt(i)) >>> 0;
+  }
+  return `h${h.toString(16)}`;
+}
+
+/**
+ * True when non-artifact file content changed under the test — a mutation of
+ * impl/tests, never an artifact write. Compares post-test contents against
+ * pre-test contents, ignoring allowed artifact paths on both sides.
+ */
+export function hasRelevantContentChange(
+  before: Record<string, string>,
+  after: Record<string, string>,
+): boolean {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const k of keys) {
+    if (isAllowedTestArtifact(k)) continue;
+    if (before[k] !== after[k]) return true;
+  }
+  return false;
+}
+
+/**
+ * §6 launcher routing: serve (verified triple) is the autonomous path.
+ * TUI is legacy only — used when `useServeMode === false` explicitly, and
+ * always with an explicit unpinned warning (never silently to satisfy the
+ * model contract).
+ * shortcut: unit fakes that omit useServeMode stay on TUI for backward compat;
+ * upgrade to default-serve (`!== false`) once fakes mock the serve helpers.
+ */
+export function shouldUseServeMode(config: { useServeMode?: boolean }): boolean {
+  return config.useServeMode === true;
 }
 
 /**
@@ -735,13 +826,16 @@ export class Orchestrator {
    * integration candidate records taskHead + candidateBase + candidateHead
    * separately so no pass is ever attributed to the wrong commit.
    */
-  private async observeCandidateState(dir: string): Promise<{ head: string | null; dirty: boolean }> {
+  private async observeCandidateState(dir: string): Promise<{ head: string | null; dirty: boolean; dirtyPaths?: string[] }> {
     const headRes = await gitCommand(['-C', dir, 'rev-parse', 'HEAD']);
     const head = headRes.exitCode === 0 && headRes.stdout.trim() !== '' ? headRes.stdout.trim() : null;
     const statusRes = await gitCommand(['-C', dir, 'status', '--porcelain']);
     // Fail-closed: an unreadable status is treated as dirty, never as clean.
-    const dirty = statusRes.exitCode !== 0 || statusRes.stdout.trim() !== '';
-    return { head, dirty };
+    // §4: permitted test outputs (coverage/dist) are filtered — they never
+    // prove an impl/test mutation and never block attribution by themselves.
+    if (statusRes.exitCode !== 0) return { head, dirty: true };
+    const dirtyPaths = filterRelevantDirtyPaths(parsePorcelainDirtyPaths(statusRes.stdout));
+    return { head, dirty: dirtyPaths.length > 0, dirtyPaths };
   }
 
   private async readCandidateContents(dir: string, changedFiles: string[]): Promise<Record<string, string>> {
@@ -878,17 +972,32 @@ export class Orchestrator {
       let contentsA: Record<string, string> = {};
       let testsA: string[] = [];
       if (cmdA) {
+        // §4 TOCTOU: snapshot content BEFORE the run so a mutation during the
+        // test is detected afterwards (HEAD/dirty alone miss content swaps
+        // that keep the ref still).
+        const scopedBefore = await this.readScopeContents(jobCandidate, changedFiles, cmdA).catch(() => null);
         const result = await runTestCommand(jobCandidate, cmdA, timeout);
+        // Re-observe AFTER the run AND after reading: never stamp the
+        // pre-test head over changed content (§4 Bloqueante B).
+        const observedAfter = await this.observeCandidateState(jobCandidate);
         const scoped = await this.readScopeContents(jobCandidate, changedFiles, cmdA);
         contentsA = scoped.contents;
         testsA = scoped.testPaths;
+        const mutated = scopedBefore
+          ? hasRelevantContentChange(scopedBefore.contents, contentsA)
+          : false;
+        const diverged = observedAfter.head !== observedJob.head;
+        const dirtyAfter = observedAfter.dirty || mutated || diverged;
         evidenceA = this.toScopeEvidence(
           cmdA,
           result,
-          { testedCommit: observedJob.head ?? jobHead, dirty: observedJob.dirty },
+          { testedCommit: observedAfter.head ?? jobHead, dirty: dirtyAfter },
           `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`,
+          dirtyAfter && result.success
+            ? `identity refused: tree changed during test (head ${observedJob.head?.slice(0, 8)}→${observedAfter.head?.slice(0, 8)}, dirty=${observedAfter.dirty}, content-changed=${mutated}) — not attributed to ${jobHead.slice(0, 8)}`
+            : undefined,
         );
-        if (result.success && !observedJob.dirty && observedJob.head === jobHead) {
+        if (result.success && !dirtyAfter && observedAfter.head === jobHead && observedAfter.head === observedJob.head) {
           return { evidence: evidenceA, fileContents: contentsA, testPaths: testsA };
         }
       }
@@ -906,32 +1015,49 @@ export class Orchestrator {
       const candidateObserved = await this.observeCandidateState(candidateDir);
       const cmdB = configured ?? await detectTestCommand(candidateDir);
       if (!cmdB) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
+      const scopedBBefore = await this.readScopeContents(candidateDir, changedFiles, cmdB).catch(() => null);
       const resultB = await runTestCommand(candidateDir, cmdB, timeout);
+      // §4: same re-observation as scope 1 — never stamp the pre-test
+      // candidate head over content changed by the test run.
+      const candidateAfter = await this.observeCandidateState(candidateDir);
       const scopedB = await this.readScopeContents(candidateDir, changedFiles, cmdB);
       const contentsB = scopedB.contents;
       const testsB = scopedB.testPaths;
+      const mutatedB = scopedBBefore
+        ? hasRelevantContentChange(scopedBBefore.contents, contentsB)
+        : false;
+      const divergedB = candidateAfter.head !== candidateObserved.head;
+      const dirtyAfterB = candidateAfter.dirty || mutatedB || divergedB;
       const evidenceB = this.toScopeEvidence(
         cmdB,
         resultB,
         {
-          testedCommit: candidateObserved.head ?? jobHead,
+          testedCommit: candidateAfter.head ?? jobHead,
           taskHead: jobHead,
           candidateBase: baseObserved.head ?? undefined,
-          candidateHead: candidateObserved.head ?? undefined,
-          dirty: candidateObserved.dirty,
+          candidateHead: candidateAfter.head ?? undefined,
+          dirty: dirtyAfterB,
         },
         `integration-candidate:${candidateDir} (base ${integrationBranch}@${(baseObserved.head ?? '').slice(0, 8)} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
+        dirtyAfterB && resultB.success
+          ? `identity refused: candidate changed during test (head ${candidateObserved.head?.slice(0, 8)}→${candidateAfter.head?.slice(0, 8)}, dirty=${candidateAfter.dirty}, content-changed=${mutatedB})`
+          : undefined,
       );
-      if (resultB.success) return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
+      if (resultB.success && !dirtyAfterB && candidateAfter.head === candidateObserved.head) return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
       // Both scopes failed: combined evidence so the diagnosis names both.
       if (evidenceA) {
         const combined: TestEvidence = {
           ...evidenceB,
+          // Preserve the job-scope mutation signal: a dirty scope-1 run must
+          // never be laundered into a clean combined record (§4).
+          ...(evidenceA.dirty ? { dirty: true } : {}),
           output: `[job scope] ${cmdA}\n${evidenceA.output}\n\n[integration candidate] ${cmdB}\n${evidenceB.output}`.slice(0, 8000),
         };
         return {
           evidence: combined,
-          fileContents: { ...contentsA, ...contentsB },
+          // Job-scope contents win on collision: they are what the first
+          // (mutating) run actually executed.
+          fileContents: { ...contentsB, ...contentsA },
           testPaths: [...new Set([...testsA, ...testsB])],
         };
       }
@@ -946,9 +1072,11 @@ export class Orchestrator {
     result: { success: boolean; output: string; timedOut: boolean },
     identity: { testedCommit: string; taskHead?: string; candidateBase?: string; candidateHead?: string; dirty?: boolean },
     environment: string,
+    identityNote?: string,
   ): TestEvidence {
-    const output = `${result.timedOut ? '[timed out] ' : ''}${result.output}`.slice(0, 8000).trim()
+    const base = `${result.timedOut ? '[timed out] ' : ''}${result.output}`.slice(0, 7800).trim()
       || `(no output; ${result.success ? 'exit 0' : 'non-zero exit'})`;
+    const output = identityNote ? `${identityNote}\n${base}`.slice(0, 8000) : base;
     return {
       command,
       exitCode: result.success ? 0 : 1,
@@ -2243,7 +2371,15 @@ export class Orchestrator {
     const branch = job.branch ?? `mc/plan/${shortPlanId}/${job.name}`;
     const mode = job.mode ?? this.config.omo?.defaultMode ?? 'vanilla';
     const sanitizedName = job.name.replace(/[^a-zA-Z0-9_-]/g, '-');
-    const tmuxSessionName = `mc-${sanitizedName}`;
+    // §7: per-execution identity for the serve path (same as relaunch).
+    // TUI legacy keeps the bare name for backward compat with unit fakes;
+    // serve scopes by execTag so parallel runs never collide.
+    const useServe = shouldUseServeMode(this.config as { useServeMode?: boolean });
+    const execTag = job.id ? formatExecTag(planId, job.id) : shortPlanId;
+    const tmuxSessionName = useServe && execTag
+      ? sessionNameForJob(sanitizedName, execTag)
+      : `mc-${sanitizedName}`;
+    const windowName = useServe && execTag ? `${sanitizedName}-${execTag}` : sanitizedName;
     const tmuxTarget =
       placement === 'session'
         ? tmuxSessionName
@@ -2252,13 +2388,14 @@ export class Orchestrator {
             if (!currentSession && !isInsideTmux()) {
               throw new Error('Window placement requires running inside tmux');
             }
-            return `${currentSession}:${sanitizedName}`;
+            return `${currentSession}:${windowName}`;
           })();
 
     await updatePlanJob(planId, job.name, { status: 'running', branch }, undefined, this.effectiveRepoRoot());
 
     let worktreePath = '';
     let promptFilePath: string | undefined;
+    let servePort: number | undefined;
     try {
       const postCreate = resolvePostCreateHook(
         this.config.worktreeSetup,
@@ -2319,50 +2456,88 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       } else if (mode === 'ulw') {
         jobPrompt = `/ulw-loop ${jobPrompt}`;
       }
-      promptFilePath = await writePromptFile(worktreePath, jobPrompt);
-      // F06: effective model once per execution — snapshot triple (variant preserved for serve).
+      // §6 unified launcher: serve (verified triple) is the autonomous path.
+      // TUI only when useServeMode === false explicitly — always with an
+      // explicit unpinned warning, never silently satisfying the model contract.
       const effective = this.ensureEffectiveModel();
-      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effective);
-
-      const initialCommand = `bash '${launcherPath}'`;
-      if (placement === 'session') {
-        await createSession({
-          name: tmuxSessionName,
-          workdir: worktreePath,
-          command: initialCommand,
+      let serveUrl: string | undefined;
+      let serveRemoteSessionID: string | undefined;
+      if (useServe) {
+        const activeJobs = await getRunningJobs().catch(() => []);
+        servePort = await allocatePort(this.config, activeJobs);
+        serveUrl = `http://127.0.0.1:${servePort}`;
+        const serveLauncherPath = await writeServeLauncherScript(
+          worktreePath,
+          servePort,
+          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+        );
+        const { quoteShellPath } = await import('./sdk-client');
+        const initialServeCommand = `bash ${quoteShellPath(serveLauncherPath)}`;
+        if (placement === 'session') {
+          await createSession({ name: tmuxSessionName, workdir: worktreePath, command: initialServeCommand });
+        } else {
+          await createWindow({ session: getCurrentSession()!, name: windowName, workdir: worktreePath, command: initialServeCommand });
+        }
+        await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
+        cleanupLauncherScript(worktreePath);
+        const client = await v2WaitForServer(servePort, {
+          password: (this.config as MCConfig & { serverPassword?: string }).serverPassword,
         });
+        const worker = await launchWorkerViaServe(client, {
+          worktree: worktreePath,
+          prompt: jobPrompt,
+          model: { ...effective },
+          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          tmuxTarget,
+        });
+        serveRemoteSessionID = worker.sessionId;
       } else {
-        await createWindow({
-          session: getCurrentSession()!,
-          name: sanitizedName,
-          workdir: worktreePath,
-          command: initialCommand,
-        });
-      }
+        const pin = describeTuiModelPin(effective);
+        console.warn(`[MC] TUI launcher (unpinned model): requested ${pin.requested ?? 'none'} — ${pin.blockade}`);
+        promptFilePath = await writePromptFile(worktreePath, jobPrompt);
+        // F06: effective model once per execution — snapshot triple (variant preserved for serve).
+        const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effective);
 
-      await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
-      cleanupPromptFile(promptFilePath);
-      cleanupLauncherScript(worktreePath);
+        const initialCommand = `bash '${launcherPath}'`;
+        if (placement === 'session') {
+          await createSession({
+            name: tmuxSessionName,
+            workdir: worktreePath,
+            command: initialCommand,
+          });
+        } else {
+          await createWindow({
+            session: getCurrentSession()!,
+            name: windowName,
+            workdir: worktreePath,
+            command: initialCommand,
+          });
+        }
 
-      if (mode !== 'vanilla') {
-        try {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          switch (mode) {
-            case 'plan':
-              await sendKeys(tmuxTarget, '/start-work');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
-            case 'ralph':
-              await sendKeys(tmuxTarget, '/ralph-loop');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
-            case 'ulw':
-              await sendKeys(tmuxTarget, '/ulw-loop');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
+        await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
+        cleanupPromptFile(promptFilePath);
+        cleanupLauncherScript(worktreePath);
+
+        if (mode !== 'vanilla') {
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            switch (mode) {
+              case 'plan':
+                await sendKeys(tmuxTarget, '/start-work');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+              case 'ralph':
+                await sendKeys(tmuxTarget, '/ralph-loop');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+              case 'ulw':
+                await sendKeys(tmuxTarget, '/ulw-loop');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+            }
+          } catch {
+            // Non-fatal: OMO command delivery is best-effort
           }
-        } catch {
-          // Non-fatal: OMO command delivery is best-effort
         }
       }
 
@@ -2389,6 +2564,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         createdAt: new Date().toISOString(),
         planId,
         launchSessionID: this.planLaunchSessionID,
+        ...(servePort !== undefined ? { port: servePort } : {}),
+        ...(serveUrl !== undefined ? { serverUrl: serveUrl } : {}),
+        ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
       });
 
       await updatePlanJob(planId, job.name, {
@@ -2396,10 +2574,16 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         branch,
         worktreePath,
         tmuxTarget,
+        ...(servePort !== undefined ? { port: servePort } : {}),
+        ...(serveUrl !== undefined ? { serverUrl: serveUrl } : {}),
+        ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
       });
     } catch (error) {
       if (promptFilePath) {
         cleanupPromptFile(promptFilePath, 0);
+      }
+      if (servePort !== undefined) {
+        await releasePort(servePort).catch(() => {});
       }
 
       try {
@@ -2453,8 +2637,8 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     // bare job name that collides across projects/runs. The predecessor is
     // killed only through the recorded tmuxTarget (ownership marker) after a
     // has-session check — never an unrecorded same-name session.
-    const execTag = `${plan.id.slice(0, 8)}-${job.id.slice(0, 8)}`;
-    const tmuxSessionName = `mc-${sanitizedName}-${execTag}`;
+    const execTag = formatExecTag(plan.id, job.id);
+    const tmuxSessionName = sessionNameForJob(sanitizedName, execTag);
     const windowName = `${sanitizedName}-${execTag}`;
     const tmuxTarget =
       placement === 'session'
@@ -2468,15 +2652,18 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           })();
 
     // Kill the predecessor session/window if still alive (ownership-checked).
+    // §7: only the recorded predecessor is owned. The legacy bare name is
+    // killed solely via explicit migration opt-in (never by mere existence),
+    // so a foreign same-prefix session survives.
     try {
       const previousTarget = job.tmuxTarget;
       if (placement === 'session') {
-        // Only touch sessions this lane recorded (or the legacy bare name for
-        // the same job, pre-upgrade). Anything else is foreign: never kill.
-        const candidates = [previousTarget, `mc-${sanitizedName}`].filter(
-          (t): t is string => typeof t === 'string' && t.startsWith(`mc-${sanitizedName}`),
-        );
-        for (const cand of new Set(candidates)) {
+        const owned = buildOwnedKillList({
+          previousTarget,
+          legacySessionName: `mc-${sanitizedName}`,
+          allowLegacyFallback: false,
+        });
+        for (const cand of filterOwnedKillTargets(owned, previousTarget)) {
           let exists = false;
           try {
             exists = await sessionExists(cand);
@@ -2486,8 +2673,10 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           if (exists) await killSession(cand);
         }
       } else if (previousTarget) {
-        const [session, window] = previousTarget.split(':');
-        if (session && window && window.startsWith(sanitizedName)) {
+        // Strict equality with the recorded target — no prefix similarity.
+        for (const cand of filterOwnedKillTargets([previousTarget], previousTarget)) {
+          const [session, window] = cand.split(':');
+          if (!session || !window) continue;
           let exists = false;
           try {
             exists = await windowExists(session, window);
@@ -2539,17 +2728,19 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     const worktreePath = job.worktreePath;
     let promptFilePath: string | undefined;
+    let relaunchPort: number | undefined;
 
     // Never silently reuse a dirty worktree: checkpoint visible (add+commit)
     // so the correction starts from a recorded state. Refuse when the
-    // checkpoint itself fails.
+    // checkpoint itself fails. §4: permitted test artifacts (coverage/dist)
+    // never force a checkpoint — only relevant mutations do.
     const dirtyProbe = await gitCommand(['-C', worktreePath, 'status', '--porcelain']);
     if (dirtyProbe.exitCode !== 0) {
       throw new Error(
         `Cannot relaunch correction for job "${jobName}": cannot inspect worktree (${dirtyProbe.stderr || 'unknown'}) — refusing to reuse an unknown tree state`,
       );
     }
-    if (dirtyProbe.stdout.trim() !== '') {
+    if (filterRelevantDirtyPaths(parsePorcelainDirtyPaths(dirtyProbe.stdout)).length > 0) {
       const addRes = await gitCommand(['-C', worktreePath, 'add', '-A']);
       if (addRes.exitCode !== 0) {
         throw new Error(
@@ -2567,49 +2758,88 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
 
     try {
-      promptFilePath = await writePromptFile(worktreePath, fullPrompt);
-      const effective = this.ensureEffectiveModel();
-      const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effective);
-
-      const initialCommand = `bash '${launcherPath}'`;
-      if (placement === 'session') {
-        await createSession({
-          name: tmuxSessionName,
-          workdir: worktreePath,
-          command: initialCommand,
+      // §6: correction relaunches on the verified serve path by default,
+      // preserving variant + auto-fix continuity (worker re-oriented on the
+      // same worktree). TUI only on explicit opt-out, never silent.
+      const useServeRelaunch = shouldUseServeMode(this.config as { useServeMode?: boolean });
+      const effectiveRelaunch = this.ensureEffectiveModel();
+      let relaunchUrl: string | undefined;
+      let relaunchRemoteSessionID: string | undefined;
+      if (useServeRelaunch) {
+        const activeJobs = await getRunningJobs().catch(() => []);
+        relaunchPort = await allocatePort(this.config, activeJobs);
+        relaunchUrl = `http://127.0.0.1:${relaunchPort}`;
+        const serveLauncherPath = await writeServeLauncherScript(
+          worktreePath,
+          relaunchPort,
+          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+        );
+        const { quoteShellPath } = await import('./sdk-client');
+        const initialServeCommand = `bash ${quoteShellPath(serveLauncherPath)}`;
+        if (placement === 'session') {
+          await createSession({ name: tmuxSessionName, workdir: worktreePath, command: initialServeCommand });
+        } else {
+          await createWindow({ session: getCurrentSession()!, name: windowName, workdir: worktreePath, command: initialServeCommand });
+        }
+        await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
+        cleanupLauncherScript(worktreePath);
+        const client = await v2WaitForServer(relaunchPort, {
+          password: (this.config as MCConfig & { serverPassword?: string }).serverPassword,
         });
+        const worker = await launchWorkerViaServe(client, {
+          worktree: worktreePath,
+          prompt: fullPrompt,
+          model: { ...effectiveRelaunch },
+          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          tmuxTarget,
+        });
+        relaunchRemoteSessionID = worker.sessionId;
       } else {
-        await createWindow({
-          session: getCurrentSession()!,
-          name: windowName,
-          workdir: worktreePath,
-          command: initialCommand,
-        });
-      }
+        const pin = describeTuiModelPin(effectiveRelaunch);
+        console.warn(`[MC] TUI relaunch (unpinned model): requested ${pin.requested ?? 'none'} — ${pin.blockade}`);
+        promptFilePath = await writePromptFile(worktreePath, fullPrompt);
+        const launcherPath = await writeLauncherScript(worktreePath, promptFilePath, effectiveRelaunch);
 
-      await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
-      cleanupPromptFile(promptFilePath);
-      cleanupLauncherScript(worktreePath);
+        const initialCommand = `bash '${launcherPath}'`;
+        if (placement === 'session') {
+          await createSession({
+            name: tmuxSessionName,
+            workdir: worktreePath,
+            command: initialCommand,
+          });
+        } else {
+          await createWindow({
+            session: getCurrentSession()!,
+            name: windowName,
+            workdir: worktreePath,
+            command: initialCommand,
+          });
+        }
 
-      if (mode !== 'vanilla') {
-        try {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          switch (mode) {
-            case 'plan':
-              await sendKeys(tmuxTarget, '/start-work');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
-            case 'ralph':
-              await sendKeys(tmuxTarget, '/ralph-loop');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
-            case 'ulw':
-              await sendKeys(tmuxTarget, '/ulw-loop');
-              await sendKeys(tmuxTarget, 'Enter');
-              break;
+        await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
+        cleanupPromptFile(promptFilePath);
+        cleanupLauncherScript(worktreePath);
+
+        if (mode !== 'vanilla') {
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            switch (mode) {
+              case 'plan':
+                await sendKeys(tmuxTarget, '/start-work');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+              case 'ralph':
+                await sendKeys(tmuxTarget, '/ralph-loop');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+              case 'ulw':
+                await sendKeys(tmuxTarget, '/ulw-loop');
+                await sendKeys(tmuxTarget, 'Enter');
+                break;
+            }
+          } catch {
+            // Non-fatal: OMO command delivery is best-effort
           }
-        } catch {
-          // Non-fatal: OMO command delivery is best-effort
         }
       }
 
@@ -2637,16 +2867,25 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         createdAt: new Date().toISOString(),
         planId: plan.id,
         launchSessionID: this.planLaunchSessionID,
+        ...(relaunchPort !== undefined ? { port: relaunchPort } : {}),
+        ...(relaunchUrl !== undefined ? { serverUrl: relaunchUrl } : {}),
+        ...(relaunchRemoteSessionID !== undefined ? { remoteSessionID: relaunchRemoteSessionID } : {}),
       });
 
       await updatePlanJob(plan.id, job.name, {
         status: 'running',
         tmuxTarget,
         error: undefined,
+        ...(relaunchPort !== undefined ? { port: relaunchPort } : {}),
+        ...(relaunchUrl !== undefined ? { serverUrl: relaunchUrl } : {}),
+        ...(relaunchRemoteSessionID !== undefined ? { remoteSessionID: relaunchRemoteSessionID } : {}),
       });
     } catch (error) {
       if (promptFilePath) {
         cleanupPromptFile(promptFilePath, 0);
+      }
+      if (relaunchPort !== undefined) {
+        await releasePort(relaunchPort).catch(() => {});
       }
 
       try {

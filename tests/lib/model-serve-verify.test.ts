@@ -3,6 +3,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   assertServeSessionModelEcho,
   createV2Client,
+  launchWorkerViaServe,
   v2CreateSessionWithVerifiedModel,
 } from '../../src/lib/sdk-client';
 
@@ -157,5 +158,97 @@ describe('assertServeSessionModelEcho (pure)', () => {
         WANT,
       ),
     ).toThrow(/model mismatch/);
+  });
+});
+
+describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
+  it('POST carries the full triple with variant, prompts, and returns the handle with no extra GET', async () => {
+    const seen: Array<{ url: string; method: string; body?: unknown }> = [];
+    stubFetch((url, init) => {
+      seen.push({ url, method: init?.method ?? 'GET', body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.endsWith('/api/session/ses_9/prompt')) {
+        return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+      }
+      return new Response(
+        sessionPayload('ses_9', {
+          providerID: 'opencode-go',
+          id: 'muse-spark-1.3-contributor',
+          variant: 'xhigh',
+        }),
+        { status: 200 },
+      );
+    });
+
+    const handle = await launchWorkerViaServe(createV2Client(17891), {
+      worktree: '/tmp/mc-w',
+      prompt: 'do the work',
+      model: { ...WANT },
+      profile: { permissions: [{ action: 'read', resource: '/tmp/mc-w/**', effect: 'allow' }] },
+      tmuxTarget: 'mc-work',
+    });
+
+    expect(handle.sessionId).toBe('ses_9');
+    expect(handle.tmuxTarget).toBe('mc-work');
+    expect(handle.model).toMatchObject({ variant: 'xhigh' });
+    const post = seen.find((s) => s.url.endsWith('/api/session') && s.method === 'POST');
+    expect(post?.body).toMatchObject({
+      model: { ...WANT },
+      location: { directory: '/tmp/mc-w' },
+    });
+    const promptCall = seen.find((s) => s.url.endsWith('/api/session/ses_9/prompt'));
+    expect(promptCall?.body).toMatchObject({ text: 'do the work' });
+    // Echo mode: exactly POST session + POST prompt, no verification GET.
+    expect(seen.filter((s) => s.method === 'GET')).toHaveLength(0);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('mismatch rejects before the prompt is sent (fail-closed, no extra calls)', async () => {
+    const seen: string[] = [];
+    stubFetch((url) => {
+      seen.push(url);
+      if (url.endsWith('/api/session/ses_9/prompt')) {
+        return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+      }
+      return new Response(sessionPayload('ses_9', { providerID: 'opencode-go', id: 'other-model' }), {
+        status: 200,
+      });
+    });
+
+    await expect(
+      launchWorkerViaServe(createV2Client(17891), {
+        worktree: '/tmp/mc-w',
+        prompt: 'do the work',
+        model: { ...WANT },
+      }),
+    ).rejects.toThrow(/model mismatch/);
+    // Only the session POST happened; the prompt was never delivered.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].endsWith('/api/session')).toBe(true);
+  });
+
+  it("get mode adds exactly one verification GET (POST+GET+prompt, nothing more)", async () => {
+    const seen: Array<{ url: string; method: string }> = [];
+    stubFetch((url, init) => {
+      seen.push({ url, method: init?.method ?? 'GET' });
+      if (url.endsWith('/api/session/ses_9/prompt')) {
+        return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+      }
+      return new Response(sessionPayload('ses_9', { ...WANT }), { status: 200 });
+    });
+
+    const handle = await launchWorkerViaServe(createV2Client(17891), {
+      worktree: '/tmp/mc-w',
+      prompt: 'hi',
+      model: { ...WANT },
+      verify: 'get',
+    });
+    expect(handle.sessionId).toBe('ses_9');
+    // POST session + GET session/:id + POST prompt, nothing more.
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toMatchObject({ method: 'POST' });
+    expect(seen[0].url.endsWith('/api/session')).toBe(true);
+    expect(seen[1]).toMatchObject({ method: 'GET' });
+    expect(seen[1].url.endsWith('/api/session/ses_9')).toBe(true);
+    expect(seen[2].url.endsWith('/api/session/ses_9/prompt')).toBe(true);
   });
 });

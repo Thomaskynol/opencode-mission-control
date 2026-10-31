@@ -277,6 +277,67 @@ describe('R01 sonda A/B (functional sufficiency)', () => {
   });
 });
 
+describe('R01 §3 regressions (bound assertion + NL behavioral)', () => {
+  it('case 1: REJECTS call without assertion (wrong impl, bare call)', () => {
+    const verdict = reviewJob(
+      sondaInput(
+        {
+          'total.mjs': 'export function total(xs) { return 0; }\n',
+          'total.test.mjs':
+            `import { total } from './total.mjs';\nimport test from '${NODE_TEST_SPEC}';\ntest('just calls total', () => { total([1,2]); });\n`,
+        },
+        'pass: just calls total (1 passed)',
+      ),
+    );
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.reasons.join('\n')).toMatch(/assert|do not cover requirement/i);
+  });
+
+  it('case 2: REJECTS assert of empty-only case for non-empty sum requirement', () => {
+    const verdict = reviewJob(
+      sondaInput(
+        {
+          'total.mjs': 'export function total(xs) { return 0; }\n',
+          'total.test.mjs':
+            `import { total } from './total.mjs';\nimport test from '${NODE_TEST_SPEC}';\nimport assert from 'node:assert/strict';\ntest('empty collection', () => { assert.equal(total([]), 0); });\n`,
+        },
+        'pass: empty collection (1 passed)',
+      ),
+    );
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.reasons.join('\n')).toMatch(/REQ-total/);
+  });
+
+  it('case 3: ACCEPTS natural-language requirement with correct impl + test', () => {
+    const verdict = reviewJob({
+      jobName: 'total-job',
+      jobBranch: 'feature-total',
+      baseBranch: 'main',
+      baseHead: 'base-1',
+      jobHead: 'job-1',
+      changedFiles: ['total.mjs', 'total.test.mjs'],
+      requirements: [
+        { id: 'REQ-empty', description: 'Return zero for an empty collection', testAnchors: ['Return zero for an empty collection'] },
+      ],
+      fileContents: {
+        'total.mjs': 'export function total(xs) { return xs.reduce((a, b) => a + b, 0); }\n',
+        'total.test.mjs':
+          `import { total } from './total.mjs';\nimport test from '${NODE_TEST_SPEC}';\nimport assert from 'node:assert/strict';\ntest('handles empty collection', () => { assert.equal(total([]), 0); });\n`,
+      },
+      evidence: {
+        command: 'bun test',
+        exitCode: 0,
+        output: 'pass: handles empty collection (1 passed)',
+        testedCommit: 'job-1',
+        environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
+      },
+      claimedPass: true,
+    });
+    expect(verdict.verdict).toBe('pass');
+    expect(verdict.blocking).toBe(false);
+  });
+});
+
 describe('R01 candidate identity (never attribute a pass to the wrong commit)', () => {
   const coveringContents = {
     'total.mjs': 'export function total(xs) { return xs.reduce((a, b) => a + b, 0); }\n',

@@ -284,6 +284,156 @@ function testCallsSymbol(testContent: string, symbol: string): boolean {
   return new RegExp(`\\b${escaped}\\s*\\(`).test(stripped);
 }
 
+/**
+ * True when the requirement text carries a code reference (a call `sym(`,
+ * a comparison `===`/`==`, a numeric literal, or a quoted literal).
+ * Plain words ("Return zero for an empty collection") are behavioural
+ * prose — never a vocabulary obligation on internal symbol names.
+ */
+function hasCodeReferences(text: string): boolean {
+  if (/\b[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(text)) return true;
+  if (/===|!==|==|!=|=>/.test(text)) return true;
+  if (/\b\d+(?:\.\d+)?\b/.test(text)) return true;
+  if (/'[^']+'|"[^"]+"|`[^`]+`/.test(text)) return true;
+  return false;
+}
+
+/** Filenames/paths alone are never coverage (anchor must be behaviour). */
+function isPathLikeAnchor(anchor: string): boolean {
+  const s = anchor.trim();
+  if (s.includes('/') || s.includes('\\')) return true;
+  if (/\.test\.|\.spec\.|__tests__/.test(s)) return true;
+  if (/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|c|cpp|h|rb|php)$/i.test(s)) return true;
+  return false;
+}
+
+/** Numbers, quoted literals and booleans the criterion pins down. */
+function extractRequiredLiterals(text: string): string[] {
+  const nums = text.match(/\b\d+(?:\.\d+)?\b/g) ?? [];
+  const bools = (text.match(/\b(true|false|null|undefined)\b/gi) ?? []).map((s) => s.toLowerCase());
+  const quoted: string[] = [];
+  const qre = /'([^']+)'|"([^"]+)"|`([^`]+)`/g;
+  let m: RegExpExecArray | null;
+  while ((m = qre.exec(text)) !== null) {
+    const inner = m[1] ?? m[2] ?? m[3] ?? '';
+    if (inner.length > 0) quoted.push(inner);
+  }
+  return [...new Set([...nums, ...bools, ...quoted])].slice(0, 12);
+}
+
+/** Strip comments but keep string contents (expected values live there). */
+function stripCommentsKeepStrings(source: string): string {
+  let out = '';
+  let i = 0;
+  const n = source.length;
+  let quote: string | null = null;
+  while (i < n) {
+    const ch = source[i]!;
+    if (quote !== null) {
+      out += ch;
+      if (ch === '\\' && i + 1 < n) {
+        out += source[i + 1]!;
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && i + 1 < n) {
+      const next = source[i + 1]!;
+      if (next === '/') {
+        while (i < n && source[i] !== '\n') i++;
+        continue;
+      }
+      if (next === '*') {
+        i += 2;
+        while (i + 1 < n && !(source[i] === '*' && source[i + 1] === '/')) i++;
+        i += 2;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Assertion windows: symmetric slice around each assert/expect/exit/throw
+ * keyword so both `assert.equal(f(x), v)` (call after) and
+ * `got = f(x); assert.equal(got, v)` (call before) bind. Exit-code
+ * harnesses (`if (got !== v) process.exit(1)`) count as assertions.
+ * shortcut: fixed ±window heuristic — upgrade to a structured parser if it misfires.
+ */
+function assertionWindows(noComments: string): string[] {
+  const wins: string[] = [];
+  const re = /\bassert\b|\bexpect\b|process\.exit|\bthrow\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(noComments)) !== null) {
+    wins.push(noComments.slice(Math.max(0, m.index - 500), m.index + 800));
+  }
+  return wins;
+}
+
+function windowHasCall(window: string, symbol: string): boolean {
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b${escaped}\\s*\\(`).test(stripStringsAndComments(window));
+}
+
+function windowCoversLiterals(window: string, literals: string[]): boolean {
+  for (const lit of literals) {
+    if (/^\d+(?:\.\d+)?$/.test(lit)) {
+      if (!new RegExp(`\\b${lit.replace('.', '\\.')}\\b`).test(window)) return false;
+    } else if (/^(true|false|null|undefined)$/i.test(lit)) {
+      if (!new RegExp(`\\b${lit}\\b`, 'i').test(window)) return false;
+    } else if (!window.includes(lit)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** An assertion whose window really invokes `symbol(` (title strings excluded). */
+function hasAssertedCall(testContent: string, symbol: string): boolean {
+  const noComments = stripCommentsKeepStrings(testContent);
+  for (const w of assertionWindows(noComments)) {
+    if (windowHasCall(w, symbol)) return true;
+  }
+  return false;
+}
+
+/** Bound assertion: same window calls `symbol(` and pins every required literal. */
+function hasBoundAssertion(testContent: string, symbol: string, required: string[]): boolean {
+  const noComments = stripCommentsKeepStrings(testContent);
+  for (const w of assertionWindows(noComments)) {
+    if (windowHasCall(w, symbol) && windowCoversLiterals(w, required)) return true;
+  }
+  return false;
+}
+
+/** Implementation-side candidates (`export function name`, `def name`, ...) for NL requirements. */
+function extractImplCandidates(implSources: string): string[] {
+  const out: string[] = [];
+  const re =
+    /(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)|\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(|\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b|(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:\(|function|=>)|def\s+([A-Za-z_][A-Za-z0-9_]*)\b|fn\s+([A-Za-z_][A-Za-z0-9_]*)\b)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(implSources)) !== null) {
+    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? m[6];
+    if (!name) continue;
+    if (REQUIREMENT_STOPWORDS.has(name.toLowerCase())) continue;
+    if (!out.some((s) => s.toLowerCase() === name.toLowerCase())) out.push(name);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
 export interface FunctionalCoverage {
   covered: boolean;
   reason: string;
@@ -293,8 +443,13 @@ export interface FunctionalCoverage {
  * R01 coordinator sufficiency: implementation + test content decide, never
  * stdout text. Covered only when:
  *  1. observed output carries a runner pass signal, AND
- *  2. some requirement symbol is defined in implementation files, AND
- *  3. some test file asserts through a call to that symbol.
+ *  2a. code-ref requirements (`sym(`, `===`, numbers, quoted literals):
+ *      some requirement symbol is defined in implementation files AND some
+ *      test assertion binds a call to that symbol with the expected
+ *      literals from the criterion (bare `f(x);` without assert fails;
+ *      `assert(f([]),0)` does not cover `f([1,2])===3`), OR
+ *  2b. behavioural NL requirements (no code refs): some implementation
+ *      candidate is asserted through a call (no vocabulary obligation).
  * Diagnostics name whether the implementation or the tests must change —
  * never "print the anchor".
  */
@@ -318,11 +473,10 @@ export function assessFunctionalCoverage(
       reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no passing test execution observed in product-run output`,
     };
   }
-  const symbols = extractRequirementSymbols(requirement.description, requirement.testAnchors);
-  if (symbols.length === 0) {
+  if (requirement.testAnchors.length > 0 && requirement.testAnchors.every(isPathLikeAnchor)) {
     return {
       covered: false,
-      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no code symbol to link requirement to implementation`,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): test anchor is a file name, not observed behaviour — add a test that calls the implementation and asserts the expected outcome`,
     };
   }
   const explicit = (opts?.testPaths ?? []).filter((p) => p in contents);
@@ -336,6 +490,32 @@ export function assessFunctionalCoverage(
   const implPool = paths.filter((p) => !testPool.includes(p));
   const implSources = (implPool.length > 0 ? implPool : paths.filter((p) => !testPool.includes(p)))
     .map((p) => contents[p] ?? '').join('\n');
+  const fullText = `${requirement.description} ${requirement.testAnchors.join(' ')}`;
+
+  // 2b. Behavioural NL: no code refs — link any asserted implementation call.
+  if (!hasCodeReferences(fullText)) {
+    const candidates = extractImplCandidates(implSources);
+    for (const cand of candidates) {
+      for (const tp of testPool) {
+        if (hasAssertedCall(contents[tp] ?? '', cand)) {
+          return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${cand}()` };
+        }
+      }
+    }
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test asserts an implementation call — fix the tests to call the implementation and assert the expected behaviour`,
+    };
+  }
+
+  // 2a. Code-ref requirements: symbol must be defined, then bound-asserted.
+  const symbols = extractRequirementSymbols(requirement.description, requirement.testAnchors);
+  if (symbols.length === 0) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no code symbol to link requirement to implementation`,
+    };
+  }
   const defined = findDefinedSymbols(implSources, symbols);
   if (defined.length === 0) {
     return {
@@ -343,13 +523,30 @@ export function assessFunctionalCoverage(
       reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation does not define ${symbols.join('/')} — fix the implementation (changed files: ${implPool.join(', ') || 'none'})`,
     };
   }
-  for (const sym of defined) {
-    for (const tp of testPool) {
-      const tc = contents[tp] ?? '';
-      if (testCallsSymbol(tc, sym)) {
-        return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} calls ${sym}()` };
+  const required = extractRequiredLiterals(fullText);
+  if (required.length === 0) {
+    for (const sym of defined) {
+      for (const tp of testPool) {
+        if (hasAssertedCall(contents[tp] ?? '', sym)) {
+          return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}()` };
+        }
       }
     }
+  } else {
+    for (const sym of defined) {
+      for (const tp of testPool) {
+        if (hasBoundAssertion(contents[tp] ?? '', sym, required)) {
+          return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}() with expected ${required.join('/')} ` };
+        }
+      }
+    }
+  }
+  const anyCall = defined.some((sym) => testPool.some((tp) => testCallsSymbol(contents[tp] ?? '', sym)));
+  if (anyCall) {
+    return {
+      covered: false,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${defined.join('/')}() but no assertion checks expected ${required.join('/')} — fix the tests to assert the implementation result for the required case`,
+    };
   }
   const anchorHint = requirement.testAnchors.some((a) => testOutput.includes(a))
     ? ' (output mentions the anchor text but no test calls the implementation — title without coverage)'
