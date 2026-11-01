@@ -13,7 +13,7 @@
 import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
-import { matchesTouchPattern } from './merge-train';
+import { matchesTouchPattern, touchPatternsOverlap } from './merge-train';
 import { gitCommand } from './git';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 
@@ -354,7 +354,7 @@ function normalizeCoherencePath(p: string): string {
     .replace(/^\.\//, '');
 }
 
-/** True when a touchSet entry covers an acceptance file ref (glob parity with merge-train, plus exact/suffix). */
+/** True when a touchSet entry covers an acceptance file ref (glob parity with merge-train). */
 export function touchSetCovers(touchSet: string[] | undefined, ref: string): boolean {
   const want = normalizeCoherencePath(ref);
   if (!want) return false;
@@ -363,9 +363,12 @@ export function touchSetCovers(touchSet: string[] | undefined, ref: string): boo
     if (!have) return false;
     if (have === want) return true;
     // Same glob semantics as merge-train validation (`src/` = `src/**`):
-    // a directory entry covers every nested file.
+    // a directory entry covers every nested file. No suffix fallback: paths
+    // in different directories are never equal (`other/src/total.js` is not
+    // covered by `src/total.js`) — overlap across entries is decided by
+    // touchPatternsOverlap in assertPlanCoherence, not here.
     if (matchesTouchPattern(have, want) || matchesTouchPattern(entry, ref)) return true;
-    return have.endsWith('/' + want) || want.endsWith('/' + have);
+    return false;
   });
 }
 
@@ -402,37 +405,68 @@ export function validateTaskCoherence(task: TaskCoherenceInput): void {
 }
 
 /**
+ * Transitive dependsOn reachability: true when `to` is reachable from `from`
+ * through any chain of dependsOn edges. Unknown names are dead ends (the
+ * structural validators reject them elsewhere; here they simply add no edge).
+ */
+function dependsTransitively(from: string, to: string, byName: Map<string, AutoTaskDraft>): boolean {
+  const seen = new Set<string>();
+  const stack = [...(byName.get(from)?.dependsOn ?? [])];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === to) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    stack.push(...(byName.get(cur)?.dependsOn ?? []));
+  }
+  return false;
+}
+
+/** True when either task hands off to the other, directly or transitively. */
+function orderedBetween(a: string, b: string, byName: Map<string, AutoTaskDraft>): boolean {
+  return dependsTransitively(a, b, byName) || dependsTransitively(b, a, byName);
+}
+
+/**
  * Plan-wide coherence: single-task checks plus cross-job diagnosis —
- * concurrent writers of the same file without a dependsOn handoff, a test
+ * concurrent writers of overlapping scope without a dependsOn handoff, a test
  * asserting on a file owned by an unrelated job, and a ceiling testCommand
  * targeting files no job owns. Throws on the first incoherence found.
  */
 export function assertPlanCoherence(draft: AutoPlanDraft, opts?: { testCommand?: string }): void {
   const byName = new Map(draft.tasks.map((t) => [t.name, t]));
 
-  // Two workers writing the same destination with no ordering edge race.
-  const writers = new Map<string, string[]>();
+  // Writers whose scopes really overlap (glob×glob, dir×file, exact) race
+  // without an ordering edge. Overlap is the canonical pattern×pattern
+  // check (merge-train semantics) — never exact-string grouping, so
+  // `src/**` × `src/total.js` is caught here, not late at merge time.
+  const writers: Array<{ task: string; entry: string }> = [];
   for (const t of draft.tasks) {
     for (const entry of t.touchSet ?? []) {
       const key = normalizeCoherencePath(entry);
       if (!key) continue;
-      writers.set(key, [...(writers.get(key) ?? []), t.name]);
+      writers.push({ task: t.name, entry: key });
     }
   }
-  for (const [file, names] of writers) {
-    for (let i = 0; i < names.length; i++) {
-      for (let j = i + 1; j < names.length; j++) {
-        const a = byName.get(names[i])!;
-        const b = byName.get(names[j])!;
-        const ordered =
-          (a.dependsOn ?? []).includes(b.name) || (b.dependsOn ?? []).includes(a.name);
-        if (!ordered) {
-          throw new Error(
-            `Jobs "${a.name}" and "${b.name}" both write "${file}" with no dependsOn ordering. ` +
-              `Add dependsOn so one hands off to the other, or split "${file}" between the jobs.`,
-          );
-        }
+  for (let i = 0; i < writers.length; i++) {
+    for (let j = i + 1; j < writers.length; j++) {
+      const wi = writers[i]!;
+      const wj = writers[j]!;
+      if (wi.task === wj.task) continue;
+      if (!touchPatternsOverlap(wi.entry, wj.entry)) continue;
+      const a = byName.get(wi.task)!;
+      const b = byName.get(wj.task)!;
+      if (orderedBetween(a.name, b.name, byName)) continue;
+      if (wi.entry === wj.entry) {
+        throw new Error(
+          `Jobs "${a.name}" and "${b.name}" both write "${wi.entry}" with no dependsOn ordering. ` +
+            `Add dependsOn so one hands off to the other, or split "${wi.entry}" between the jobs.`,
+        );
       }
+      throw new Error(
+        `Jobs "${a.name}" and "${b.name}" overlap ("${wi.entry}" × "${wj.entry}") with no dependsOn ordering. ` +
+          `Add dependsOn so one hands off to the other, or split the scope between the jobs.`,
+      );
     }
   }
 
@@ -444,9 +478,7 @@ export function assertPlanCoherence(draft: AutoPlanDraft, opts?: { testCommand?:
         .filter((o) => o.name !== t.name && touchSetCovers(o.touchSet, ref))
         .map((o) => o.name);
       if (owners.length > 0) {
-        const linked = owners.some(
-          (o) => (t.dependsOn ?? []).includes(o) || (byName.get(o)?.dependsOn ?? []).includes(t.name),
-        );
+        const linked = owners.some((o) => orderedBetween(t.name, o, byName));
         if (linked) continue;
         throw new Error(
           `Task "${t.name}" asserts on "${ref}" which belongs to job ${owners.map((o) => `"${o}"`).join(', ')} (touchSet) with no dependsOn edge. ` +

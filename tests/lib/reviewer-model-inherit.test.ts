@@ -26,12 +26,23 @@ describe('reviewer model inheritance (effective → review)', () => {
     expect(resolved).toBe(EFFECTIVE);
   });
 
-  it('precedência: args.model > MC_REVIEW_MODEL > effectiveModel', () => {
+  it('precedência: args.model > MC_REVIEW_MODEL > effectiveModel (divergência exige autorização)', () => {
     clearReviewEnv();
     expect(resolveReviewModel({}, EFFECTIVE)).toBe(EFFECTIVE);
+    // Igual ao efetivo: aceito sem autorização extra.
+    process.env.MC_REVIEW_MODEL = EFFECTIVE;
+    expect(resolveReviewModel({}, EFFECTIVE)).toBe(EFFECTIVE);
+    // Divergente sem MC_REVIEW_MODEL_ALLOW_DIVERGENT: rejeitado, nunca silencioso.
     process.env.MC_REVIEW_MODEL = 'env-model/env-id';
+    expect(() => resolveReviewModel({}, EFFECTIVE)).toThrow(/diverg/i);
+    process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = 'env-model/env-id';
     expect(resolveReviewModel({}, EFFECTIVE)).toBe('env-model/env-id');
+    delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    expect(() => resolveReviewModel({ model: 'args-model/args-id' }, EFFECTIVE)).toThrow(/diverg/i);
+    process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = 'args-model/args-id';
     expect(resolveReviewModel({ model: 'args-model/args-id' }, EFFECTIVE)).toBe('args-model/args-id');
+    delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    delete process.env.MC_REVIEW_MODEL;
   });
 
   it('aceita ModelRef com variant e formata com #variant', () => {

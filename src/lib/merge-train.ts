@@ -74,6 +74,49 @@ export function matchesTouchPattern(pattern: string, file: string): boolean {
   return new Bun.Glob(normalized).match(file);
 }
 
+const OVERLAP_GLOB_CHARS = /[*?{\[]/;
+
+/**
+ * Concrete witness for a touchSet pattern: every glob token replaced by a
+ * fixed probe segment, so the OTHER pattern can be tested against it with
+ * the canonical matchesTouchPattern. A witness matching the other pattern
+ * proves real overlap (glob×glob, dir×file); no match either direction
+ * proves disjointness for the covered shapes (e.g. `src/*.js` × `src/*.ts`).
+ */
+function witnessForPattern(pattern: string): string {
+  const base = pattern.endsWith('/') ? `${pattern}**` : pattern;
+  return base
+    .replace(/\*\*/g, '__probe__/deep')
+    .replace(/\{([^{}]*)\}/g, (_, inner: string) => (inner.split(',')[0] ?? '').trim() || '__probe__')
+    .replace(/\[[^\]]*\]/g, 'a')
+    .replace(/\*/g, '__probe__')
+    .replace(/\?/g, 'p');
+}
+
+/**
+ * Canonical pattern×pattern overlap shared by plan coherence (auto-plan).
+ * Conservative by design: a proven or plausible overlap returns true
+ * (callers serialize / require dependsOn ordering); only provably disjoint
+ * scopes return false. Never treats a bare suffix as equality — paths in
+ * different directories (`src/total.js` × `other/src/total.js`) do NOT
+ * overlap. A glob-free literal prefix still covers nested files (`src` ×
+ * `src/total.js`), matching the directory intuition without weakening the
+ * file-level matcher above.
+ */
+export function touchPatternsOverlap(a: string, b: string): boolean {
+  const na = a.trim().replace(/^\.\//, '');
+  const nb = b.trim().replace(/^\.\//, '');
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (matchesTouchPattern(na, witnessForPattern(nb))) return true;
+  if (matchesTouchPattern(nb, witnessForPattern(na))) return true;
+  const sa = na.endsWith('/') ? na.slice(0, -1) : na;
+  const sb = nb.endsWith('/') ? nb.slice(0, -1) : nb;
+  if (!OVERLAP_GLOB_CHARS.test(na) && (sb === sa || sb.startsWith(sa + '/'))) return true;
+  if (!OVERLAP_GLOB_CHARS.test(nb) && (sa === sb || sa.startsWith(sb + '/'))) return true;
+  return false;
+}
+
 export async function validateTouchSet(
   jobBranch: string,
   baseBranch: string,

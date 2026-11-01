@@ -73,20 +73,40 @@ function normalizeReviewModelInput(input?: ReviewModelInput): string | undefined
  * Never falls back to a silent default: undefined means the caller must
  * report `review model unpinned` without invoking the binary.
  *
+ * Single-effective-triple rule (achado D): an override (args.model or
+ * MC_REVIEW_MODEL) that DIVERGES from the inherited effective triple is
+ * rejected with an explicit error — the reviewer must never silently run a
+ * different model than the mission. Unset the override to inherit, or set
+ * MC_REVIEW_MODEL_ALLOW_DIVERGENT to the exact override value to authorize
+ * that switch explicitly (recorded in the environment, auditable).
+ *
  * Integrator note: the public review path never sets args.model, so the
  * orchestrator's attachExternalSufficiency must pass the effective triple as
  * `effectiveModel` — `formatModelRefForArgv(ensureEffectiveModel())` — making
- * MC_REVIEW_MODEL an optional override, not a second required config.
+ * MC_REVIEW_MODEL an authorized-or-rejected override, not a silent switch.
  */
 export function resolveReviewModel(
   args: { model?: ReviewModelInput },
   effectiveModel?: ReviewModelInput,
 ): string | undefined {
   const fromArgs = normalizeReviewModelInput(args?.model);
-  if (fromArgs) return fromArgs;
   const fromEnv = process.env.MC_REVIEW_MODEL?.trim() || undefined;
-  if (fromEnv) return fromEnv;
-  return normalizeReviewModelInput(effectiveModel);
+  const effective = normalizeReviewModelInput(effectiveModel);
+  const override = fromArgs ?? fromEnv;
+  if (override) {
+    if (effective && override !== effective) {
+      const acknowledged = process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT?.trim() || undefined;
+      if (acknowledged !== override) {
+        throw new Error(
+          `Review model override "${override}" diverges from the mission effective model "${effective}" — refusing silent switch. ` +
+            `Unset MC_REVIEW_MODEL (and the per-call model) to inherit "${effective}", or set ` +
+            `MC_REVIEW_MODEL_ALLOW_DIVERGENT="${override}" to authorize this exact override explicitly.`,
+        );
+      }
+    }
+    return override;
+  }
+  return effective;
 }
 
 export interface FunctionalCriterionResult {
@@ -319,9 +339,11 @@ function unwrapEnvelopeCandidates(raw: string): string[] {
  * Model pin (always `--model`, variant preserved as `#variant`): resolved via
  * {@link resolveReviewModel} — args.model → MC_REVIEW_MODEL → effectiveModel
  * (inherited triple from the integrator) → unpinned fail-closed without
- * invoking the binary. The orchestrator's attachExternalSufficiency should
+ * invoking the binary. A divergent override without explicit authorization
+ * (MC_REVIEW_MODEL_ALLOW_DIVERGENT) resolves to fail-closed verdicts here,
+ * never to a silent run on another model. The orchestrator's attachExternalSufficiency should
  * pass `formatModelRefForArgv(ensureEffectiveModel())` as `effectiveModel`
- * so MC_REVIEW_MODEL stays an optional override.
+ * so MC_REVIEW_MODEL stays an authorized-or-rejected override.
  */
 export async function reviewFunctionallyViaOpenCode(
   args: FunctionalReviewArgs,
@@ -329,7 +351,13 @@ export async function reviewFunctionallyViaOpenCode(
 ): Promise<FunctionalCriterionResult[]> {
   const { requirements } = args;
   if (requirements.length === 0) return [];
-  const model = resolveReviewModel(args, effectiveModel);
+  let model: string | undefined;
+  try {
+    model = resolveReviewModel(args, effectiveModel);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return failClosed(requirements, msg.slice(0, 300));
+  }
   if (!model) return failClosed(requirements, 'review model unpinned (MC_REVIEW_MODEL not set)');
   const bin = args.bin ?? process.env.MC_OPENCODE_BIN ?? process.env.OPENCODE_BIN ?? 'opencode';
   const timeoutMs = args.timeoutMs ?? 300_000;
