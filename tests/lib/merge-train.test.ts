@@ -425,11 +425,24 @@ describe('validateTouchSet', () => {
     rmSync(testRepo.rootDir, { recursive: true, force: true });
   });
 
-  it('should return valid when touchSet is empty', async () => {
+  it('should return invalid when touchSet is empty but the diff is not', async () => {
     await createBranchCommit(testRepo.repoDir, 'feature-empty-ts', 'foo.txt', 'foo\n');
 
     const result = await validateTouchSet('feature-empty-ts', 'main', [], { cwd: testRepo.repoDir });
+    expect(result.valid).toBe(false);
+    expect(result.violations).toBeDefined();
+    expect(result.violations!.join('\n')).toMatch(/touchSet|scope/i);
+    expect(result.changedFiles).toContain('foo.txt');
+  });
+
+  it('should return valid when touchSet is empty and there are no changes', async () => {
+    await mustExec(['git', 'checkout', '-b', 'feature-empty-nodiff', 'main'], testRepo.repoDir);
+    await mustExec(['git', 'commit', '--allow-empty', '-m', 'empty'], testRepo.repoDir);
+    await mustExec(['git', 'checkout', 'main'], testRepo.repoDir);
+
+    const result = await validateTouchSet('feature-empty-nodiff', 'main', [], { cwd: testRepo.repoDir });
     expect(result.valid).toBe(true);
+    expect(result.changedFiles).toEqual([]);
   });
 
   it('should return valid when all changed files match touchSet globs', async () => {

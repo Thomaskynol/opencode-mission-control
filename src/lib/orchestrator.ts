@@ -5,10 +5,10 @@ import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validat
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
-import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet, isSameCommit } from './merge-train';
+import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
 import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
-import { protectInputsDuringRun, decideIdentityVerdict, runTestsOnImmutableSnapshot, type FileIdentity } from './candidate-identity';
+import { runTestsOnImmutableSnapshot } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, resolveJobPassword, type Job } from './job-state';
 import { JobMonitor } from './monitor';
@@ -1203,15 +1203,6 @@ export class Orchestrator {
     }
   }
 
-  /** Content snapshots as FileIdentity records for the canonical verdict. */
-  private scopeFileIdentities(contents: Record<string, string>): Record<string, FileIdentity> {
-    const out: Record<string, FileIdentity> = {};
-    for (const [key, value] of Object.entries(contents)) {
-      out[key] = { hash: hashScopeContents({ [key]: value }), mtimeMs: 0, size: value.length, exists: true };
-    }
-    return out;
-  }
-
   private async gatherScopeEvidence(
     job: JobSpec,
     jobHead: string,
@@ -1263,63 +1254,38 @@ export class Orchestrator {
       let contentsA: Record<string, string> = {};
       let testsA: string[] = [];
       if (cmdA) {
-        // §4 TOCTOU A→B→A: the run executes under protected inputs
-        // (snapshot hash before, read-only hardening, re-hash on a short
-        // poll, hash+mtime compare after). A swap that executes and restores
-        // — invisible to HEAD/dirty/content-after — still refuses identity.
-        // Allowlist respected inside: untracked dist/build outputs stay
+        // §4 TOCTOU A→B→A: the run executes on an immutable snapshot
+        // (git archive → tmpdir, cwd=snapshot); the ORIGINAL is attested via
+        // hash+mtime+ctime. A swap that executes and restores — invisible to
+        // HEAD/dirty/content-after and to the old poll — refuses identity
+        // here. Allowlist respected inside: untracked dist/build outputs stay
         // writable, versioned dist stays a protected input.
-        const scopedBefore = await this.readScopeContents(jobCandidate, changedFiles, cmdA).catch(() => null);
         const scopePathsA = await this.collectScopePaths(jobCandidate, changedFiles, cmdA);
         const isTrackedA = await this.buildIsTracked(jobCandidate);
-        let runA: { success: boolean; output: string; timedOut: boolean } | undefined;
-        const protectionA = await protectInputsDuringRun({
-          dir: jobCandidate,
-          scopePaths: scopePathsA,
-          ...(isTrackedA ? { isTracked: isTrackedA } : {}),
-          runFn: async () => {
-            runA = await runTestCommand(jobCandidate, cmdA, timeout);
-          },
-        });
-        const result = runA ?? {
-          success: false,
-          output: `protection refused the run: ${protectionA.reason ?? 'write denied on protected input'}`,
-          timedOut: false,
-        };
-        // Re-observe AFTER the run AND after reading: never stamp the
-        // pre-test head over changed content (§4 Bloqueante B).
+        const snapA = await this.runScopeSnapshot(jobCandidate, scopePathsA, cmdA, timeout, jobHead, isTrackedA);
+        const result = snapA.verdict === 'fail'
+          ? { success: false, output: snapA.output, timedOut: snapA.timedOut }
+          : { success: snapA.success, output: snapA.output, timedOut: snapA.timedOut };
+        // Re-observe AFTER the run: never stamp the pre-test head over changed
+        // content (§4 Bloqueante B). Input mutation during the run is already
+        // covered by the snapshot verdict (hash+mtime+ctime on the original).
         const observedAfter = await this.observeCandidateState(jobCandidate);
         const scoped = await this.readScopeContents(jobCandidate, changedFiles, cmdA);
         contentsA = scoped.contents;
         testsA = scoped.testPaths;
-        // Canonical identity verdict over the executed bytes: content hash
-        // plus transient hits observed DURING the run. testedCommit is never
-        // stamped clean over a transient mutation — it fails here.
-        const canonicalA = scopedBefore
-          ? decideIdentityVerdict(
-              this.scopeFileIdentities(scopedBefore.contents),
-              this.scopeFileIdentities(contentsA),
-              protectionA.transientHits,
-            )
-          : protectionA.verdict === 'fail'
-            ? { verdict: 'fail' as const, reason: protectionA.reason }
-            : { verdict: 'pass' as const };
-        const mutated = scopedBefore
-          ? hasRelevantContentChange(scopedBefore.contents, contentsA)
-          : false;
-        const protectionFail = protectionA.verdict === 'fail' || canonicalA.verdict === 'fail';
+        const snapshotFail = snapA.verdict === 'fail';
         const diverged = observedAfter.head !== observedJob.head;
-        const dirtyAfter = observedAfter.dirty || mutated || diverged || protectionFail;
-        const refusalA = protectionFail
-          ? (protectionA.reason ?? canonicalA.reason ?? 'identity refused: input changed during run')
+        const dirtyAfter = observedAfter.dirty || snapshotFail;
+        const refusalA = snapshotFail
+          ? (snapA.reason ?? 'identity refused: input changed during run')
           : undefined;
         evidenceA = this.toScopeEvidence(
           cmdA,
           result,
           { testedCommit: observedAfter.head ?? jobHead, dirty: dirtyAfter },
-          `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`,
+          `immutable-snapshot:${jobCandidate} (job scope, base ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
           refusalA ?? (dirtyAfter && result.success
-            ? `identity refused: tree changed during test (head ${observedJob.head?.slice(0, 8)}→${observedAfter.head?.slice(0, 8)}, dirty=${observedAfter.dirty}, content-changed=${mutated}) — not attributed to ${jobHead.slice(0, 8)}`
+            ? `identity refused: tree changed during test (head ${observedJob.head?.slice(0, 8)}→${observedAfter.head?.slice(0, 8)}, dirty=${observedAfter.dirty}) — not attributed to ${jobHead.slice(0, 8)}`
             : undefined),
         );
         if (result.success && !dirtyAfter && observedAfter.head === jobHead && observedAfter.head === observedJob.head) {
@@ -1340,46 +1306,33 @@ export class Orchestrator {
       const candidateObserved = await this.observeCandidateState(candidateDir);
       const cmdB = configured ?? await detectTestCommand(candidateDir);
       if (!cmdB) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
-      const scopedBBefore = await this.readScopeContents(candidateDir, changedFiles, cmdB).catch(() => null);
+      // §4: same immutable-snapshot execution as scope 1 — the executed
+      // bytes are the merge-commit bytes (base+job), and the candidate
+      // original is attested via hash+mtime+ctime.
       const scopePathsB = await this.collectScopePaths(candidateDir, changedFiles, cmdB);
       const isTrackedB = await this.buildIsTracked(candidateDir);
-      let runB: { success: boolean; output: string; timedOut: boolean } | undefined;
-      const protectionB = await protectInputsDuringRun({
-        dir: candidateDir,
-        scopePaths: scopePathsB,
-        ...(isTrackedB ? { isTracked: isTrackedB } : {}),
-        runFn: async () => {
-          runB = await runTestCommand(candidateDir, cmdB, timeout);
-        },
-      });
-      const resultB = runB ?? {
-        success: false,
-        output: `protection refused the run: ${protectionB.reason ?? 'write denied on protected input'}`,
-        timedOut: false,
-      };
+      const snapB = await this.runScopeSnapshot(
+        candidateDir,
+        scopePathsB,
+        cmdB,
+        timeout,
+        candidateObserved.head ?? undefined,
+        isTrackedB,
+      );
+      const resultB = snapB.verdict === 'fail'
+        ? { success: false, output: snapB.output, timedOut: snapB.timedOut }
+        : { success: snapB.success, output: snapB.output, timedOut: snapB.timedOut };
       // §4: same re-observation as scope 1 — never stamp the pre-test
       // candidate head over content changed by the test run.
       const candidateAfter = await this.observeCandidateState(candidateDir);
       const scopedB = await this.readScopeContents(candidateDir, changedFiles, cmdB);
       const contentsB = scopedB.contents;
       const testsB = scopedB.testPaths;
-      const canonicalB = scopedBBefore
-        ? decideIdentityVerdict(
-            this.scopeFileIdentities(scopedBBefore.contents),
-            this.scopeFileIdentities(contentsB),
-            protectionB.transientHits,
-          )
-        : protectionB.verdict === 'fail'
-          ? { verdict: 'fail' as const, reason: protectionB.reason }
-          : { verdict: 'pass' as const };
-      const mutatedB = scopedBBefore
-        ? hasRelevantContentChange(scopedBBefore.contents, contentsB)
-        : false;
-      const protectionFailB = protectionB.verdict === 'fail' || canonicalB.verdict === 'fail';
+      const snapshotFailB = snapB.verdict === 'fail';
       const divergedB = candidateAfter.head !== candidateObserved.head;
-      const dirtyAfterB = candidateAfter.dirty || mutatedB || divergedB || protectionFailB;
-      const refusalB = protectionFailB
-        ? (protectionB.reason ?? canonicalB.reason ?? 'identity refused: candidate input changed during run')
+      const dirtyAfterB = candidateAfter.dirty || snapshotFailB;
+      const refusalB = snapshotFailB
+        ? (snapB.reason ?? 'identity refused: candidate input changed during run')
         : undefined;
       const evidenceB = this.toScopeEvidence(
         cmdB,
@@ -1391,9 +1344,9 @@ export class Orchestrator {
           candidateHead: candidateAfter.head ?? undefined,
           dirty: dirtyAfterB,
         },
-        `integration-candidate:${candidateDir} (base ${integrationBranch}@${(baseObserved.head ?? '').slice(0, 8)} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
+        `immutable-snapshot:${candidateDir} (integration candidate, base ${integrationBranch}@${(baseObserved.head ?? '').slice(0, 8)} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
         refusalB ?? (dirtyAfterB && resultB.success
-          ? `identity refused: candidate changed during test (head ${candidateObserved.head?.slice(0, 8)}→${candidateAfter.head?.slice(0, 8)}, dirty=${candidateAfter.dirty}, content-changed=${mutatedB})`
+          ? `identity refused: candidate changed during test (head ${candidateObserved.head?.slice(0, 8)}→${candidateAfter.head?.slice(0, 8)}, dirty=${candidateAfter.dirty})`
           : undefined),
       );
       if (resultB.success && !dirtyAfterB && candidateAfter.head === candidateObserved.head) return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
@@ -4913,6 +4866,50 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
   }
 
   /**
+   * Task-scoped execution on an immutable snapshot: runs the command with
+   * cwd=snapshotDir (materialized from `git archive jobHead`, else a
+   * hash-verified working-tree copy) and refuses attribution when the
+   * ORIGINAL inputs were touched during the run (hash+mtime+ctime). A sync
+   * swap+restore that the old poll missed now fails instead of passing.
+   * Outputs written inside the copy (untracked dist/build/coverage) pass.
+   */
+  private async runScopeSnapshot(
+    dir: string,
+    scopePaths: string[],
+    command: string,
+    timeoutMs: number,
+    jobHead?: string,
+    isTracked?: (rel: string) => boolean,
+  ): Promise<{ success: boolean; output: string; timedOut: boolean; verdict: 'pass' | 'fail'; reason?: string }> {
+    try {
+      const r = await runTestsOnImmutableSnapshot({
+        dir,
+        scopePaths,
+        testCommand: command,
+        timeoutMs,
+        ...(jobHead ? { jobHead } : {}),
+        ...(isTracked ? { isTracked } : {}),
+      });
+      if (r.verdict === 'fail') {
+        return {
+          success: false,
+          output: `${r.reason ?? 'identity refused'}${r.output ? `\n${r.output}` : ''}`.slice(0, 8000),
+          timedOut: r.timedOut,
+          verdict: 'fail',
+          ...(r.reason ? { reason: r.reason } : {}),
+        };
+      }
+      return { success: r.success, output: r.output, timedOut: r.timedOut, verdict: 'pass' };
+    } catch (error) {
+      // Fail-closed on snapshot failure (no silent unprotected rerun): surface
+      // as test failure so the caller pauses instead of merging unverified.
+      const msg = error instanceof Error ? error.message : String(error);
+      const out = `immutable snapshot failed: ${msg}`.slice(0, 2000);
+      return { success: false, output: out, timedOut: false, verdict: 'fail', reason: out };
+    }
+  }
+
+  /**
    * Immutable retest: runs the command in a `git archive` snapshot copy and
    * refuses attribution when the ORIGINAL was touched during the run
    * (hash+mtime+ctime). Identity fail → success=false with the reason in
@@ -4936,24 +4933,8 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         scope = [];
       }
     }
-    try {
-      const r = await runTestsOnImmutableSnapshot({
-        dir,
-        scopePaths: scope,
-        testCommand: command,
-        timeoutMs,
-        ...(jobHead ? { jobHead } : {}),
-      });
-      if (r.verdict === 'fail') {
-        return { success: false, output: `${r.reason ?? 'identity refused'}${r.output ? `\n${r.output}` : ''}`.slice(0, 8000), timedOut: r.timedOut };
-      }
-      return { success: r.success, output: r.output, timedOut: r.timedOut };
-    } catch (error) {
-      // Fail-closed on snapshot failure (no silent unprotected rerun): surface
-      // as test failure so the caller pauses instead of merging unverified.
-      const msg = error instanceof Error ? error.message : String(error);
-      return { success: false, output: `immutable snapshot failed: ${msg}`.slice(0, 2000), timedOut: false };
-    }
+    const r = await this.runScopeSnapshot(dir, scope, command, timeoutMs, jobHead);
+    return { success: r.success, output: r.output, timedOut: r.timedOut };
   }
 
   private validatePlan(spec: PlanSpec): void {

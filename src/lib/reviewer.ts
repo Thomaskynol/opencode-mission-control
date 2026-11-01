@@ -23,6 +23,8 @@
 
 export type ReviewVerdictValue = 'pass' | 'fail';
 
+import { matchesTouchPattern } from './merge-train';
+
 export interface EssentialRequirement {
   id: string;
   description: string;
@@ -161,10 +163,7 @@ export function requirementsFromAcceptance(jobName: string, prompt: string): Ess
 }
 
 function matchesTouchSet(file: string, touchSet: string[]): boolean {
-  return touchSet.some((pattern) => {
-    const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;
-    return new Bun.Glob(normalized).match(file);
-  });
+  return touchSet.some((pattern) => matchesTouchPattern(pattern, file));
 }
 
 /**
@@ -880,7 +879,7 @@ export function assessFunctionalCoverage(
   requirement: EssentialRequirement,
   fileContents: Record<string, string> | undefined,
   testOutput: string,
-  opts?: { testPaths?: string[] },
+  opts?: { testPaths?: string[]; allowBarrelAbstention?: boolean },
 ): FunctionalCoverage {
   const contents = fileContents ?? {};
   const paths = Object.keys(contents);
@@ -954,10 +953,18 @@ export function assessFunctionalCoverage(
   // requirement is itself about the empty case. No vocabulary obligation.
   if (!hasCodeReferences(fullText)) {
     const candidates = extractImplCandidates(implSources);
-    // Barrel abstains: only re-exports, no visible definition in scope even
-    // after chasing. Neutral — the passing executable test + external OpenCode
-    // reviewer decide (never a fail for judging what the heuristic cannot see).
+    // Barrel abstains ONLY when an external decision participates (prod
+    // path): no visible definition in scope even after chasing — neutral,
+    // the passing executable test + external OpenCode reviewer decide.
+    // Without external participation the invisible implementation fails
+    // closed (a bare executable signal never verifies unseen code).
     if (candidates.length === 0 && barrelWithNoVisibleCandidate) {
+      if (opts?.allowBarrelAbstention !== true) {
+        return {
+          covered: false,
+          reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation not visible in scope (barrel re-export with no visible definition after chasing relative re-exports) and no external reviewer decision participates — fail-closed: the heuristic cannot examine what the tests execute`,
+        };
+      }
       return {
         covered: true,
         reason: `requirement "${requirement.id}" exercised via barrel re-export: no visible definition in scope after chasing relative re-exports — heuristic abstains (neutral), executable test passes and external reviewer decides`,
@@ -1034,9 +1041,15 @@ export function assessFunctionalCoverage(
   }
   const defined = findDefinedSymbols(implSources, symbols);
   if (defined.length === 0) {
-    // Same barrel abstention as the NL branch: no visible candidate at all
-    // (not just a missing symbol) + relative re-export syntax → neutral.
+    // Same barrel abstention as the NL branch, gated the same way: only
+    // when an external decision participates; otherwise fail-closed.
     if (barrelWithNoVisibleCandidate) {
+      if (opts?.allowBarrelAbstention !== true) {
+        return {
+          covered: false,
+          reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation not visible in scope (barrel re-export with no visible definition after chasing relative re-exports) and no external reviewer decision participates — fail-closed: the heuristic cannot examine what the tests execute`,
+        };
+      }
       return {
         covered: true,
         reason: `requirement "${requirement.id}" exercised via barrel re-export: no visible definition in scope after chasing relative re-exports — heuristic abstains (neutral), executable test passes and external reviewer decides`,
@@ -1103,7 +1116,14 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
     return fail(base);
   }
 
-  if (input.touchSet && input.touchSet.length > 0) {
+  if (!input.touchSet || input.touchSet.length === 0) {
+    // No allow-all: a non-empty diff (guaranteed past the empty-diff check
+    // above) without a declared scope fails — the job must declare which
+    // files it may touch.
+    reasons.push(
+      'missing touchSet: non-empty diff declares no scope — declare the allowed scope in touchSet (empty touchSet never passes)',
+    );
+  } else {
     const violations = input.changedFiles.filter((f) => !matchesTouchSet(f, input.touchSet!));
     if (violations.length > 0) {
       reasons.push(
@@ -1188,6 +1208,12 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
   for (const req of input.requirements) {
     const assessment = assessFunctionalCoverage(req, input.fileContents, ev.output ?? '', {
       testPaths: input.testPaths,
+      // Barrel abstention (no visible implementation in scope) is neutral
+      // only when an external OpenCode decision participates — the strict
+      // prod composition or an attached external verdict. Otherwise the
+      // local heuristic fails closed instead of passing on a bare signal.
+      allowBarrelAbstention:
+        input.requireExternalSufficiency === true || input.sufficiency?.reviewer === 'opencode',
     });
     if (!assessment.covered) {
       reasons.push(assessment.reason);

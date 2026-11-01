@@ -13,6 +13,7 @@
 import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
+import { matchesTouchPattern } from './merge-train';
 import { gitCommand } from './git';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 
@@ -353,7 +354,7 @@ function normalizeCoherencePath(p: string): string {
     .replace(/^\.\//, '');
 }
 
-/** True when a touchSet entry covers an acceptance file ref (exact or src/-style suffix). */
+/** True when a touchSet entry covers an acceptance file ref (glob parity with merge-train, plus exact/suffix). */
 export function touchSetCovers(touchSet: string[] | undefined, ref: string): boolean {
   const want = normalizeCoherencePath(ref);
   if (!want) return false;
@@ -361,6 +362,9 @@ export function touchSetCovers(touchSet: string[] | undefined, ref: string): boo
     const have = normalizeCoherencePath(entry);
     if (!have) return false;
     if (have === want) return true;
+    // Same glob semantics as merge-train validation (`src/` = `src/**`):
+    // a directory entry covers every nested file.
+    if (matchesTouchPattern(have, want) || matchesTouchPattern(entry, ref)) return true;
     return have.endsWith('/' + want) || want.endsWith('/' + have);
   });
 }

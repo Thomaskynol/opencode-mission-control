@@ -34,9 +34,9 @@ import { isAbsolute, join } from 'path';
  * it via absolute path or `..` is DETECTED (fail), not prevented; system
  * clock tampering is out of scope.
  *
- * Integrator plug (orchestrator.ts gatherScopeEvidence): wrap the
- * runTestCommand call as runFn —
- *   const r = await protectInputsDuringRun({ dir, scopePaths, runFn: () => runTestCommand(dir, cmd, timeout) });
+ * Integrator plug (orchestrator.ts runScopeSnapshot → gatherScopeEvidence):
+ * run the test command via runTestsOnImmutableSnapshot —
+ *   const r = await runTestsOnImmutableSnapshot({ dir, scopePaths, testCommand: cmd, timeoutMs, jobHead });
  *   if (r.verdict === 'fail') → identity refused, never attribute to jobHead.
  * `decideIdentityVerdict` is the pure core for reuse once before/after
  * snapshots are captured by other means.

@@ -201,6 +201,17 @@ describe('reviewJob', () => {
     expect(reviewJob(baseInput({ changedFiles: [] })).verdict).toBe('fail');
   });
 
+  it('fails a non-empty diff without a declared scope (empty touchSet is not allow-all)', () => {
+    for (const missing of [{ touchSet: [] as string[] }, { touchSet: undefined as unknown as string[] }]) {
+      const input = baseInput(missing);
+      if (missing.touchSet === undefined) delete (input as Partial<ReviewInput>).touchSet;
+      const verdict = reviewJob(input);
+      expect(verdict.verdict).toBe('fail');
+      expect(verdict.blocking).toBe(true);
+      expect(verdict.reasons.join('\n')).toMatch(/touchSet|scope/i);
+    }
+  });
+
   it('rejects test changes without a record, accepts documented ones', () => {
     const undocumented = reviewJob(
       baseInput({ testChange: { changedTestFiles: ['tests/auth.test.ts'] } }),
@@ -249,6 +260,7 @@ function sondaInput(fileContents: Record<string, string>, output: string): Revie
     baseHead: 'base-1',
     jobHead: 'job-1',
     changedFiles: ['total.mjs', 'total.test.mjs'],
+    touchSet: ['total.mjs', 'total.test.mjs'],
     requirements: [{ id: 'REQ-total', description: 'total([1,2])===3', testAnchors: ['total([1,2])===3'] }],
     fileContents,
     evidence: {
@@ -336,6 +348,7 @@ describe('R01 §3 regressions (bound assertion + NL behavioral)', () => {
       baseHead: 'base-1',
       jobHead: 'job-1',
       changedFiles: ['total.mjs', 'total.test.mjs'],
+      touchSet: ['total.mjs', 'total.test.mjs'],
       requirements: [
         { id: 'REQ-empty', description: 'Return zero for an empty collection', testAnchors: ['Return zero for an empty collection'] },
       ],

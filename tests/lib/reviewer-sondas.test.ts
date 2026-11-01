@@ -15,6 +15,7 @@ function sondaInput(fileContents: Record<string, string>, output: string, descri
     baseHead: 'base-1',
     jobHead: 'job-1',
     changedFiles: ['total.mjs', 'total.test.mjs'],
+    touchSet: ['total.mjs', 'total.test.mjs'],
     requirements: [{ id: 'REQ-total', description, testAnchors: [description] }],
     fileContents,
     evidence: {
@@ -123,6 +124,7 @@ describe('demo-r5: âncora-arquivo como dica de escopo (revisão 9f47d5f)', () =
       baseHead: 'base-1',
       jobHead: 'job-1',
       changedFiles: ['total.mjs', 'total.test.mjs'],
+      touchSet: ['total.mjs', 'total.test.mjs'],
       requirements: [
         { id: 'REQ-total', description: 'total([1,2])===3 covered in total.test.mjs', testAnchors: anchors },
       ],

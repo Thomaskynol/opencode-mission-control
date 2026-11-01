@@ -3,6 +3,7 @@ import {
   parsePlannerOutput,
   validateTaskCoherence,
   assertPlanCoherence,
+  touchSetCovers,
   type AutoPlanDraft,
 } from '../../src/lib/auto-plan';
 import { validateModelDispatch } from '../../src/lib/coordinator';
@@ -231,5 +232,21 @@ describe('touchset coherence (RED: acceptance x touchSet before dispatch)', () =
     expect(() => assertPlanCoherence(narrow, { testCommand: 'bun test sum.test.js' })).toThrow(
       /sum\.test\.js/,
     );
+  });
+});
+
+describe('touchSetCovers glob parity with merge-train (directory entry covers nested files)', () => {
+  it('touchSet ["src/"] covers src/slugify.js (trailing-slash glob, same as validateTouchSet)', () => {
+    expect(touchSetCovers(['src/'], 'src/slugify.js')).toBe(true);
+  });
+
+  it('a valid plan declaring a directory is not blocked', () => {
+    expect(() =>
+      validateTaskCoherence({
+        name: 'slugify',
+        acceptance: ['bun test src/slugify.js passes'],
+        touchSet: ['src/'],
+      }),
+    ).not.toThrow();
   });
 });

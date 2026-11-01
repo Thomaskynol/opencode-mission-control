@@ -64,16 +64,22 @@ const INSTALL_COMMAND_BY_LOCKFILE = [
 
 
 
+/**
+ * Single touchSet pattern matcher shared by merge-train validation,
+ * reviewer scope checks and auto-plan coherence: trailing slash means
+ * "this directory and everything inside it" (`src/` = `src/**`).
+ */
+export function matchesTouchPattern(pattern: string, file: string): boolean {
+  const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;
+  return new Bun.Glob(normalized).match(file);
+}
+
 export async function validateTouchSet(
   jobBranch: string,
   baseBranch: string,
   touchSet: string[],
   opts?: { cwd?: string },
 ): Promise<{ valid: boolean; violations?: string[]; changedFiles?: string[] }> {
-  if (touchSet.length === 0) {
-    return { valid: true };
-  }
-
   const diffResult = await gitCommand(['diff', '--name-only', `${baseBranch}...${jobBranch}`], opts);
   if (diffResult.exitCode !== 0) {
     return { valid: false, violations: [`Failed to diff: ${diffResult.stderr}`] };
@@ -84,14 +90,21 @@ export async function validateTouchSet(
     return { valid: true, changedFiles: [] };
   }
 
+  // No allow-all: a non-empty diff without a declared scope is a violation
+  // (the job must declare which files it may touch).
+  if (touchSet.length === 0) {
+    return {
+      valid: false,
+      violations: [
+        `touchSet declares no scope but the diff touches ${changedFiles.length} file(s): ${changedFiles.join(', ')} — declare the allowed scope in touchSet`,
+      ],
+      changedFiles,
+    };
+  }
+
   const violations: string[] = [];
   for (const file of changedFiles) {
-    const matchesAny = touchSet.some(pattern => {
-      // Trailing slash means "this directory and everything inside it"
-      const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;
-      const glob = new Bun.Glob(normalized);
-      return glob.match(file);
-    });
+    const matchesAny = touchSet.some((pattern) => matchesTouchPattern(pattern, file));
     if (!matchesAny) {
       violations.push(file);
     }
@@ -214,9 +227,10 @@ export async function detectInstallCommand(worktreePath: string): Promise<string
 /**
  * Execute a test command in a worktree directory.
  *
- * Scope protection lives in the orchestrator (gatherScopeEvidence wraps this
- * call with protectInputsDuringRun: snapshot hash before, read-only
- * hardening, re-hash during/after, hash+mtime verdict). This function stays
+ * Scope protection lives in the orchestrator (gatherScopeEvidence runs the
+ * command on an immutable snapshot via runTestsOnImmutableSnapshot:
+ * git archive → tmpdir, cwd=snapshot, original attested hash+mtime+ctime).
+ * This function stays
  * raw on purpose so legitimate builds keep working: untracked dist/build
  * outputs, coverage/tmp/logs are writable outputs, never blocked here —
  * versioned dist modifications are refused upstream as identity failures.

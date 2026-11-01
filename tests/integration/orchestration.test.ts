@@ -312,6 +312,9 @@ function installLaunchJobStub(orchestrator: Orchestrator): void {
 }
 
 describe('orchestration integration', () => {
+  // Fail-closed review requires every job to declare its scope: fixtures
+  // carry explicit touchSets (as autonomous plans always emit). Omitting
+  // touchSet is a review failure by contract, not a gap in these fixtures.
   beforeEach(async () => {
     originalCwd = process.cwd();
     const repo = await createTestRepo();
@@ -374,6 +377,7 @@ describe('orchestration integration', () => {
           prompt: 'Update README details',
           status: 'queued',
           branch: 'mc/update-readme',
+          touchSet: ['README.md'],
         },
         {
           id: 'job-b',
@@ -381,6 +385,7 @@ describe('orchestration integration', () => {
           prompt: 'Fix bug in src/index.ts',
           status: 'queued',
           branch: 'mc/fix-index-bug',
+          touchSet: ['src/index.ts'],
         },
         {
           id: 'job-c',
@@ -389,6 +394,7 @@ describe('orchestration integration', () => {
           status: 'queued',
           dependsOn: ['Fix bug in index.ts'],
           branch: 'mc/add-feature',
+          touchSet: ['src/feature.ts'],
         },
       ],
       'Full orchestration plan',
@@ -467,6 +473,7 @@ describe('orchestration integration', () => {
           prompt: 'Update README first way',
           status: 'queued',
           branch: 'mc/conflict-one',
+          touchSet: ['README.md'],
         },
         {
           id: 'job-2',
@@ -474,6 +481,7 @@ describe('orchestration integration', () => {
           prompt: 'Update README second way',
           status: 'queued',
           branch: 'mc/conflict-two',
+          touchSet: ['README.md'],
         },
       ],
       'Conflict plan',
@@ -540,6 +548,7 @@ describe('orchestration integration', () => {
           prompt: 'Complete resume A',
           status: 'queued',
           branch: 'mc/resume-a',
+          touchSet: ['README.md'],
         },
         {
           id: 'job-b',
@@ -547,6 +556,7 @@ describe('orchestration integration', () => {
           prompt: 'Complete resume B',
           status: 'queued',
           branch: 'mc/resume-b',
+          touchSet: ['src/resume-b.ts'],
         },
         {
           id: 'job-c',
@@ -554,6 +564,7 @@ describe('orchestration integration', () => {
           prompt: 'Complete resume C',
           status: 'queued',
           branch: 'mc/resume-c',
+          touchSet: ['src/resume-c.ts'],
         },
       ],
       'Resume plan',
@@ -622,6 +633,7 @@ describe('orchestration integration', () => {
           prompt: 'Run A',
           status: 'queued',
           branch: 'mc/dep-a',
+          touchSet: ['src/dep-a.ts'],
         },
         {
           id: 'job-b',
@@ -630,6 +642,7 @@ describe('orchestration integration', () => {
           status: 'queued',
           dependsOn: ['Independent A'],
           branch: 'mc/dep-b',
+          touchSet: ['src/dep-b.ts'],
         },
         {
           id: 'job-c',
@@ -637,6 +650,7 @@ describe('orchestration integration', () => {
           prompt: 'Run C',
           status: 'queued',
           branch: 'mc/dep-c',
+          touchSet: ['src/dep-c.ts'],
         },
       ],
       'Dependency plan',

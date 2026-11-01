@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { join } from 'path';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { EventEmitter } from 'events';
 import type { JobSpec, PlanSpec } from '../../src/lib/plan-types';
 import { Orchestrator } from '../../src/lib/orchestrator';
 import * as planStateMod from '../../src/lib/plan-state';
-import * as mergeTrainMod from '../../src/lib/merge-train';
 import * as tmuxMod from '../../src/lib/tmux';
 import * as sdkClientMod from '../../src/lib/sdk-client';
 
@@ -52,6 +51,15 @@ describe('toctou kill launcher integration', () => {
     await mustExec(['git', 'config', 'user.name', 'T'], repoDir);
     writeFileSync(join(repoDir, 'total.mjs'), 'export function total(xs){ return 0; }\n');
     writeFileSync(join(repoDir, 'check.mjs'), 'import { total } from "./total.mjs"; if (total([1,2])!==3) { console.error("wrong"); process.exit(1);} console.log("ok");\n');
+    // Committed attacker: persistently mutates the ORIGINAL total.mjs from
+    // inside the test run, then exits non-zero. The immutable snapshot
+    // executes committed bytes and refuses identity via hash+mtime+ctime on
+    // the original (the old poll ran in the original dir and could miss a
+    // sync swap+restore; the snapshot cannot be fooled by restore).
+    writeFileSync(
+      join(repoDir, 'mutate.mjs'),
+      'import { writeFileSync } from "fs";\nimport { join } from "path";\nwriteFileSync(join(process.argv[2], "total.mjs"), "export function total(xs){ return 3; }\\n");\nconsole.error("mutated");\nprocess.exit(1);\n',
+    );
     writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }));
     await mustExec(['git', 'add', '.'], repoDir);
     await mustExec(['git', 'commit', '-m', 'init'], repoDir);
@@ -65,25 +73,11 @@ describe('toctou kill launcher integration', () => {
       idleThreshold: 300000,
       worktreeBasePath: '/tmp',
       omo: { enabled: false, defaultMode: 'vanilla' },
-      testCommand: 'node check.mjs',
+      testCommand: `node mutate.mjs "${repoDir}"`,
     } as any);
     (orch as any).setRepoRoot(repoDir);
 
     const job = makeJob('total', { branch: 'main', worktreePath: repoDir, status: 'completed' as const });
-    let calls = 0;
-    spyOn(mergeTrainMod, 'runTestCommand').mockImplementation(async (dir: string, _cmd: string, _t: number) => {
-      calls += 1;
-      if (calls === 1) {
-        // Adaptive attacker: scope inputs are hardened read-only during the
-        // run (protectInputsDuringRun), so re-enable writes first — the same
-        // pattern as candidate-identity's A→B→A test. Detection (transient
-        // hit + identity refusal, never a clean pass) is what matters here.
-        try { chmodSync(join(dir, 'total.mjs'), 0o644); } catch {}
-        writeFileSync(join(dir, 'total.mjs'), 'export function total(xs){ return 3; }\n');
-        return { success: true, output: 'ok', timedOut: false };
-      }
-      return { success: false, output: 'wrong', timedOut: false };
-    });
 
     const gathered: any = await (orch as any).gatherScopeEvidence(job, jobHead, 'integration', ['total.mjs']);
     expect(gathered).not.toBeNull();

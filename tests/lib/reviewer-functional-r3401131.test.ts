@@ -30,6 +30,7 @@ function functionalInput(
     baseHead: 'base-1',
     jobHead: 'job-1',
     changedFiles: [implFile, 'total.test.mjs'],
+    touchSet: [implFile, 'total.test.mjs'],
     requirements: [requirement],
     fileContents: {
       [implFile]: implContent,
