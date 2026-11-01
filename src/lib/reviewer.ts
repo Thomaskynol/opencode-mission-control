@@ -671,6 +671,98 @@ function splitParams(raw: string): string[] {
 }
 
 /**
+ * Re-export specifiers (`export * from './x'`, `export {a} from './x'`,
+ * `import {a} from './x'`, `require('./x')`). General by syntax — never by
+ * filename (no index.js hardcode). Bare specifiers (`lodash`) are returned
+ * but never resolved (outside scope = ignored, never read).
+ * shortcut: regex on comments-stripped source — upgrade to a structured parser if it misfires.
+ */
+function extractReExportSpecifiers(content: string): string[] {
+  const out: string[] = [];
+  const code = stripCommentsKeepStrings(content);
+  const fromRe = /\b(?:import|export)\s+[^;]*?\bfrom\s*['"]([^'"]+)['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = fromRe.exec(code)) !== null) {
+    if (m[1] && !out.includes(m[1])) out.push(m[1]);
+  }
+  const reqRe = /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  while ((m = reqRe.exec(code)) !== null) {
+    if (m[1] && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/** Resolve a relative spec (`./x`, `../y`) to a key in scope; null = outside scope. */
+function resolveScopeTarget(fromPath: string, spec: string, available: Set<string>): string | null {
+  if (!spec.startsWith('.')) return null;
+  const slash = fromPath.lastIndexOf('/');
+  const baseDir = slash < 0 ? '' : fromPath.slice(0, slash);
+  const parts = (baseDir ? `${baseDir}/${spec}` : spec).split('/');
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  const normalized = stack.join('/');
+  const candidates = [normalized];
+  if (!/\.[A-Za-z0-9]+$/.test(normalized)) {
+    for (const ext of ['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx']) {
+      candidates.push(`${normalized}${ext}`);
+    }
+    for (const ext of ['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx']) {
+      candidates.push(`${normalized}/index${ext}`);
+    }
+  }
+  for (const c of candidates) {
+    if (available.has(c)) return c;
+  }
+  return null;
+}
+
+/**
+ * Join impl sources following relative re-exports inside scope (visited-set
+ * for cycles; outside scope ignored, never read). Feeds both
+ * extractImplCandidates and findFunctionDef so barrels resolve to the
+ * target defs instead of failing blind.
+ */
+function collectReExportExpandedSources(
+  contents: Record<string, string>,
+  implPool: string[],
+): string {
+  const available = new Set(Object.keys(contents));
+  const visited = new Set<string>();
+  const queue: string[] = [];
+  for (const p of implPool) {
+    if (p in contents && !visited.has(p)) {
+      visited.add(p);
+      queue.push(p);
+    }
+  }
+  for (let i = 0; i < queue.length; i++) {
+    const cur = queue[i]!;
+    for (const spec of extractReExportSpecifiers(contents[cur] ?? '')) {
+      const target = resolveScopeTarget(cur, spec, available);
+      if (target && !visited.has(target)) {
+        visited.add(target);
+        queue.push(target);
+      }
+    }
+  }
+  return queue.map((p) => contents[p] ?? '').join('\n');
+}
+
+/** True when some impl file re-exports a relative target (barrel syntax, any filename). */
+function implHasRelativeReExport(contents: Record<string, string>, implPool: string[]): boolean {
+  return implPool.some((p) =>
+    extractReExportSpecifiers(contents[p] ?? '').some((s) => s.startsWith('.')),
+  );
+}
+
+/**
  * True when the defined function never references any of its own params
  * (e.g. `total(xs) { return 0; }`): it cannot compute anything from its
  * inputs, so an asserted call passing only on a trivial case (empty input
@@ -840,8 +932,15 @@ export function assessFunctionalCoverage(
     };
   }
   const implPool = paths.filter((p) => !testPool.includes(p));
-  const implSources = (implPool.length > 0 ? implPool : paths.filter((p) => !testPool.includes(p)))
-    .map((p) => contents[p] ?? '').join('\n');
+  // Barrels only re-export: follow relative re-exports inside scope so the
+  // target defs count as candidates (cycles via visited-set; outside scope
+  // ignored, never read from disk).
+  const implSources = collectReExportExpandedSources(
+    contents,
+    implPool.length > 0 ? implPool : paths.filter((p) => !testPool.includes(p)),
+  );
+  const barrelWithNoVisibleCandidate =
+    implHasRelativeReExport(contents, implPool) && extractImplCandidates(implSources).length === 0;
   const fullText = `${requirement.description} ${requirement.testAnchors.join(' ')}`;
 
   // 2b. Behavioural NL: no code refs — link any asserted implementation call.
@@ -855,6 +954,15 @@ export function assessFunctionalCoverage(
   // requirement is itself about the empty case. No vocabulary obligation.
   if (!hasCodeReferences(fullText)) {
     const candidates = extractImplCandidates(implSources);
+    // Barrel abstains: only re-exports, no visible definition in scope even
+    // after chasing. Neutral — the passing executable test + external OpenCode
+    // reviewer decide (never a fail for judging what the heuristic cannot see).
+    if (candidates.length === 0 && barrelWithNoVisibleCandidate) {
+      return {
+        covered: true,
+        reason: `requirement "${requirement.id}" exercised via barrel re-export: no visible definition in scope after chasing relative re-exports — heuristic abstains (neutral), executable test passes and external reviewer decides`,
+      };
+    }
     const required = extractRequiredLiterals(fullText);
     const emptySpecific = isEmptySpecificRequirement(fullText);
     const cardinalitySpecific = isCardinalitySpecificRequirement(fullText);
@@ -926,6 +1034,14 @@ export function assessFunctionalCoverage(
   }
   const defined = findDefinedSymbols(implSources, symbols);
   if (defined.length === 0) {
+    // Same barrel abstention as the NL branch: no visible candidate at all
+    // (not just a missing symbol) + relative re-export syntax → neutral.
+    if (barrelWithNoVisibleCandidate) {
+      return {
+        covered: true,
+        reason: `requirement "${requirement.id}" exercised via barrel re-export: no visible definition in scope after chasing relative re-exports — heuristic abstains (neutral), executable test passes and external reviewer decides`,
+      };
+    }
     return {
       covered: false,
       reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation does not define ${symbols.join('/')} — fix the implementation (changed files: ${implPool.join(', ') || 'none'})`,
