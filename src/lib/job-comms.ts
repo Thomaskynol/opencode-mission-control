@@ -1,6 +1,7 @@
 import type { JobSpec } from './plan-types';
 import { v2Prompt, v2WaitForServer } from './sdk-client';
 import { loadConfig } from './config';
+import { resolveJobPassword } from './job-state';
 
 export interface RelayContext {
   finding: string;
@@ -103,9 +104,15 @@ export class JobComms {
 
     try {
       const config = await loadConfig();
+      const password = resolveJobPassword(job, config.serverPassword);
+      if (!password) {
+        // Fail-closed: serve always requires auth; without a credential it
+        // answers 401. Keep the messages queued instead of polling blind.
+        return 0;
+      }
       const client = await v2WaitForServer(job.port, {
         timeoutMs: 5000,
-        password: config.serverPassword,
+        password,
       });
 
       for (const message of filtered) {

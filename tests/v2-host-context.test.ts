@@ -145,6 +145,8 @@ describe('v2 representative operation depending on host session (R06)', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
+        // TUI intent: this test probes launchSessionID persistence, not routing.
+        useServeMode: false,
         omo: { enabled: false, defaultMode: 'vanilla' },
       } as never);
       vi.spyOn(promptFile, 'writePromptFile').mockResolvedValue(join(probeDir, '.mc-prompt.txt'));

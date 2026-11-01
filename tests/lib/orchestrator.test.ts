@@ -13,6 +13,7 @@ import * as promptFileMod from '../../src/lib/prompt-file';
 import * as reportsMod from '../../src/lib/reports';
 import * as modelTrackerMod from '../../src/lib/model-tracker';
 import * as sdkClientMod from '../../src/lib/sdk-client';
+import * as portAllocMod from '../../src/lib/port-allocator';
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -118,6 +119,21 @@ describe('orchestrator', () => {
     spyOn(tmuxMod, 'setPaneDiedHook').mockResolvedValue();
 
     spyOn(mergeTrainMod, 'checkMergeability').mockResolvedValue({ canMerge: true });
+    // Default-serve (sonda §5): unit fakes mock the serve helpers; TUI-only
+    // suites opt out explicitly with useServeMode:false.
+    spyOn(planStateMod, 'claimJobForDispatch').mockResolvedValue({ ok: true, status: 'running' } as never);
+    spyOn(portAllocMod, 'allocatePort').mockResolvedValue(14101);
+    spyOn(portAllocMod, 'releasePort').mockResolvedValue();
+    spyOn(promptFileMod, 'writeServeLauncherScript').mockResolvedValue('/tmp/wt/job-a/.mc-launch.sh');
+    spyOn(promptFileMod, 'cleanupLauncherScript').mockImplementation(() => {});
+    spyOn(sdkClientMod, 'v2WaitForServer').mockImplementation(async () => ({ baseUrl: 'http://127.0.0.1:14101/api', headers: {} }));
+    spyOn(sdkClientMod, 'launchWorkerViaServe').mockImplementation(async (_c: unknown, input: never) => ({
+      sessionId: 'ses-1',
+      tmuxTarget: (input as { tmuxTarget?: string }).tmuxTarget,
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+    } as never));
+    spyOn(sdkClientMod, 'v2RunCommand').mockResolvedValue({});
   });
 
   afterEach(() => {
@@ -535,6 +551,21 @@ describe('orchestrator', () => {
     });
 
     spyOn(mergeTrainMod, 'checkMergeability').mockResolvedValue({ canMerge: true });
+    // Default-serve (sonda §5): unit fakes mock the serve helpers; TUI-only
+    // suites opt out explicitly with useServeMode:false.
+    spyOn(planStateMod, 'claimJobForDispatch').mockResolvedValue({ ok: true, status: 'running' } as never);
+    spyOn(portAllocMod, 'allocatePort').mockResolvedValue(14101);
+    spyOn(portAllocMod, 'releasePort').mockResolvedValue();
+    spyOn(promptFileMod, 'writeServeLauncherScript').mockResolvedValue('/tmp/wt/job-a/.mc-launch.sh');
+    spyOn(promptFileMod, 'cleanupLauncherScript').mockImplementation(() => {});
+    spyOn(sdkClientMod, 'v2WaitForServer').mockImplementation(async () => ({ baseUrl: 'http://127.0.0.1:14101/api', headers: {} }));
+    spyOn(sdkClientMod, 'launchWorkerViaServe').mockImplementation(async (_c: unknown, input: never) => ({
+      sessionId: 'ses-1',
+      tmuxTarget: (input as { tmuxTarget?: string }).tmuxTarget,
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+    } as never));
+    spyOn(sdkClientMod, 'v2RunCommand').mockResolvedValue({});
 
     const fakeTrain = {
       queue: [] as JobSpec[],
@@ -1030,6 +1061,21 @@ describe('orchestrator reconcile pending (dirty re-reconcile)', () => {
     spyOn(tmuxMod, 'setPaneDiedHook').mockResolvedValue();
 
     spyOn(mergeTrainMod, 'checkMergeability').mockResolvedValue({ canMerge: true });
+    // Default-serve (sonda §5): unit fakes mock the serve helpers; TUI-only
+    // suites opt out explicitly with useServeMode:false.
+    spyOn(planStateMod, 'claimJobForDispatch').mockResolvedValue({ ok: true, status: 'running' } as never);
+    spyOn(portAllocMod, 'allocatePort').mockResolvedValue(14101);
+    spyOn(portAllocMod, 'releasePort').mockResolvedValue();
+    spyOn(promptFileMod, 'writeServeLauncherScript').mockResolvedValue('/tmp/wt/job-a/.mc-launch.sh');
+    spyOn(promptFileMod, 'cleanupLauncherScript').mockImplementation(() => {});
+    spyOn(sdkClientMod, 'v2WaitForServer').mockImplementation(async () => ({ baseUrl: 'http://127.0.0.1:14101/api', headers: {} }));
+    spyOn(sdkClientMod, 'launchWorkerViaServe').mockImplementation(async (_c: unknown, input: never) => ({
+      sessionId: 'ses-1',
+      tmuxTarget: (input as { tmuxTarget?: string }).tmuxTarget,
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+    } as never));
+    spyOn(sdkClientMod, 'v2RunCommand').mockResolvedValue({});
   });
 
   afterEach(() => {
@@ -1227,6 +1273,21 @@ describe('plan-scoped branch naming', () => {
     spyOn(tmuxMod, 'setPaneDiedHook').mockResolvedValue();
 
     spyOn(mergeTrainMod, 'checkMergeability').mockResolvedValue({ canMerge: true });
+    // Default-serve (sonda §5): unit fakes mock the serve helpers; TUI-only
+    // suites opt out explicitly with useServeMode:false.
+    spyOn(planStateMod, 'claimJobForDispatch').mockResolvedValue({ ok: true, status: 'running' } as never);
+    spyOn(portAllocMod, 'allocatePort').mockResolvedValue(14101);
+    spyOn(portAllocMod, 'releasePort').mockResolvedValue();
+    spyOn(promptFileMod, 'writeServeLauncherScript').mockResolvedValue('/tmp/wt/job-a/.mc-launch.sh');
+    spyOn(promptFileMod, 'cleanupLauncherScript').mockImplementation(() => {});
+    spyOn(sdkClientMod, 'v2WaitForServer').mockImplementation(async () => ({ baseUrl: 'http://127.0.0.1:14101/api', headers: {} }));
+    spyOn(sdkClientMod, 'launchWorkerViaServe').mockImplementation(async (_c: unknown, input: never) => ({
+      sessionId: 'ses-1',
+      tmuxTarget: (input as { tmuxTarget?: string }).tmuxTarget,
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+    } as never));
+    spyOn(sdkClientMod, 'v2RunCommand').mockResolvedValue({});
 
     spyOn(promptFileMod, 'writePromptFile').mockResolvedValue('/tmp/wt/job-a/.mc-prompt');
     spyOn(promptFileMod, 'cleanupPromptFile').mockImplementation(() => {});
@@ -1313,7 +1374,7 @@ describe('plan-scoped branch naming', () => {
     );
   });
 
-  it('tmux session name stays based on job name, not branch', async () => {
+  it('tmux session name stays based on job name, not branch (deterministic execTag)', async () => {
     planState = makePlan({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       status: 'running',
@@ -1330,9 +1391,11 @@ describe('plan-scoped branch naming', () => {
 
     await (orchestrator as any).reconcile();
 
+    // Deterministic per-execution identity (sonda 15): session carries the
+    // job name plus the execTag, never the bare name that collides.
     expect(tmuxMod.createSession).toHaveBeenCalledWith(
       expect.objectContaining({
-        name: 'mc-api-endpoints',
+        name: expect.stringMatching(/^mc-api-endpoints-a1b2c3d4-/),
       }),
     );
   });
@@ -1421,6 +1484,21 @@ describe('orchestrator dynamic replanning', () => {
     spyOn(tmuxMod, 'setPaneDiedHook').mockResolvedValue();
 
     spyOn(mergeTrainMod, 'checkMergeability').mockResolvedValue({ canMerge: true });
+    // Default-serve (sonda §5): unit fakes mock the serve helpers; TUI-only
+    // suites opt out explicitly with useServeMode:false.
+    spyOn(planStateMod, 'claimJobForDispatch').mockResolvedValue({ ok: true, status: 'running' } as never);
+    spyOn(portAllocMod, 'allocatePort').mockResolvedValue(14101);
+    spyOn(portAllocMod, 'releasePort').mockResolvedValue();
+    spyOn(promptFileMod, 'writeServeLauncherScript').mockResolvedValue('/tmp/wt/job-a/.mc-launch.sh');
+    spyOn(promptFileMod, 'cleanupLauncherScript').mockImplementation(() => {});
+    spyOn(sdkClientMod, 'v2WaitForServer').mockImplementation(async () => ({ baseUrl: 'http://127.0.0.1:14101/api', headers: {} }));
+    spyOn(sdkClientMod, 'launchWorkerViaServe').mockImplementation(async (_c: unknown, input: never) => ({
+      sessionId: 'ses-1',
+      tmuxTarget: (input as { tmuxTarget?: string }).tmuxTarget,
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' },
+    } as never));
+    spyOn(sdkClientMod, 'v2RunCommand').mockResolvedValue({});
 
     spyOn(promptFileMod, 'writePromptFile').mockResolvedValue('/tmp/wt/job-a/.mc-prompt');
     spyOn(promptFileMod, 'cleanupPromptFile').mockImplementation(() => {});
@@ -1581,7 +1659,7 @@ describe('orchestrator dynamic replanning', () => {
       planState = makePlan({
         status: 'running',
         mode: 'autopilot',
-        jobs: [makeJob('source-job', { status: 'running', port: 14100, remoteSessionID: 'src-remote' })],
+        jobs: [makeJob('source-job', { status: 'running', port: 14100, remoteSessionID: 'src-remote', serverPassword: 'src-pw' })],
       });
 
       const orchestrator = new Orchestrator(monitor as any, makeConfig() as any);
@@ -1594,7 +1672,12 @@ describe('orchestrator dynamic replanning', () => {
       );
 
       expect(sdkClientMod.v2ForkSession).toHaveBeenCalledWith(
-        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        expect.objectContaining({
+          baseUrl: 'http://127.0.0.1:14100/api',
+          headers: expect.objectContaining({
+            Authorization: 'Basic ' + Buffer.from('opencode:src-pw').toString('base64'),
+          }),
+        }),
         'src-remote',
       );
       expect(promptSpy).toHaveBeenCalledWith(

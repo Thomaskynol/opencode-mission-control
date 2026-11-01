@@ -64,6 +64,12 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     spyOn(planStateMod, 'savePlan').mockImplementation(async (p: PlanSpec) => {
       planState = clone(p);
     });
+    // The conductor lease verifies against the real plan file (internal
+    // loadPlan bypasses the in-memory mock above), so seed a real copy with
+    // the same id — status may go stale, id never does.
+    try {
+      fs.writeFileSync(join(testStateDir, 'plan.json'), JSON.stringify(planState));
+    } catch {}
   });
 
   afterEach(() => {
@@ -87,7 +93,9 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     }
   });
 
-  /** Real detached child as conductor stand-in: alive and verifiable via pid (no tmux). */
+  /** Real detached child as conductor stand-in: alive and verifiable via pid (no tmux).
+   * Simulates the real driver proving assumption: it claims the plan lease
+   * itself (pid-alive alone never counts), so the handoff can re-read it. */
   async function spawnRealHolder(intakeId: string): Promise<{ pid: number; command: string }> {
     const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
     try {
@@ -98,6 +106,11 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
       throw new Error('test holder did not start');
     }
     liveChildren.push(pid);
+    const { loadPlan, claimConductorLease } = await import('../../src/lib/plan-state');
+    const plan = await loadPlan().catch(() => null);
+    if (plan) {
+      await claimConductorLease(plan.id, pid, `resume --intake ${intakeId}`, `test-driver:${pid}`);
+    }
     return { pid, command: `resume --intake ${intakeId}` };
   }
 
@@ -235,7 +248,10 @@ describe('approve handoff (R04: verifiable conductor, no false live claim)', () 
     const err = await dispatchCommand(
       `approve --intake ${id} --retry task-a`,
       fakeControls(),
-      { verifyWorkers: async () => ({ live: 0, total: 0 }) },
+      {
+        verifyWorkers: async () => ({ live: 0, total: 0 }),
+        spawnConductor: (intakeId) => spawnRealHolder(intakeId),
+      },
     ).catch((e: unknown) => e as Error);
 
     expect(err).toBeInstanceOf(Error);

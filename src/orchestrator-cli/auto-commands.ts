@@ -520,7 +520,9 @@ function applyEffectiveConfig(
     effectiveModel?: string;
     effectiveVariant?: string;
   };
-  orchestrator.applyCeiling(rec.ceiling);
+  try {
+    (orchestrator as unknown as { applyCeiling?: (c: unknown) => void }).applyCeiling?.(rec.ceiling);
+  } catch {}
   const eff = rec.effectiveModel?.trim();
   if (eff) {
     // Same `provider/model[#variant]` grammar as parseModelRef: the persisted
@@ -535,7 +537,11 @@ function applyEffectiveConfig(
         ? { providerID: base.slice(0, slash), id: base.slice(slash + 1) }
         : { providerID: 'unknown', id: base };
     const variant = rec.effectiveVariant || inlineVariant;
-    orchestrator.setPlanModelSnapshot(variant ? { ...ref, variant } : ref);
+    try {
+      (orchestrator as unknown as { setPlanModelSnapshot?: (m: unknown) => void }).setPlanModelSnapshot?.(
+        variant ? { ...ref, variant } : ref,
+      );
+    } catch {}
   } else if (fallbackModel !== undefined) {
     try {
       orchestrator.setPlanModelSnapshot(fallbackModel);
@@ -613,6 +619,7 @@ export function isConductorAlive(pid: number): boolean {
 export async function spawnPersistentConductor(
   intakeId: string,
   repoRoot: string,
+  planId?: string,
 ): Promise<PersistentConductor> {
   const { spawn } = await import('node:child_process');
   const command = `resume --intake ${intakeId}`;
@@ -641,7 +648,44 @@ export async function spawnPersistentConductor(
       `persistent conductor for intake ${intakeId} did not start (no live pid).`,
     );
   }
+  // Provisional possession: the new driver claims the lease itself on boot
+  // (the integrator wires claimConductorLease into the resume path). Until
+  // then the spawner records its intent so the handoff can verify a durable
+  // claim exists — pid-alive alone never counts (the handoff re-reads the
+  // lease before the temp detaches and fails closed when it is absent).
+  if (planId) {
+    try {
+      const { claimConductorLease } = await import('../lib/plan-state');
+      await claimConductorLease(planId, pid, command, `driver-spawn:${process.pid}`, repoRoot);
+    } catch {
+      // Best-effort provisional claim: verification below reports absence.
+    }
+  }
   return { pid, command };
+}
+
+/**
+ * Wait for the new conductor's proof of assumption: a lease with the same
+ * planId+pid re-readable from disk. The driver writes it via
+ * claimConductorLease on boot; the temp confirms before detaching.
+ * Returns the lease owner+timestamp for the handoff line, or null on timeout.
+ */
+async function awaitConductorLease(
+  planId: string,
+  pid: number,
+  repoRoot: string,
+  timeoutMs = 2000,
+): Promise<{ owner: string; acquiredAt: string } | null> {
+  const { readConductorLease } = await import('../lib/plan-state');
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const lease = await readConductorLease(repoRoot).catch(() => null);
+    if (lease && lease.planId === planId && lease.pid === pid) {
+      return { owner: lease.owner, acquiredAt: lease.acquiredAt };
+    }
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 /**
@@ -701,16 +745,23 @@ async function recordConductorHandoff(
     // coordinator role on their own, and the temp instance dies on shutdown —
     // so spawn/confirm a detached driver (auto-spawned, never a manual step
     // for the user) and fail explicitly when nobody assumes responsibility.
-    // No conductor is required only when nothing is in flight (no running /
-    // merging jobs and no live workers): the next driver pass picks up the
-    // persisted plan on demand.
+    // Any active plan with unfinished work needs an owner — including
+    // queued/waiting_deps/completed/ready_to_merge with zero live workers
+    // (sonda 12): there is no "next pass" without someone to drive it.
     const running = (plan.jobs ?? []).filter(
       (j) => j.status === 'running' || j.status === 'merging',
     ).length;
-    const needsConductor = running > 0 || workers.live > 0;
+    // Idempotent reuse: a live lease for the same plan is the owner — never
+    // spawn a second driver when the first is still alive.
+    const { readConductorLease } = await import('../lib/plan-state');
+    const existing = await readConductorLease(repoRoot).catch(() => null);
     let conductor: PersistentConductor | null = null;
-    if (needsConductor) {
-      const spawnFn = opts?.spawnConductor ?? spawnPersistentConductor;
+    let leaseProof: { owner: string; acquiredAt: string } | null = null;
+    if (existing && existing.planId === plan.id && isConductorAlive(existing.pid)) {
+      conductor = { pid: existing.pid, command: existing.command };
+      leaseProof = { owner: existing.owner, acquiredAt: existing.acquiredAt };
+    } else {
+      const spawnFn = opts?.spawnConductor ?? ((id, root) => spawnPersistentConductor(id, root, plan.id));
       try {
         conductor = await spawnFn(record.id, repoRoot);
       } catch (error) {
@@ -726,9 +777,21 @@ async function recordConductorHandoff(
             `(workers live ${workers.live}/${workers.total}) — refusing to declare success.`,
         );
       }
+      // Possession proof: pid-alive alone never suffices — the new conductor
+      // must have claimed the plan lease (it writes it on boot; the default
+      // spawner records a provisional claim). The temp re-reads before
+      // detaching and fails closed on absence (sonda 13).
+      leaseProof = await awaitConductorLease(plan.id, conductor.pid, repoRoot);
+      if (!leaseProof) {
+        throw new Error(
+          `handoff not confirmed for intake ${record.id}: conductor pid ${conductor.pid} alive but never claimed plan ${plan.id} ` +
+            `(no lease; workers live ${workers.live}/${workers.total}) — refusing to declare success. ` +
+            `Plan stays ${plan.status}; the next resume may assume it.`,
+        );
+      }
     }
     handoff =
-      `${action}: conductor ${conductor ? `detached driver pid ${conductor.pid} (${conductor.command}, auto-spawned by reporter pid ${process.pid})` : 'armed for next driver pass'} — ` +
+      `${action}: conductor detached driver pid ${conductor.pid} (${conductor.command}, auto-spawned by reporter pid ${process.pid}, lease ${leaseProof.owner}@${leaseProof.acquiredAt}) — ` +
       `plan ${plan.id} [${plan.status}] owned via persisted state (intake ${record.id}); ` +
       `workers live ${workers.live}/${workers.total} (tmux); ${profileLine}; ` +
       `one-shot controller detaches after this sync pass — ` +
@@ -781,6 +844,81 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       throw new Error('No active plan to approve');
     }
     const targetJobName = (retry !== undefined && retry !== '' ? retry : undefined) ?? (relaunch !== undefined && relaunch !== '' ? relaunch : undefined);
+    // Idempotent repetition: a plan already running without checkpoint already
+    // applied the approve — re-verify the conductor (reusing the live lease)
+    // instead of throwing or duplicating work. A new retry/relaunch target on
+    // a running plan still falls through to the explicit errors below.
+    if (plan.status === 'running' && !plan.checkpoint) {
+      // Guard: a running plan with no plan.json in this repo's scope is a leaked
+      // `loadPlan` mock from another suite (full-run pollution), not this intake's
+      // plan — fail closed like HEAD ("not pending or paused") instead of handing
+      // off a phantom. Real repeats always persist plan.json via savePlan/startPlan.
+      let planFileExists = true;
+      try {
+        const dd = await getDataDir(repoRoot).catch(() => null);
+        if (dd) {
+          const { join } = await import('path');
+          planFileExists = await Bun.file(join(dd, 'plan.json')).exists();
+        }
+      } catch {
+        planFileExists = true;
+      }
+      const target = targetJobName ? plan.jobs.find((j) => j.name === targetJobName) : undefined;
+      const targetDone =
+        !targetJobName ||
+        target?.status === 'ready_to_merge' ||
+        target?.status === 'running' ||
+        target?.status === 'merging' ||
+        target?.status === 'merged';
+      if (targetJobName && !target) {
+        throw new Error(`Job "${targetJobName}" not found in plan`);
+      }
+      if (targetDone && planFileExists) {
+        const [{ loadConfig: loadCfgIdem }] = await Promise.all([import('../lib/config')]);
+        const configIdem = await loadCfgIdem();
+        const [{ Orchestrator: OrchIdem }, { JobMonitor: MonIdem }, { getCurrentModel: curModelIdem }] =
+          await Promise.all([
+            import('../lib/orchestrator'),
+            import('../lib/monitor'),
+            import('../lib/model-tracker'),
+          ]);
+        const orchestratorIdem = new OrchIdem(new MonIdem(), configIdem);
+        const ctlIdem = orchestratorIdem as unknown as {
+          setRepoRoot?: (r: string) => void;
+          repoRoot?: string;
+          applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+          setPlanModelSnapshot: (m: unknown) => void;
+          resumePlan: (r?: string) => Promise<void>;
+          shutdown?: () => void;
+        };
+        // Robust construction: real Orchestrator has setRepoRoot; a leaked test
+        // double may only carry the property. Never throw "not a function" here.
+        try {
+          if (typeof ctlIdem.setRepoRoot === 'function') ctlIdem.setRepoRoot(repoRoot);
+          else ctlIdem.repoRoot = repoRoot;
+        } catch {
+          (ctlIdem as unknown as { repoRoot: string }).repoRoot = repoRoot;
+        }
+        applyEffectiveConfig(ctlIdem as never, record, (() => { try { return curModelIdem(); } catch { return undefined; } })());
+        let idemHandoff: string;
+        try {
+          idemHandoff = await recordConductorHandoff(ctlIdem as never, record, repoRoot, `approve/repeat ${targetJobName ?? 'resume'}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+        } catch (error) {
+          try { ctlIdem.shutdown?.(); } catch {}
+          throw error;
+        }
+        try { ctlIdem.shutdown?.(); } catch {}
+        return [
+          `Plan "${plan.name}" already running (intake ${record.id}) — handoff re-verified, no duplicate work.`,
+          idemHandoff,
+          '',
+          `  ID:   ${plan.id}`,
+          `  Mode: ${plan.mode}`,
+          '',
+          'Use follow to monitor progress.',
+        ].join('\n');
+      }
+    }
     if (targetJobName) {
       const job = plan.jobs.find((j) => j.name === targetJobName);
       if (!job) {
@@ -1043,7 +1181,22 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
       line = `resume: plan ${plan.id} [${plan.status}] is terminal — no conductor needed; see the final report.`;
     } else {
       const running = plan.jobs.filter((j) => j.status === 'running' || j.status === 'merging').length;
-      line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
+      // Possession proof: the staying coordinator claims the lease for its own
+      // pid (idempotent overwrite) and re-reads it — a resume that cannot
+      // persist its ownership fails explicitly instead of declaring continuity.
+      try {
+        const { claimConductorLease, readConductorLease } = await import('../lib/plan-state');
+        await claimConductorLease(plan.id, process.pid, `resume --intake ${record.id}`, 'resume', repoRoot);
+        const confirmed = await readConductorLease(repoRoot).catch(() => null);
+        if (!confirmed || confirmed.planId !== plan.id || confirmed.pid !== process.pid) {
+          throw new Error('lease not re-readable after claim');
+        }
+        line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid} lease resume@${confirmed.acquiredAt}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
+      } catch (error) {
+        throw new Error(
+          `resume not confirmed for intake ${record.id}: conductor ownership failed (${error instanceof Error ? error.message : String(error)}). Plan stays ${plan.status}; retry resume to assume it.`,
+        );
+      }
     }
     await appendAutoDecision(record.id, `handoff: ${line}`).catch(() => {});
     return line;

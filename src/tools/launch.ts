@@ -18,7 +18,7 @@ import { buildWorktreePermissions } from '../lib/permission-policy';
 import { detectOMO } from '../lib/omo';
 import { copyPlansToWorktree } from '../lib/plan-copier';
 import { resolvePostCreateHook } from '../lib/worktree-setup';
-import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript } from '../lib/prompt-file';
+import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, describeTuiModelPin, TUI_MODEL_BLOCKADE } from '../lib/prompt-file';
 import { getCurrentModel, getCurrentModelInfo } from '../lib/model-tracker';
 import { allocatePort, releasePort } from '../lib/port-allocator';
 import {
@@ -115,6 +115,10 @@ export const mc_launch: ToolDefinition = tool({
       .array(tool.schema.string())
       .optional()
       .describe('Files to copy from main worktree (e.g. [".env", ".env.local"])'),
+    agent: tool.schema
+      .string()
+      .optional()
+      .describe('Serve worker agent (passed as the session agent profile; TUI ignores it)'),
     symlinkDirs: tool.schema
       .array(tool.schema.string())
       .optional()
@@ -214,11 +218,15 @@ export const mc_launch: ToolDefinition = tool({
       }
     }
 
-    // 6. Branch: serve mode vs TUI mode
-    const useServeMode = config.useServeMode === true;
+    // 6. Branch: serve mode vs TUI mode.
+    // Serve is the default: only an explicit `useServeMode: false` opts out
+    // to legacy TUI (which cannot pin a model). An absent key ({}) serves.
+    const useServeMode = config.useServeMode !== false;
     let allocatedPort: number | undefined;
     let serverUrl: string | undefined;
     let remoteSessionId: string | undefined;
+    let modelRequested: { providerID: string; id: string; variant?: string } | undefined;
+    let modelObserved: { providerID: string; id: string; variant?: string } | undefined;
 
     if (useServeMode) {
       // === SERVE MODE ===
@@ -300,9 +308,9 @@ export const mc_launch: ToolDefinition = tool({
 
       cleanupLauncherScript(worktreePath);
 
-      // Wait for the 2.1.4 /api surface, create the session with the pinned
+      // Wait for the 2.x /api surface, create the session with the pinned
       // model triple, and deliver the prompt. The legacy unprefixed SDK is
-      // not served by 2.1.4 (session.create answered `{}`).
+      // not served by 2.x (session.create answered `{}`).
       // Canonical path: launchWorkerViaServe (sdk-client) — same POST+prompt
       // the integrador reuses for the autonomous launcher (orchestrator.ts).
       try {
@@ -316,25 +324,39 @@ export const mc_launch: ToolDefinition = tool({
           autoCommit: config.autoCommit,
         });
         const modelInfo = getCurrentModelInfo(context?.sessionID);
+        // No pin, no worker: running under an unknown server default (or a
+        // silent TUI fallback) is worse than failing here with a name.
+        if (!modelInfo) {
+          throw new Error(
+            '[MC] serve mode requires a pinned model, none tracked for this session — ' +
+              'set it via the model tracker (or coordinator snapshot) instead of running unpinned.',
+          );
+        }
         // R03: the full triple (variant included) is pinned and verified
-        // back via echo — a silent server default throws instead of running
-        // under the wrong model.
+        // back via echo/GET — a silent server default throws instead of
+        // running under the wrong model.
         const worker = await launchWorkerViaServe(client, {
           worktree: worktreePath,
           prompt: fullPrompt,
-          model: modelInfo
-            ? {
-                providerID: modelInfo.providerID,
-                id: modelInfo.modelID,
-                ...(modelInfo.variant ? { variant: modelInfo.variant } : {}),
-              }
-            : undefined,
+          model: {
+            providerID: modelInfo.providerID,
+            id: modelInfo.modelID,
+            ...(modelInfo.variant ? { variant: modelInfo.variant } : {}),
+          },
           // Allow-inside ruleset: reads/writes/shell within the worktree
           // never ask; anything outside stays under the default policy.
-          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          // Title + agent ride the session profile (echoed back by serve,
+          // revalidated on 2.2.5).
+          profile: {
+            permissions: buildWorktreePermissions(worktreePath),
+            title: args.name,
+            ...(args.agent ? { agent: args.agent } : {}),
+          },
           tmuxTarget,
         });
         remoteSessionId = worker.sessionId;
+        modelRequested = worker.requestedModel;
+        modelObserved = worker.observedModel;
       } catch (error) {
         await releasePort(allocatedPort).catch(() => {});
         try {
@@ -370,9 +392,14 @@ export const mc_launch: ToolDefinition = tool({
           autoCommit: config.autoCommit,
         });
         promptFilePath = await writePromptFile(worktreePath, fullPrompt);
-        // TUI root cannot apply a model pin (no -m/--model in v2.1.4): pass
+        // TUI root cannot apply a model pin (no -m/--model on the 2.2.5 root
+        // either — rejected with exit 1, revalidated natively): pass
         // the tracked string through unchanged — writeLauncherScript records
-        // it as NOT pinned. Serve mode is the pinned path.
+        // it as NOT pinned. Serve mode is the pinned path. Explicit opt-out
+        // only (`useServeMode: false`): this branch is never silent.
+        console.warn(
+          `[MC] TUI launcher (unpinned model): ${describeTuiModelPin(getCurrentModel(context?.sessionID)).requested ?? 'none tracked'} — ${TUI_MODEL_BLOCKADE}`,
+        );
         const model = getCurrentModel(context?.sessionID);
         launcherPath = await writeLauncherScript(worktreePath, promptFilePath, model);
       } catch (error) {
@@ -470,6 +497,8 @@ export const mc_launch: ToolDefinition = tool({
       port: allocatedPort,
       serverUrl,
       remoteSessionID: remoteSessionId,
+      ...(modelRequested ? { modelRequested: { ...modelRequested } } : {}),
+      ...(modelObserved ? { modelObserved: { ...modelObserved } } : {}),
     };
 
     await addJob(job);

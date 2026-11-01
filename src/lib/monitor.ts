@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { getRunningJobs, getJob, updateJob, type Job } from './job-state.js';
+import { getRunningJobs, getJob, updateJob, resolveJobPassword, type Job } from './job-state.js';
 import { isPaneRunning, capturePane, captureExitStatus } from './tmux.js';
 import { loadConfig } from './config.js';
 import { readReport } from './reports.js';
@@ -19,6 +19,7 @@ import {
 import {
   createV2Client,
   v2GetForm,
+  v2GetSession,
   v2ListForms,
   type V2Client,
 } from './sdk-client.js';
@@ -247,8 +248,17 @@ export class JobMonitor extends EventEmitter {
 
     const abortController = new AbortController();
     const config = await loadConfig().catch(() => undefined);
-    const client = createV2Client(job.port, config?.serverPassword);
-    this.questionRelay.setPassword(config?.serverPassword);
+    const password = resolveJobPassword(job, config?.serverPassword);
+    if (!password) {
+      // Fail-closed: serve always requires auth; an unauthenticated SSE
+      // stream would just 401-loop. Skip until a credential exists.
+      console.warn(
+        `[Monitor] No serve password for job ${job.name} (job or config) — skipping SSE subscribe, fail-closed.`,
+      );
+      return;
+    }
+    const client = createV2Client(job.port, password);
+    this.questionRelay.setPassword(password);
 
     this.sseSubscriptions.set(job.id, {
       abortController,
@@ -257,6 +267,11 @@ export class JobMonitor extends EventEmitter {
     });
 
     this.backfillPendingQuestions(job, client).catch(() => {});
+
+    // demo-r5 race: the worker session can reach a terminal outcome before
+    // this subscription opens (the stream is volatile, no replay). One-shot
+    // read of the current outcome; live events stay authoritative after.
+    this.syncSessionOutcome(job, client).catch(() => {});
 
     this.processSSEStream(job, client, abortController).catch((error) => {
       console.error(`[Monitor] SSE stream error for job ${job.name}:`, error);
@@ -278,6 +293,41 @@ export class JobMonitor extends EventEmitter {
       }
     } catch {
       // Non-fatal: backfill failure shouldn't block SSE subscription
+    }
+  }
+
+  /**
+   * One-shot initial sync: read the current remote outcome at subscribe
+   * time and route terminal ones through the event path (idempotent —
+   * handleSSEEvent drops events for already-terminal jobs). 'interrupted'
+   * and absent outcomes keep the job running; a failed read is fail-open
+   * (warn, events stay authoritative). No continuous polling.
+   *
+   * Public for tests (see tests/lib/monitor-initial-sync.test.ts).
+   */
+  async syncSessionOutcome(job: Job, client: V2Client): Promise<void> {
+    if (!job.remoteSessionID) return;
+    let outcome: string | undefined;
+    try {
+      const session = await v2GetSession(client, job.remoteSessionID);
+      // Session.Info.outcome (openapi 2.2.5): succeeded | failed | interrupted.
+      outcome = (session as unknown as { outcome?: string }).outcome;
+    } catch {
+      console.warn(
+        `[Monitor] Initial session sync failed for job ${job.name} — keeping SSE events authoritative.`,
+      );
+      return;
+    }
+    if (outcome === 'succeeded') {
+      await this.handleSSEEvent(job, {
+        type: 'session.execution.succeeded',
+        data: { sessionID: job.remoteSessionID },
+      });
+    } else if (outcome === 'failed') {
+      await this.handleSSEEvent(job, {
+        type: 'session.execution.failed',
+        data: { sessionID: job.remoteSessionID },
+      });
     }
   }
 

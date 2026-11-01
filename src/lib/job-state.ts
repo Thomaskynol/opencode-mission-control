@@ -10,6 +10,20 @@ import { atomicWrite } from './utils';
 export type Job = z.infer<typeof JobSchema>;
 export type JobState = z.infer<typeof JobStateSchema>;
 
+/**
+ * Effective serve password for a job: the persisted per-worker credential
+ * first, config fallback second. Undefined when neither exists — callers
+ * must fail closed (never poll unauthenticated, serve always 401s).
+ */
+export function resolveJobPassword(
+  job: { serverPassword?: string },
+  configured?: string,
+): string | undefined {
+  if (job.serverPassword) return job.serverPassword;
+  const trimmed = configured?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 export function migrateV2ToV3(state: Record<string, unknown>): JobState {
   const jobs = (state.jobs as Job[]) ?? [];
   const migrated = {

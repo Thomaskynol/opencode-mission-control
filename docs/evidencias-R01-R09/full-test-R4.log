@@ -1,0 +1,116 @@
+bun test v1.3.14 (0d9b296a)
+
+tests/v2-host-context.test.ts:
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+
+tests/lib/plan-state.test.ts:
+[MC] Invalid job transition: queued → failed (job: fix-login) (forced recovery)
+
+tests/lib/question-relay.test.ts:
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot escalate permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot auto-approve permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Cannot escalate permission for job Test Job: missing serve port or remote session.
+[QuestionRelay] Auto-denied permission per-pub-1 for job job-pub-timeout
+[QuestionRelay] Auto-approved permission per-plain-1 for job job-plain-timeout
+
+tests/lib/monitor.test.ts:
+[Monitor] No serve password for job Serve Job (job or config) — skipping SSE subscribe, fail-closed.
+[Monitor] No serve password for job Serve Job (job or config) — skipping SSE subscribe, fail-closed.
+[Monitor] No serve password for job Serve Job (job or config) — skipping SSE subscribe, fail-closed.
+
+tests/lib/f03f05f06f07-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/wire-report.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+
+tests/lib/acceptance-less-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/gate-resume-approve.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model (session/config) found — falling back to default "opencode-go/muse-spark-1.3-contributor" (triple). Set MC_PLANNER_MODEL or run inside the control center so planner and workers share the effective model.
+
+tests/lib/ceiling-context-regression.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/orchestrator-modes.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/merge-train.test.ts:
+No test command configured or detected in /tmp/mc-merge-train-rNvKV6/integration-worktree. Skipping test gating.
+[MC] fix-before-rollback prompt failed for job "feature-sdk-fail": connection refused
+[MC] fix-before-rollback skipped for job "feature-no-session": no remote worker session (port/remoteSessionID missing), rolling back.
+
+tests/lib/gap1-integration-context.test.ts:
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+[MC] No tracked model for coordinator — falling back to default with explicit warning (no silent unknown/unknown).
+
+tests/lib/orchestrator.test.ts:
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+[MC] auto final report failed: The "paths[0]" property must be of type string, got undefined
+
+tests/lib/monitor-autocomplete.test.ts:
+[MC] auto final report failed: reports gone
+
+tests/lib/job-password-reconnect.test.ts:
+[Monitor] Initial session sync failed for job v2-pw — keeping SSE events authoritative.
+[Monitor] No serve password for job v2-nopw (job or config) — skipping SSE subscribe, fail-closed.
+
+tests/tools/launch.test.ts:
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): anthropic/claude-sonnet-4-20250514 — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+[MC] TUI launcher (unpinned model): none tracked — TUI root (opencode --prompt) has no -m/--model in v2.2.5 (revalidated; also true on 2.1.4): the requested model is recorded, NOT applied — workers inherit the session default. Use serve mode (POST /api/session {model}) for a pinned, verified triple.
+
+ 1235 pass
+ 15 skip
+ 0 fail
+ 3161 expect() calls
+Ran 1250 tests across 93 files. [38.55s]

@@ -38,6 +38,7 @@ let mockResolvePostCreateHook: any;
 let mockAllocatePort: any;
 let mockReleasePort: any;
 let mockV2WaitForServer: any;
+let mockGetCurrentModelInfo: any;
 let mockV2CreateSession: any;
 let mockV2Prompt: any;
 let mockWriteServeLauncherScript: any;
@@ -61,6 +62,9 @@ function setupDefaultMocks() {
     pollInterval: 10000,
     idleThreshold: 300000,
     worktreeBasePath: '/tmp/mc-worktrees',
+    // Legacy-path default for the pre-serve TUI suites: explicit opt-out.
+    // Default-serve (absent key → serve) is covered in the serve describe.
+    useServeMode: false,
     omo: { enabled: false, defaultMode: 'vanilla' },
   });
   mockCreateWorktree.mockResolvedValue('/tmp/mc-worktrees/test-job');
@@ -106,7 +110,7 @@ describe('mc_launch', () => {
     mockAllocatePort = vi.spyOn(portAllocator, 'allocatePort').mockImplementation(() => Promise.resolve(14100) as any);
     mockReleasePort = vi.spyOn(portAllocator, 'releasePort').mockImplementation(() => Promise.resolve(undefined) as any);
     mockV2WaitForServer = vi.spyOn(sdkClient, 'v2WaitForServer').mockImplementation(() => Promise.resolve({ baseUrl: 'http://127.0.0.1:14100/api', headers: {} }) as any);
-    mockV2CreateSession = vi.spyOn(sdkClient, 'v2CreateSession').mockImplementation(() => Promise.resolve({ id: 'ses-v2-1' }) as any);
+    mockV2CreateSession = vi.spyOn(sdkClient, 'v2CreateSession').mockImplementation(() => Promise.resolve({ id: 'ses-v2-1', model: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'xhigh' } }) as any);
     mockV2Prompt = vi.spyOn(sdkClient, 'v2Prompt').mockImplementation(() => Promise.resolve({}) as any);
     mockWriteServeLauncherScript = vi.spyOn(promptFile, 'writeServeLauncherScript').mockImplementation(() => Promise.resolve('/tmp/mc-worktrees/test-job/.mc-launch.sh') as any);
     mockGetRunningJobs = vi.spyOn(jobState, 'getRunningJobs').mockImplementation(() => Promise.resolve([]) as any);
@@ -462,6 +466,7 @@ describe('mc_launch', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
+        useServeMode: false,
         omo: { enabled: false, defaultMode: 'vanilla' },
       });
 
@@ -480,6 +485,7 @@ describe('mc_launch', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
+        useServeMode: false,
         omo: { enabled: true, defaultMode: 'ralph' },
       });
 
@@ -608,6 +614,12 @@ describe('mc_launch', () => {
         portRangeEnd: 14199,
         omo: { enabled: false, defaultMode: 'vanilla' },
       });
+      // Production always pins via the tracker; the mocked create echoes it.
+      mockGetCurrentModelInfo = vi.spyOn(modelTracker, 'getCurrentModelInfo').mockReturnValue({
+        providerID: 'opencode-go',
+        modelID: 'muse-spark-1.3-contributor',
+        variant: 'xhigh',
+      });
     });
 
     it('should allocate port and use serve launcher', async () => {
@@ -697,6 +709,68 @@ describe('mc_launch', () => {
           port: 14100,
           serverUrl: 'http://127.0.0.1:14100',
           remoteSessionID: 'ses-v2-1',
+          // Requested vs observed persist separately; observed is the echo.
+          modelRequested: expect.objectContaining({
+            providerID: 'opencode-go',
+            id: 'muse-spark-1.3-contributor',
+            variant: 'xhigh',
+          }),
+          modelObserved: expect.objectContaining({
+            providerID: 'opencode-go',
+            id: 'muse-spark-1.3-contributor',
+            variant: 'xhigh',
+          }),
+        }),
+      );
+    });
+
+    it('should serve by default when useServeMode is absent ({} → serve)', async () => {
+      mockLoadConfig.mockResolvedValue({
+        defaultPlacement: 'session',
+        pollInterval: 10000,
+        idleThreshold: 300000,
+        worktreeBasePath: '/tmp/mc-worktrees',
+        portRangeStart: 14100,
+        portRangeEnd: 14199,
+        omo: { enabled: false, defaultMode: 'vanilla' },
+      });
+
+      await mc_launch.execute(
+        { name: 'serve-default', prompt: 'Do task' },
+        mockContext,
+      );
+
+      expect(mockAllocatePort).toHaveBeenCalled();
+      expect(mockWriteServeLauncherScript).toHaveBeenCalled();
+      expect(mockWritePromptFile).not.toHaveBeenCalled();
+    });
+
+    it('should fail closed without a tracked pin (never silent TUI, never unpinned serve)', async () => {
+      mockGetCurrentModelInfo.mockReturnValue(undefined);
+
+      await expect(
+        mc_launch.execute(
+          { name: 'serve-nopin', prompt: 'Do task' },
+          mockContext,
+        ),
+      ).rejects.toThrow(/requires a pinned model/);
+
+      expect(mockWritePromptFile).not.toHaveBeenCalled();
+      expect(mockRemoveWorktree).toHaveBeenCalled();
+    });
+
+    it('should pass agent and title through the serve session profile', async () => {
+      await mc_launch.execute(
+        { name: 'serve-agent', prompt: 'Do task', agent: 'code-agent' } as any,
+        mockContext,
+      );
+
+      expect(mockV2CreateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        expect.objectContaining({
+          agent: 'code-agent',
+          title: 'serve-agent',
+          location: { directory: '/tmp/mc-worktrees/test-job' },
         }),
       );
     });

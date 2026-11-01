@@ -793,3 +793,69 @@ describe('checkMergeability', () => {
     expect(statusAfter).toBe('');
   });
 });
+
+describe('verdict freshness SHA normalization (demo-r5)', () => {
+  let testRepo: TestRepo;
+
+  beforeEach(async () => {
+    testRepo = await setupRepo();
+  });
+
+  afterEach(() => {
+    rmSync(testRepo.rootDir, { recursive: true, force: true });
+  });
+
+  it('treats short-vs-full SHA of the same base+job as fresh (no false base-moved block)', async () => {
+    await createBranchCommit(testRepo.repoDir, 'feature-short-pin', 'short.txt', 'short\n');
+
+    const fullBase = await mustExec(['git', 'rev-parse', 'HEAD'], testRepo.integrationWorktree);
+    const fullJobHead = await mustExec(['git', 'rev-parse', 'feature-short-pin'], testRepo.repoDir);
+
+    const train = new MergeTrain(testRepo.integrationWorktree);
+    train.enqueue(makeJob('feature-short-pin'));
+    const result = await train.processNext({
+      verdict: 'pass',
+      blocking: false,
+      reasons: [],
+      jobName: 'feature-short-pin',
+      // Same commits as the live HEADs, recorded in short form —
+      // the demo-r5 shape: approved on `74a6958` vs integration at `74a6958...`.
+      reviewedCommit: fullJobHead.slice(0, 7),
+      reviewedBase: fullBase.slice(0, 7),
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('still blocks when the base really moved (different commit, not a prefix)', async () => {
+    await createBranchCommit(testRepo.repoDir, 'feature-moved-base', 'moved.txt', 'moved\n');
+
+    const staleBase = await mustExec(['git', 'rev-parse', 'HEAD'], testRepo.integrationWorktree);
+    const jobHead = await mustExec(['git', 'rev-parse', 'feature-moved-base'], testRepo.repoDir);
+
+    // Advance the integration HEAD with a real commit: the old pin is stale.
+    writeFileSync(join(testRepo.integrationWorktree, 'other.txt'), 'other\n');
+    await mustExec(['git', 'add', 'other.txt'], testRepo.integrationWorktree);
+    await mustExec(['git', 'commit', '-m', 'advance integration'], testRepo.integrationWorktree);
+    const movedBase = await mustExec(['git', 'rev-parse', 'HEAD'], testRepo.integrationWorktree);
+    expect(movedBase).not.toBe(staleBase);
+    expect(movedBase.startsWith(staleBase.slice(0, 7))).toBe(false);
+
+    const train = new MergeTrain(testRepo.integrationWorktree);
+    train.enqueue(makeJob('feature-moved-base'));
+    const result = await train.processNext({
+      verdict: 'pass',
+      blocking: false,
+      reasons: [],
+      jobName: 'feature-moved-base',
+      reviewedCommit: jobHead,
+      reviewedBase: staleBase,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.type).toBe('review_blocked');
+      expect(result.output).toContain('base moved');
+    }
+  });
+});

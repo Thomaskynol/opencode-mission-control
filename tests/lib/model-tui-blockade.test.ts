@@ -40,7 +40,8 @@ describe('TUI model blockade (R03: TUI root cannot pin, declared explicitly)', (
       });
       const script = await fs.promises.readFile(join(base, '.mc-launch.sh'), 'utf-8');
       const execLine = script.split('\n').filter((l) => l.startsWith('exec ')).join('\n');
-      // PROHIBITED: re-adding the rejected flag (v2.1.4 exits 1 on -m).
+      // PROHIBITED: re-adding the rejected flag (TUI root rejects -m: exit 1,
+      // revalidated natively on 2.2.5; also true on 2.1.4).
       expect(execLine).not.toMatch(/(^|\s)(-m|--model)(\s|=|$)/);
       // The requested triple stays observable, explicitly marked as not pinned.
       expect(script).toContain('opencode-go/muse-spark-1.3-contributor#xhigh');
@@ -69,7 +70,8 @@ describe('TUI model blockade (R03: TUI root cannot pin, declared explicitly)', (
   it('TUI is explicitly not the model contract path: the pinned triple lives only on serve (why this file never emits -m)', async () => {
     // Contract anchor: the autonomous launcher must use a verified serve
     // session (launchWorkerViaServe), never the TUI root. This test pins the
-    // reason so a future -m re-add (rejected by v2.1.4 with exit 1) cannot
+    // reason so a future -m re-add (rejected by the TUI root with exit 1,
+    // revalidated on 2.2.5) cannot
     // slip back in as a silent "fix": the TUI exec line stays `opencode
     // --prompt ...` with the triple recorded only as a NOT-pinned comment.
     const fs = await import('fs');

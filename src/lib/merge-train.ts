@@ -361,6 +361,21 @@ async function ensureTestDependencies(
   };
 }
 
+/**
+ * Demo-r5 root cause: the same commit compared in different formats
+ * (short `--short` prefix vs full 40-char SHA) faked a base/job move.
+ * A pin that is a prefix of the live SHA (either direction) is the
+ * SAME commit. Minimum 4 chars: git never resolves a shorter prefix.
+ */
+function isSameCommit(a: string, b: string): boolean {
+  const x = a.trim();
+  const y = b.trim();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (Math.min(x.length, y.length) < 4) return false;
+  return x.startsWith(y) || y.startsWith(x);
+}
+
 export class MergeTrain {
   private queue: JobSpec[] = [];
 
@@ -452,6 +467,13 @@ export class MergeTrain {
    * M4 freshness: an approval pins (reviewedCommit, reviewedBase). Any move
    * of the job branch or the integration HEAD invalidates it — re-review.
    * Must run inside the integration lock (TOCTOU otherwise).
+   *
+   * SHA normalization: pins may record a commit in short form
+   * (`git rev-parse --short`, 7+ hex chars) while the live HEAD resolves
+   * to the full 40-char SHA. A pin that is a prefix of the live SHA
+   * (or vice versa) is the SAME commit — not a move. Strict `!==`
+   * fakes a move (e.g. approved on `74a6958` vs integration at
+   * `74a6958...`) and blocks the merge forever.
    */
   private async checkVerdictFreshness(
     job: JobSpec,
@@ -465,7 +487,7 @@ export class MergeTrain {
         output: `Review blocked: job "${job.name}" verdict=fail: ${verdict.reasons.join('; ') || 'no reasons given'}`,
       };
     }
-    if (verdict.reviewedBase !== integrationHead) {
+    if (!isSameCommit(verdict.reviewedBase, integrationHead)) {
       return {
         success: false,
         type: 'review_blocked',
@@ -474,7 +496,7 @@ export class MergeTrain {
     }
     if (job.branch) {
       const jobHead = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', job.branch]);
-      if (jobHead.exitCode === 0 && jobHead.stdout.trim() !== verdict.reviewedCommit) {
+      if (jobHead.exitCode === 0 && !isSameCommit(jobHead.stdout.trim(), verdict.reviewedCommit)) {
         return {
           success: false,
           type: 'review_blocked',

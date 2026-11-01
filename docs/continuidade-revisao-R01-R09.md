@@ -154,3 +154,14 @@ Base: relatório /home/thomaskyn/Downloads/REVISAO_ORQUESTRADOR_97af72d.md (12 s
 - §7 kill sem posse: só alvos registrados (buildOwnedKillList/filterOwnedKillTargets); legado por existência removido; execTag no lançamento inicial serve; tmux-isPaneRunning gated por TEST_LIVE + nomes por execução + kill com posse.
 - §8 evidências: demo-R3.log = regressões Bun (51 pass, sem OpenCodes vivos — declarado); MANIFESTO-R3.txt gerado pelo script corrigido.
 Skipped: live E2E multiprocesso com modelo; rigor total em NL. Risk: fallback TUI compat em fakes (virar default-serve quando fakes mockarem serve); sessões tmux legadas preservadas.
+
+## 12. Rodada REVISAO_9f47d5f (2026-10-31/11-01, HEAD 9f47d5f → novo commit)
+
+Base: /home/thomaskyn/Downloads/REVISAO_ORQUESTRADOR_9f47d5f.md (16 sondas). Explorers antes; 3 fixers paralelos + integrador + reparos sequenciais. Full final: build exit 0; `bun test` 1235 pass / 15 skip / 0 fail / 93 arquivos (docs/evidencias-R01-R09/{build,full-test}-R4.log).
+- Bloq A (heurística textual): asserção vinculada por dataflow (literais dentro do assert que recebe a chamada), imports ignorados, números-prosa→comportamental, vacuidade bloqueia prova trivial; âncora-arquivo virou dica de escopo (extração de path embutido). Sondas 2/3/4/A/1 rejeitam; Sonda B/7/coberturas reais passam.
+- Bloq C (handoff): lease de condutor (conductor.json + claim/re-leitura), queued-only exige condutor, claimJobForCorrection atômico, approve idempotente; monitor handlers idempotentes (sem rebaixar ready_to_merge).
+- Bloq D (modelo): ausência de model FALHA fechado (requested/observed separados); default-serve (`!==false`); agent/title no perfil; senha serve por worker gerada + persistida (resolveJobPassword em monitor/job-comms/fork); /start-work via v2RunCommand.
+- Bloq B (identidade): re-observação pós-teste + allowlist consciente de versionamento (dist versionada relevante); isSameCommit short-vs-full em merge-train, reviewer e transições (ready_to_merge→failed permitido).
+- §7/§8: catch só mata o que criou; addJob/updatePlanJob ANTES do prompt; initial-sync de outcome no subscribe (coleta worker já terminado); prompt de correção inclui protocolo mc_report.
+- Achados da demo viva corrigidos no caminho: serve 2.2.5 exige auth (401 sem senha → timeout virado em senha por worker); transição ready_to_merge→failed; comparação short-vs-full; veto de âncora-arquivo; coleta de worker já-concluído.
+Skipped: E2E com 4-8 workers paralelos; OMO live (endpoint verificado, execução presumida). Risk: suite tem flakes de ordem ocasionais (re-run isolado verde); sessões tmux demo preservadas p/ inspeção.

@@ -10,7 +10,7 @@ import { atomicWrite } from './utils';
 const PLAN_FILE = 'plan.json';
 
 /** Cross-process lock for plan.json read-modify-write cycles (see file-lock.ts). */
-async function withPlanLock<T>(fn: () => Promise<T>, repoRoot?: string): Promise<T> {
+export async function withPlanLock<T>(fn: () => Promise<T>, repoRoot?: string): Promise<T> {
   const dataDir = await getDataDir(repoRoot);
   return withFileLock(lockPathFor(join(dataDir, PLAN_FILE)), fn);
 }
@@ -220,4 +220,160 @@ export async function validateGhAuth(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Conductor lease: durable proof that a live process owns the plan.   */
+/* PID liveness alone never suffices (sonda 13): the new conductor     */
+/* must claim (planId+pid+owner+timestamp) under the inter-process      */
+/* lock and the handoff only completes after the claim is re-read.     */
+/* Stored beside plan.json (no PlanSpec schema change) with its own    */
+/* lockfile so plan.json writers and lease writers never interleave.   */
+/* ------------------------------------------------------------------ */
+
+const CONDUCTOR_FILE = 'conductor.json';
+
+export interface ConductorLease {
+  planId: string;
+  pid: number;
+  command: string;
+  owner: string;
+  acquiredAt: string;
+}
+
+async function getConductorFilePath(repoRoot?: string): Promise<string> {
+  const dataDir = await getDataDir(repoRoot);
+  return join(dataDir, CONDUCTOR_FILE);
+}
+
+/**
+ * Claim conductor ownership for a plan (new driver proves assumption).
+ * Overwrites any prior lease (last writer wins; the handoff verifies the
+ * winner before the temp detaches, so a stale holder is never trusted).
+ * Throws when no matching plan exists — the lease never points at nothing.
+ */
+export async function claimConductorLease(
+  planId: string,
+  pid: number,
+  command: string,
+  owner?: string,
+  repoRoot?: string,
+): Promise<ConductorLease> {
+  const plan = await loadPlan(repoRoot);
+  if (!plan) throw new Error(`Cannot claim conductor for plan "${planId}": no active plan.`);
+  if (plan.id !== planId) {
+    throw new Error(`Cannot claim conductor: plan ID mismatch (expected ${planId}, got ${plan.id}).`);
+  }
+  if (!Number.isFinite(pid) || pid <= 0) {
+    throw new Error(`Cannot claim conductor for plan "${planId}": invalid pid ${pid}.`);
+  }
+  const lease: ConductorLease = {
+    planId,
+    pid,
+    command,
+    owner: owner ?? `pid-${pid}`,
+    acquiredAt: new Date().toISOString(),
+  };
+  const filePath = await getConductorFilePath(repoRoot);
+  await withFileLock(lockPathFor(filePath), async () => {
+    await atomicWrite(filePath, JSON.stringify(lease, null, 2));
+  });
+  return lease;
+}
+
+/** Read the current conductor lease (null when never claimed). Never throws. */
+export async function readConductorLease(repoRoot?: string): Promise<ConductorLease | null> {
+  try {
+    const filePath = await getConductorFilePath(repoRoot);
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) return null;
+    const parsed = JSON.parse(await file.text()) as ConductorLease;
+    if (!parsed || parsed.planId === undefined || !Number.isFinite(parsed.pid)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify a lease: same plan, same pid, and that pid answers to signal 0.
+ * PID-alive alone is NOT enough — the caller must also require this to be
+ * true (the lease is the new conductor's proof of assumption).
+ */
+export async function verifyConductorLease(
+  planId: string,
+  pid: number,
+  repoRoot?: string,
+): Promise<boolean> {
+  const lease = await readConductorLease(repoRoot);
+  if (!lease) return false;
+  if (lease.planId !== planId || lease.pid !== pid) return false;
+  return isPidAlive(pid);
+}
+
+/** Remove the lease (test cleanup / explicit release). Never throws. */
+export async function clearConductorLease(repoRoot?: string): Promise<void> {
+  try {
+    const filePath = await getConductorFilePath(repoRoot);
+    const { acquireFileLock } = await import('./file-lock');
+    const release = await acquireFileLock(lockPathFor(filePath));
+    try {
+      const fs = await import('fs');
+      try {
+        fs.unlinkSync(filePath);
+      } catch {}
+    } finally {
+      await release();
+    }
+  } catch {}
+}
+
+/* ------------------------------------------------------------------ */
+/* Atomic job dispatch claim (sonda 15). Two coordinators racing on    */
+/* the same queued job must not both dispatch: only queued→running     */
+/* under the plan lock succeeds; an already-claimed job returns       */
+/* ok:false with its current status (never throws, never double-sets). */
+/* shortcut: owner is recorded only in the lease/audit trail, not in  */
+/* the JobSpec (no schema change); upgrade when JobSpec gains owner.   */
+/* ------------------------------------------------------------------ */
+
+export async function claimJobForDispatch(
+  planId: string,
+  jobName: string,
+  owner: string,
+  repoRoot?: string,
+): Promise<{ ok: boolean; status: JobSpec['status'] }> {
+  void owner;
+  return withPlanLock(async () => {
+    const plan = await loadPlan(repoRoot);
+    if (!plan) throw new Error('No active plan exists');
+    if (plan.id !== planId) {
+      throw new Error(`Plan ID mismatch: expected ${planId}, got ${plan.id}`);
+    }
+    const jobIndex = plan.jobs.findIndex((j) => j.name === jobName || j.id === jobName);
+    if (jobIndex === -1) {
+      throw new Error(`Job "${jobName}" not found in plan "${plan.name}"`);
+    }
+    const current = plan.jobs[jobIndex].status;
+    if (current !== 'queued') {
+      return { ok: false as const, status: current };
+    }
+    if (!isValidJobTransition('queued', 'running')) {
+      return { ok: false as const, status: current };
+    }
+    plan.jobs[jobIndex] = { ...plan.jobs[jobIndex], status: 'running' };
+    const filePath = await getPlanFilePath(repoRoot);
+    await atomicWrite(filePath, JSON.stringify(plan, null, 2));
+    return { ok: true as const, status: 'running' as const };
+  }, repoRoot);
 }

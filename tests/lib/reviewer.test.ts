@@ -151,24 +151,44 @@ describe('reviewJob', () => {
     expect(verdict.reasons.join('\n')).toMatch(/REQ-1/);
   });
 
-  it('fails when the anchor only matches a changed filename, never the test output', () => {
-    // The test file changed but no test output mentions the requirement:
-    // filename match is not coverage.
-    const verdict = reviewJob(
+  it('treats a file anchor as a scope hint, not a veto', () => {
+    // New contract (demo-r5): a path-like anchor names the file whose
+    // execution should demonstrate the requirement. When that file is in the
+    // examined scope AND really asserts the implementation, it is covered.
+    const covered = reviewJob(
       baseInput({
         requirements: [
-          { id: 'REQ-2', description: 'covers the changed file', testAnchors: ['tests/auth.test.ts'] },
+          { id: 'REQ-2', description: 'login rejects bad password covered in tests/auth.test.ts', testAnchors: ['tests/auth.test.ts'] },
+        ],
+        evidence: {
+          command: 'bun test',
+          exitCode: 0,
+          output: 'pass: rejects bad password (12 tests)',
+          testedCommit: 'job-head-1',
+          environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
+        },
+      }),
+    );
+    expect(covered.verdict).toBe('pass');
+
+    // But an anchor naming a file outside the examined candidate still fails
+    // closed: the named test was never part of the reviewed scope.
+    const outOfScope = reviewJob(
+      baseInput({
+        requirements: [
+          { id: 'REQ-2', description: 'login covered in tests/missing.test.ts', testAnchors: ['tests/missing.test.ts'] },
         ],
         evidence: {
           command: 'bun test',
           exitCode: 0,
           output: 'pass: 12 tests (unrelated suite, no file names listed)',
           testedCommit: 'job-head-1',
+          environment: 'worktree:/tmp/x (bun 1.3.14, linux)',
         },
       }),
     );
-    expect(verdict.verdict).toBe('fail');
-    expect(verdict.reasons.join('\n')).toMatch(/REQ-2/);
+    expect(outOfScope.verdict).toBe('fail');
+    expect(outOfScope.reasons.join('\n')).toMatch(/REQ-2/);
   });
 
   it('fails touchSet violations', () => {

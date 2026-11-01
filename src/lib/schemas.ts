@@ -20,6 +20,26 @@ export const JobSchema = z.object({
   port: z.number().optional(),
   serverUrl: z.string().optional(),
   remoteSessionID: z.string().optional(),
+  // Effective serve password for THIS worker (per-worker credential from
+  // launch). Reconnects (monitor poll, relay, fork) auth with this first,
+  // falling back to config. Never logged or embedded in prompts.
+  serverPassword: z.string().optional(),
+  // Serve worker pin, split by evidence: requested is what was asked,
+  // observed is what the server echoed back (fail-closed when absent).
+  modelRequested: z
+    .object({
+      providerID: z.string(),
+      id: z.string(),
+      variant: z.string().optional(),
+    })
+    .optional(),
+  modelObserved: z
+    .object({
+      providerID: z.string(),
+      id: z.string(),
+      variant: z.string().optional(),
+    })
+    .optional(),
 });
 
 export const JobStateSchema = z.object({
@@ -108,6 +128,10 @@ export const JobSpecSchema = z.object({
   // Remote worker session on the serve instance. Parsed (not stripped) so
   // fix-before-rollback and fork survive a coordinator restart.
   remoteSessionID: z.string().optional(),
+  // Effective serve password for THIS worker (per-worker credential from
+  // launch). Reconnects auth with this first, falling back to config.
+  // Never logged or embedded in prompts.
+  serverPassword: z.string().optional(),
   permissionPolicy: PermissionPolicySchema.optional(),
 });
 

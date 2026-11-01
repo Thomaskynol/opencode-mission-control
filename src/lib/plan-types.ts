@@ -94,6 +94,12 @@ export interface JobSpec {
    * never launchSessionID, which is the local control-center session.
    */
   remoteSessionID?: string;
+  /**
+   * Effective serve password for THIS worker (per-worker credential from
+   * launch). Reconnects (monitor poll, relay, fork) auth with this first,
+   * falling back to config. Never logged or embedded in prompts.
+   */
+  serverPassword?: string;
   permissionPolicy?: PermissionPolicyConfig;
 }
 
@@ -115,7 +121,7 @@ export const VALID_JOB_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
   paused: ['running', 'failed', 'stopped', 'canceled'],
   completed: ['ready_to_merge', 'failed', 'stopped', 'canceled'],
   failed: ['ready_to_merge', 'running', 'stopped', 'canceled'],
-  ready_to_merge: ['merging', 'needs_rebase', 'stopped', 'canceled'],
+  ready_to_merge: ['merging', 'failed', 'needs_rebase', 'stopped', 'canceled'],
   merging: ['merged', 'failed', 'conflict', 'stopped', 'canceled'],
   merged: ['needs_rebase'],
   conflict: ['ready_to_merge', 'stopped', 'canceled'],

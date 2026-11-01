@@ -286,15 +286,22 @@ function testCallsSymbol(testContent: string, symbol: string): boolean {
 
 /**
  * True when the requirement text carries a code reference (a call `sym(`,
- * a comparison `===`/`==`, a numeric literal, or a quoted literal).
- * Plain words ("Return zero for an empty collection") are behavioural
- * prose — never a vocabulary obligation on internal symbol names.
+ * a comparison `===`/`==`, or a quoted literal). Bare prose numbers
+ * ("retry 3 times", "sum of 2 numbers") are NOT code refs: a digit only
+ * counts when adjacent to code punctuation (brackets, parens, commas,
+ * operators), e.g. `total([1,2])===3`. A requirement without real refs is
+ * behavioural prose and takes the behavioural path. Numbers in prose must
+ * never force a vocabulary obligation on internal symbol names.
+ * shortcut: punctuation-adjacency heuristic — upgrade to a structured parser if it misfires.
  */
 function hasCodeReferences(text: string): boolean {
   if (/\b[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(text)) return true;
   if (/===|!==|==|!=|=>/.test(text)) return true;
-  if (/\b\d+(?:\.\d+)?\b/.test(text)) return true;
   if (/'[^']+'|"[^"]+"|`[^`]+`/.test(text)) return true;
+  // A digit counts only adjacent to code punctuation (brackets, parens,
+  // commas, operators). Sentence punctuation (`.`, `,`, `;`, `:`, `?`) after
+  // a prose number ("uses 3.") does NOT count.
+  if (/[(\[{,=!<>:+\-*/%&|]\s*\d|\d\s*[)\]},=!<>:+\-*/%&|]/.test(text)) return true;
   return false;
 }
 
@@ -365,56 +372,186 @@ function stripCommentsKeepStrings(source: string): string {
   return out;
 }
 
-/**
- * Assertion windows: symmetric slice around each assert/expect/exit/throw
- * keyword so both `assert.equal(f(x), v)` (call after) and
- * `got = f(x); assert.equal(got, v)` (call before) bind. Exit-code
- * harnesses (`if (got !== v) process.exit(1)`) count as assertions.
- * shortcut: fixed ±window heuristic — upgrade to a structured parser if it misfires.
- */
-function assertionWindows(noComments: string): string[] {
-  const wins: string[] = [];
-  const re = /\bassert\b|\bexpect\b|process\.exit|\bthrow\b/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(noComments)) !== null) {
-    wins.push(noComments.slice(Math.max(0, m.index - 500), m.index + 800));
+/** Drop import/require lines: `assert` in an import is never an assertion. */
+function removeImportRequireLines(source: string): string {
+  return source
+    .split('\n')
+    .filter((l) => {
+      const t = l.trim();
+      if (/^import\b/.test(t)) return false;
+      if (/\brequire\s*\(/.test(t)) return false;
+      return true;
+    })
+    .join('\n');
+}
+
+/** Extract the balanced `(...)` starting at openIdx (which must be `(`). */
+function extractBalanced(source: string, openIdx: number): string | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = openIdx; i < source.length; i++) {
+    const ch = source[i]!;
+    if (quote !== null) {
+      if (ch === '\\') {
+        i++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return source.slice(openIdx, i + 1);
+    }
   }
-  return wins;
+  return null;
 }
 
-function windowHasCall(window: string, symbol: string): boolean {
+/**
+ * Assertion snippets: the actual argument list of each assert-verb call,
+ * not a character window. Only verb forms count — `assert.equal(`,
+ * `assert.ok(`, `assert.deepEqual(`, bare `assert(`, `expect(` (plus its
+ * `.toX(...)` chain). An `assert` that only appears in an import/require
+ * line is never an assertion (those lines are removed first).
+ * shortcut: regex + balanced-paren scan — upgrade to a structured parser if it misfires.
+ */
+function assertionSnippets(noCommentsNoImports: string): string[] {
+  const src = noCommentsNoImports;
+  const out: string[] = [];
+  const re = /\bassert\s*(?:\.\s*[A-Za-z_][A-Za-z0-9_]*\s*)?\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    const open = m.index + m[0].length - 1;
+    const bal = extractBalanced(src, open);
+    if (bal) out.push(src.slice(m.index, open + bal.length));
+  }
+  const reExpect = /\bexpect\s*\(/g;
+  while ((m = reExpect.exec(src)) !== null) {
+    const open = m.index + m[0].length - 1;
+    const bal = extractBalanced(src, open);
+    if (!bal) continue;
+    let snippet = src.slice(m.index, open + bal.length);
+    // Append the `.toX(...)` member chain: structurally linked to this
+    // expect call (up to `;`/newline, capped), never a free text window.
+    const tail = src.slice(open + bal.length);
+    const endOfChain = tail.search(/[;\n]/);
+    const head = (endOfChain < 0 ? tail : tail.slice(0, endOfChain)).slice(0, 160);
+    if (/^\s*\./.test(head)) snippet += head;
+    out.push(snippet);
+  }
+  return out;
+}
+
+function snippetCallsSymbol(snippet: string, symbol: string): boolean {
   const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`\\b${escaped}\\s*\\(`).test(stripStringsAndComments(window));
+  return new RegExp(`\\b${escaped}\\s*\\(`).test(stripStringsAndComments(snippet));
 }
 
-function windowCoversLiterals(window: string, literals: string[]): boolean {
+/**
+ * Numbers/booleans must appear in CODE (strings stripped — a test title
+ * like `test('total([1,2])===3', ...)` never supplies expected values).
+ * Quoted literals live inside strings, so they are matched on the raw
+ * snippet instead.
+ */
+function snippetCoversLiterals(snippet: string, literals: string[]): boolean {
+  const stripped = stripStringsAndComments(snippet);
   for (const lit of literals) {
     if (/^\d+(?:\.\d+)?$/.test(lit)) {
-      if (!new RegExp(`\\b${lit.replace('.', '\\.')}\\b`).test(window)) return false;
+      if (!new RegExp(`\\b${lit.replace('.', '\\.')}\\b`).test(stripped)) return false;
     } else if (/^(true|false|null|undefined)$/i.test(lit)) {
-      if (!new RegExp(`\\b${lit}\\b`, 'i').test(window)) return false;
-    } else if (!window.includes(lit)) {
+      if (!new RegExp(`\\b${lit}\\b`, 'i').test(stripped)) return false;
+    } else if (!snippet.includes(lit)) {
       return false;
     }
   }
   return true;
 }
 
-/** An assertion whose window really invokes `symbol(` (title strings excluded). */
-function hasAssertedCall(testContent: string, symbol: string): boolean {
-  const noComments = stripCommentsKeepStrings(testContent);
-  for (const w of assertionWindows(noComments)) {
-    if (windowHasCall(w, symbol)) return true;
+/**
+ * Exit-code harness link: `x = sym(...); ... if (x !== <lit>) process.exit(1)`
+ * (or `throw`). The variable bridges the call to the checked value, so a
+ * bare `sym(x);` next to an unrelated assert does NOT bind.
+ */
+function exitHarnessCovers(code: string, symbol: string, required: string[]): boolean {
+  if (!/\bprocess\.exit\b|\bthrow\b/.test(code)) return false;
+  const stripped = stripStringsAndComments(code);
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Direct comparison harness (`if (sym(...) === <lit>) ... process.exit(1)`).
+  // The call and literal share one ===/!==/==/!= comparison, so they are bound
+  // by construction (unlike window co-occurrence). Bare `sym();` next to an
+  // unrelated exit never counts. shortcut: single-line comparison heuristic.
+  const compOp = '(?:===|!==|==|!=)';
+  if (required.length === 0) {
+    if (new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*${compOp}`).test(stripped)) return true;
+  } else {
+    for (const lit of required) {
+      if (/^\d+(?:\.\d+)?$/.test(lit) || /^(true|false|null|undefined)$/i.test(lit)) {
+        const litRe = `\\b${lit.replace('.', '\\.')}\\b`;
+        if (
+          new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*${compOp}\\s*${litRe}`).test(stripped) ||
+          new RegExp(`${litRe}\\s*${compOp}[^;{]*\\b${escaped}\\s*\\(`).test(stripped)
+        ) {
+          return true;
+        }
+      } else if (code.includes(lit)) {
+        if (new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*${compOp}`).test(stripped)) return true;
+      }
+    }
+  }
+  const assignRe = new RegExp(`\\b([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*${escaped}\\s*\\(`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = assignRe.exec(stripped)) !== null) {
+    const v = m[1]!;
+    const vEsc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (required.length === 0) {
+      if (new RegExp(`\\b${vEsc}\\b`).test(stripped.slice(m.index))) return true;
+    } else {
+      for (const lit of required) {
+        const litRe = /^\d+(?:\.\d+)?$/.test(lit)
+          ? `\\b${lit.replace('.', '\\.')}\\b`
+          : /^(true|false|null|undefined)$/i.test(lit)
+            ? `\\b${lit}\\b`
+            : null;
+        if (litRe === null) {
+          if (code.includes(lit) && new RegExp(`\\b${vEsc}\\b`).test(stripped.slice(m.index))) return true;
+        } else if (
+          new RegExp(`\\b${vEsc}\\b[^;{]*${litRe}|${litRe}[^;{]*\\b${vEsc}\\b`).test(stripped.slice(m.index))
+        ) {
+          return true;
+        }
+      }
+    }
   }
   return false;
 }
 
-/** Bound assertion: same window calls `symbol(` and pins every required literal. */
-function hasBoundAssertion(testContent: string, symbol: string, required: string[]): boolean {
-  const noComments = stripCommentsKeepStrings(testContent);
-  for (const w of assertionWindows(noComments)) {
-    if (windowHasCall(w, symbol) && windowCoversLiterals(w, required)) return true;
+/** An assertion verb whose own arguments really invoke `symbol(`. */
+function hasAssertedCall(testContent: string, symbol: string): boolean {
+  const code = removeImportRequireLines(stripCommentsKeepStrings(testContent));
+  for (const s of assertionSnippets(code)) {
+    if (snippetCallsSymbol(s, symbol)) return true;
   }
+  if (exitHarnessCovers(code, symbol, [])) return true;
+  return false;
+}
+
+/**
+ * Bound assertion: the expected literals sit INSIDE the assert arguments
+ * that receive the `symbol(` call (or a harness variable links them), so
+ * `total([1,2]); assert.equal(3,3)` does NOT bind — the `3`s never touch
+ * the call. Mere window co-occurrence never suffices.
+ */
+function hasBoundAssertion(testContent: string, symbol: string, required: string[]): boolean {
+  const code = removeImportRequireLines(stripCommentsKeepStrings(testContent));
+  for (const s of assertionSnippets(code)) {
+    if (snippetCallsSymbol(s, symbol) && snippetCoversLiterals(s, required)) return true;
+  }
+  if (exitHarnessCovers(code, symbol, required)) return true;
   return false;
 }
 
@@ -434,6 +571,73 @@ function extractImplCandidates(implSources: string): string[] {
   return out;
 }
 
+/** Minimal def lookup: params + body of `function sym(...) {...}` or `sym = (...) => ...`. */
+function findFunctionDef(
+  implSources: string,
+  name: string,
+): { params: string[]; body: string } | null {
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const code = stripCommentsKeepStrings(implSources);
+  const fnRe = new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)`);
+  const fnM = fnRe.exec(code);
+  if (fnM) {
+    const brace = code.indexOf('{', fnM.index + fnM[0].length);
+    if (brace < 0) return null;
+    let depth = 0;
+    for (let i = brace; i < code.length; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') {
+        depth--;
+        if (depth === 0) return { params: splitParams(fnM[1] ?? ''), body: code.slice(brace + 1, i) };
+      }
+    }
+    return null;
+  }
+  const arrowRe = new RegExp(`(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s*)?\\(?([^)=;]*)\\)?\\s*=>\\s*`);
+  const arrowM = arrowRe.exec(code);
+  if (arrowM) {
+    const bodyStart = arrowM.index + arrowM[0].length;
+    if (code[bodyStart] === '{') {
+      let depth = 0;
+      for (let i = bodyStart; i < code.length; i++) {
+        if (code[i] === '{') depth++;
+        else if (code[i] === '}') {
+          depth--;
+          if (depth === 0) return { params: splitParams(arrowM[1] ?? ''), body: code.slice(bodyStart + 1, i) };
+        }
+      }
+      return null;
+    }
+    const semi = code.indexOf(';', bodyStart);
+    const nl = code.indexOf('\n', bodyStart);
+    const end = semi < 0 ? (nl < 0 ? code.length : nl) : nl < 0 ? semi : Math.min(semi, nl);
+    return { params: splitParams(arrowM[1] ?? ''), body: code.slice(bodyStart, end) };
+  }
+  return null;
+}
+
+function splitParams(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((p) => p.trim().match(/^[A-Za-z_][A-Za-z0-9_]*/)?.[0] ?? '')
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * True when the defined function never references any of its own params
+ * (e.g. `total(xs) { return 0; }`): it cannot compute anything from its
+ * inputs, so an asserted call passing only on a trivial case (empty input
+ * matching a constant) proves nothing about the requirement. Static-only
+ * heuristic — a model reviewer would confirm; uncertainty is recorded in
+ * the diagnostic, never a promise of perfection.
+ */
+function isVacuousImpl(implSources: string, name: string): boolean {
+  const def = findFunctionDef(implSources, name);
+  if (!def || def.params.length === 0) return false;
+  const stripped = stripStringsAndComments(def.body);
+  return !def.params.some((p) => new RegExp(`\\b${p}\\b`).test(stripped));
+}
+
 export interface FunctionalCoverage {
   covered: boolean;
   reason: string;
@@ -449,7 +653,10 @@ export interface FunctionalCoverage {
  *      literals from the criterion (bare `f(x);` without assert fails;
  *      `assert(f([]),0)` does not cover `f([1,2])===3`), OR
  *  2b. behavioural NL requirements (no code refs): some implementation
- *      candidate is asserted through a call (no vocabulary obligation).
+ *      candidate is asserted through a call whose assert-verb arguments
+ *      receive the call — and the implementation is not vacuous (it must
+ *      use its inputs; a constant body proved only by a trivial-case
+ *      assert demonstrates nothing). No vocabulary obligation.
  * Diagnostics name whether the implementation or the tests must change —
  * never "print the anchor".
  */
@@ -473,11 +680,32 @@ export function assessFunctionalCoverage(
       reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no passing test execution observed in product-run output`,
     };
   }
+  // Path-like anchors name the file whose execution should demonstrate the
+  // requirement — a scope hint, not coverage and not a veto. Resolve each
+  // anchor against examined content (execution itself is proven by the pass
+  // signal above + the asserted test the normal judgment requires below);
+  // only fail when the file is absent from scope. When present, fall through
+  // to the normal judgment (code-ref with bound assertion / behavioural),
+  // which alone decides coverage.
+  // shortcut: exact/suffix/dir-prefix match on the whole anchor OR any
+  // embedded path token — upgrade if anchors need globs.
   if (requirement.testAnchors.length > 0 && requirement.testAnchors.every(isPathLikeAnchor)) {
-    return {
-      covered: false,
-      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): test anchor is a file name, not observed behaviour — add a test that calls the implementation and asserts the expected outcome`,
-    };
+    const unresolved = requirement.testAnchors.filter((a) => {
+      const t = a.trim();
+      // Auto-generated criteria embed the file in a prose line ("X covered
+      // in f.test.mjs"): extract path-looking substrings (token ending in a
+      // source extension, with or without directory) and match ANY of them.
+      const embedded = [...t.matchAll(/[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.(mjs|cjs|mts|cts|tsx|ts|jsx|js|cpp|c|h|py|go|rs|java|rb|php)\b/g)].map((m) => m[0]);
+      return ![t, ...embedded].some((c) =>
+        paths.some((p) => p === c || p.endsWith(`/${c}`) || p.startsWith(c.endsWith('/') ? c : `${c}/`)),
+      );
+    });
+    if (unresolved.length > 0) {
+      return {
+        covered: false,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): test anchor file ${unresolved.join('/')} not in scope — no examined content matches it (fail-closed: the named test was not part of the reviewed candidate)`,
+      };
+    }
   }
   const explicit = (opts?.testPaths ?? []).filter((p) => p in contents);
   const testPool = explicit.length > 0 ? explicit : paths.filter((p) => isTestPath(p));
@@ -493,14 +721,31 @@ export function assessFunctionalCoverage(
   const fullText = `${requirement.description} ${requirement.testAnchors.join(' ')}`;
 
   // 2b. Behavioural NL: no code refs — link any asserted implementation call.
+  // A vacuous implementation (ignores its own inputs) never demonstrates a
+  // behavioural requirement, even when a trivial-case assert passes.
   if (!hasCodeReferences(fullText)) {
     const candidates = extractImplCandidates(implSources);
+    const vacuous: string[] = [];
     for (const cand of candidates) {
+      let asserted = false;
       for (const tp of testPool) {
         if (hasAssertedCall(contents[tp] ?? '', cand)) {
-          return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${cand}()` };
+          asserted = true;
+          break;
         }
       }
+      if (!asserted) continue;
+      if (isVacuousImpl(implSources, cand)) {
+        if (!vacuous.some((s) => s.toLowerCase() === cand.toLowerCase())) vacuous.push(cand);
+        continue;
+      }
+      return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${testPool.find((tp) => hasAssertedCall(contents[tp] ?? '', cand))} asserts ${cand}()` };
+    }
+    if (vacuous.length > 0) {
+      return {
+        covered: false,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation ${vacuous.join('/')}() ignores its inputs so a passing trivial-case assert proves nothing about the requirement (static heuristic, not a proof — a model reviewer would confirm) — fix the implementation to compute from its inputs`,
+      };
     }
     return {
       covered: false,
@@ -670,9 +915,23 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
 /**
  * An approval taken on oldBaseHead never auto-applies after the base
  * moves (merge or new main). True = must re-review.
+ *
+ * Same-commit comparison is prefix-bidirectional (same normalization as
+ * merge-train isSameCommit, duplicated minimal): the same commit in
+ * different formats (short prefix vs full 40-char SHA) is the SAME base,
+ * never a move. Minimum 4 chars: git never resolves a shorter prefix.
  */
+function isSameCommit(a: string, b: string): boolean {
+  const x = a.trim();
+  const y = b.trim();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (Math.min(x.length, y.length) < 4) return false;
+  return x.startsWith(y) || y.startsWith(x);
+}
+
 export function needsReReview(approvedBaseHead: string, currentBaseHead: string): boolean {
-  return approvedBaseHead !== currentBaseHead;
+  return !isSameCommit(approvedBaseHead, currentBaseHead);
 }
 
 /**

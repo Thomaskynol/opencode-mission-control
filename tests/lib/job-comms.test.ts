@@ -144,7 +144,7 @@ describe('JobComms', () => {
 
   describe('deliverMessages', () => {
     beforeEach(() => {
-      spyOn(configMod, 'loadConfig').mockResolvedValue({ serverPassword: undefined } as any);
+      spyOn(configMod, 'loadConfig').mockResolvedValue({ serverPassword: 'test-pw' } as any);
     });
 
     it('delivers messages to the remote worker session via v2 and clears queue', async () => {
@@ -163,7 +163,7 @@ describe('JobComms', () => {
       const delivered = await comms.deliverMessages(job);
 
       expect(delivered).toBe(1);
-      expect(waitSpy).toHaveBeenCalledWith(14100, { timeoutMs: 5000, password: undefined });
+      expect(waitSpy).toHaveBeenCalledWith(14100, { timeoutMs: 5000, password: 'test-pw' });
       expect(sendSpy).toHaveBeenCalledTimes(1);
       expect(sendSpy).toHaveBeenCalledWith(
         v2Client,

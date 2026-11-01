@@ -9,6 +9,8 @@ import { isLive, ownedName, uniqueName, isOwnedMcSession } from '../helpers/test
 
 // Live tmux is explicit opt-in (TEST_LIVE=1). Without it, live cases skip and
 // only pure ownership/naming checks run — no existing session is ever touched.
+// Sole exception: isTmuxHealthy() issues one read-only `tmux list-sessions`
+// probe (never kill/create); documented at the test, not gated.
 const live = isLive();
 const hasTmux = live && (await isTmuxHealthy());
 const tmuxIt = hasTmux ? it : it.skip;
@@ -96,7 +98,11 @@ describe('isPaneRunning test isolation (pure, no tmux needed)', () => {
     expect(b.startsWith('mc-test-pane-running-')).toBe(true);
   });
 
-  it('isTmuxHealthy returns a boolean without side effects', async () => {
+  it('isTmuxHealthy issues one read-only probe with no side effects', async () => {
+    // Read-only exception to the TEST_LIVE gate, documented explicitly: this
+    // calls `tmux list-sessions` (isTmuxHealthy, tmux.ts) which only queries
+    // the server and never creates, kills, or touches any session/pane. When
+    // tmux is absent it returns false without spawning anything persistent.
     const result = await isTmuxHealthy();
     expect(typeof result).toBe('boolean');
   });

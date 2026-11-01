@@ -79,6 +79,13 @@ mock.module('../../src/lib/job-state', () => {
     // them for sidecar reconcile). Passthrough: workflow state is current.
     migrateJobState: vi.fn((state: Record<string, unknown>) => state),
     migrateV2ToV3: vi.fn((state: Record<string, unknown>) => state),
+    // Password helper mirrors the real module surface: persisted
+    // per-worker credential first, config fallback second.
+    resolveJobPassword: vi.fn((job: { serverPassword?: string }, configured?: string) => {
+      if (job.serverPassword) return job.serverPassword;
+      const trimmed = configured?.trim();
+      return trimmed ? trimmed : undefined;
+    }),
     // Expose for test cleanup
     _resetJobs: () => {
       jobs = [];
@@ -127,6 +134,8 @@ mock.module('../../src/lib/config', () => ({
     pollInterval: 10000,
     idleThreshold: 300000,
     worktreeBasePath: '/tmp/mc-worktrees',
+    // TUI intent: this suite probes workflows, not serve routing.
+    useServeMode: false,
     omo: { enabled: false, defaultMode: 'vanilla' },
   })),
 }));
@@ -151,6 +160,8 @@ mock.module('../../src/lib/prompt-file', () => ({
   writeLauncherScript: vi.fn(async (worktreePath: string) => `${worktreePath}/.mc-launch.sh`),
   writeServeLauncherScript: vi.fn(async (worktreePath: string) => `${worktreePath}/.mc-launch.sh`),
   cleanupLauncherScript: vi.fn(() => {}),
+  describeTuiModelPin: vi.fn(() => ({ pinned: false, mechanism: 'none', blockade: 'mocked' })),
+  TUI_MODEL_BLOCKADE: 'mocked',
 }));
 
 mock.module('../../src/lib/worktree-setup', () => ({
@@ -246,6 +257,7 @@ describe('Workflow 1: Basic lifecycle (Launch -> Status -> Capture -> Kill -> Cl
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
+      useServeMode: false,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
     (worktree.isInManagedWorktree as Mock).mockResolvedValue({
@@ -426,6 +438,7 @@ describe('Workflow 2: OMO mode launch with plans', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
+      useServeMode: false,
       omo: { enabled: true, defaultMode: 'plan' },
     });
   });
@@ -608,6 +621,7 @@ describe('Workflow 3: Launch -> PR -> Cleanup', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
+      useServeMode: false,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
   });
@@ -735,6 +749,7 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
+      useServeMode: false,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
     (worktree.isInManagedWorktree as Mock).mockResolvedValue({

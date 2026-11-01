@@ -1,19 +1,19 @@
 import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
-import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth } from './plan-state';
+import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, withPlanLock } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type TestEvidence } from './reviewer';
 import { getBranchHead, listChangedFiles } from './git';
-import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, type Job } from './job-state';
+import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, resolveJobPassword, type Job } from './job-state';
 import { JobMonitor } from './monitor';
 import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
 import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
-import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, describeTuiModelPin } from './prompt-file';
+import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, resolveServePassword, describeTuiModelPin } from './prompt-file';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 import { detectOMO } from './omo';
 import { copyPlansToWorktree } from './plan-copier';
@@ -36,7 +36,7 @@ import {
   sessionNameForJob,
 } from './tmux';
 import { JobComms, type RelayContext } from './job-comms';
-import { createV2Client, v2ForkSession, v2Prompt, launchWorkerViaServe, v2WaitForServer, type V2ModelRef } from './sdk-client';
+import { createV2Client, v2ForkSession, v2Prompt, v2RunCommand, launchWorkerViaServe, v2WaitForServer, type V2ModelRef } from './sdk-client';
 import { allocatePort, releasePort } from './port-allocator';
 import { buildWorktreePermissions } from './permission-policy';
 import {
@@ -101,40 +101,53 @@ export function modelRefToCliString(ref: V2ModelRef): string {
 
 /**
  * §4 TOCTOU identity: outputs the test runner may legitimately produce.
- * These paths never prove an impl/test mutation — they are ignored for the
- * dirty/content-mutation check, never confused with source changes.
- * Anything else showing up in `git status --porcelain` after the test is a
- * mutation of the candidate and refuses attribution to the pre-test commit.
+ * Coverage/tmp/logs are always ignored. dist/build are NOT a global ignore:
+ * only untracked generated outputs (status `??`, never versioned) are
+ * permitted there — a versioned source under dist/ that changes (worktree or
+ * staged `git add`) is relevant and blocks attribution. This keeps the common
+ * persistent-mutation test green without blocking normal builds (untracked
+ * coverage/dist outputs stay allowed).
  */
 export const ALLOWED_TEST_ARTIFACT_PATTERNS: RegExp[] = [
   /^coverage\//,
   /^\.nyc_output\//,
-  /^dist\//,
-  /^build\//,
   /^tmp\//,
   /^\.coverage/,
   /\.lcov$/,
   /\.log$/,
 ];
 
-/** True when a repo-relative path is a permitted test artifact (coverage/dist). */
+/** True when a repo-relative path is a permitted test artifact (coverage/tmp/logs). */
 export function isAllowedTestArtifact(relPath: string): boolean {
   const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^"+|"+$/g, '').trim();
   if (!normalized) return false;
   return ALLOWED_TEST_ARTIFACT_PATTERNS.some((re) => re.test(normalized));
 }
 
+/** True for generated outputs under dist/build that were never versioned. */
+function isUntrackedDistBuildOutput(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').replace(/^\.\//, '').trim();
+  return /^(dist|build)\//.test(normalized);
+}
+
 /** Parse `git status --porcelain` into repo-relative paths (rename-aware). */
 export function parsePorcelainDirtyPaths(porcelain: string): string[] {
-  const out: string[] = [];
+  return parsePorcelainEntries(porcelain).map((e) => e.path);
+}
+
+/** Parse porcelain into status-aware entries (untracked vs tracked change). */
+export function parsePorcelainEntries(porcelain: string): Array<{ status: string; path: string }> {
+  const out: Array<{ status: string; path: string }> = [];
   for (const line of porcelain.split('\n')) {
     if (!line.trim()) continue;
+    const rawStatus = line.slice(0, 2);
+    const status = rawStatus.trim();
     const m = line.match(/^.{2}\s+(.*)$/);
     const raw = (m ? m[1] : line.trim()).trim().replace(/^"+|"+$/g, '');
     if (!raw) continue;
     const arrow = raw.indexOf(' -> ');
     const p = (arrow >= 0 ? raw.slice(arrow + 4) : raw).trim().replace(/^"+|"+$/g, '');
-    if (p) out.push(p);
+    if (p) out.push({ status, path: p });
   }
   return out;
 }
@@ -142,6 +155,18 @@ export function parsePorcelainDirtyPaths(porcelain: string): string[] {
 /** Dirty paths that are NOT permitted artifacts — the identity-relevant set. */
 export function filterRelevantDirtyPaths(paths: string[]): string[] {
   return paths.filter((p) => !isAllowedTestArtifact(p));
+}
+
+/** Status-aware filter: untracked dist/build outputs stay permitted, tracked changes block. */
+export function filterRelevantDirtyEntries(entries: Array<{ status: string; path: string }>): string[] {
+  const out: string[] = [];
+  for (const e of entries) {
+    if (isAllowedTestArtifact(e.path)) continue;
+    const untracked = e.status === '??' || e.status.includes('?');
+    if (untracked && isUntrackedDistBuildOutput(e.path)) continue;
+    out.push(e.path);
+  }
+  return out;
 }
 
 /** Stable hash of the scope contents read for review (sorted keys + values). */
@@ -177,11 +202,10 @@ export function hasRelevantContentChange(
  * TUI is legacy only — used when `useServeMode === false` explicitly, and
  * always with an explicit unpinned warning (never silently to satisfy the
  * model contract).
- * shortcut: unit fakes that omit useServeMode stay on TUI for backward compat;
- * upgrade to default-serve (`!== false`) once fakes mock the serve helpers.
+ * Default-serve (alinha com tools/launch.ts): ausente === serve.
  */
 export function shouldUseServeMode(config: { useServeMode?: boolean }): boolean {
-  return config.useServeMode === true;
+  return config.useServeMode !== false;
 }
 
 /**
@@ -831,10 +855,11 @@ export class Orchestrator {
     const head = headRes.exitCode === 0 && headRes.stdout.trim() !== '' ? headRes.stdout.trim() : null;
     const statusRes = await gitCommand(['-C', dir, 'status', '--porcelain']);
     // Fail-closed: an unreadable status is treated as dirty, never as clean.
-    // §4: permitted test outputs (coverage/dist) are filtered — they never
-    // prove an impl/test mutation and never block attribution by themselves.
+    // §4: permitted outputs (coverage/tmp/logs + untracked dist/build) are
+    // filtered — they never prove an impl/test mutation. Versioned dist/build
+    // changes (worktree or staged) stay relevant and block attribution.
     if (statusRes.exitCode !== 0) return { head, dirty: true };
-    const dirtyPaths = filterRelevantDirtyPaths(parsePorcelainDirtyPaths(statusRes.stdout));
+    const dirtyPaths = filterRelevantDirtyEntries(parsePorcelainEntries(statusRes.stdout));
     return { head, dirty: dirtyPaths.length > 0, dirtyPaths };
   }
 
@@ -1120,6 +1145,7 @@ export class Orchestrator {
       `1. Fix the implementation and/or tests on this branch per the diagnosis above so every requirement is exercised by a test assertion that calls the implementation (a matching test name alone is not coverage).`,
       `2. Do NOT weaken tests to force approval: if a previous test was wrong, record why in the commit message.`,
       `3. Commit your corrections and report completion.`,
+      `4. Reporting is NOT optional: call the mc_report tool when you start (status: "working"), at milestones (status: "progress"), and when done (status: "completed" with the test output). Without mc_report the run cannot complete.`,
     ].join('\n');
   }
 
@@ -1526,7 +1552,8 @@ export class Orchestrator {
           dispatchedThisPass.add(key);
           // F03: use the coordinator-calculated prompt (not a stale job.prompt).
           if (req.prompt) current.prompt = req.prompt;
-          await this.launchJob(current);
+          const ok = await this.launchJob(current);
+          if (ok === false) return { sessionID: '' };
           current.status = 'running';
           this.coordinatedJobs.add(key);
           return { sessionID: `coord-${plan.id.slice(0, 8)}-${req.job.name}` };
@@ -1727,6 +1754,12 @@ export class Orchestrator {
     this.coordinatedJobs.clear();
     this.planPlacement = spec.placement ?? null;
     this.planLaunchSessionID = spec.launchSessionID;
+    // Conductor lease on boot: this driver proves assumption (sonda 13).
+    // Best-effort so unit fakes without state dir keep working; the public
+    // handoff re-reads the lease and fails closed when absent.
+    try {
+      await claimConductorLease(plan.id, process.pid, `start plan ${plan.id}`, 'orchestrator-start', repoRoot);
+    } catch {}
     this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
     this.subscribeToMonitorEvents();
     this.ensureMonitorRunning();
@@ -1902,7 +1935,8 @@ export class Orchestrator {
           continue;
         }
 
-        await this.launchJob(job);
+        const dispatched = await this.launchJob(job);
+        if (dispatched === false) continue;
         runningCount += 1;
         launchedThisCycle += 1;
         job.status = 'running';
@@ -2360,7 +2394,7 @@ export class Orchestrator {
     });
   }
 
-  private async launchJob(job: JobSpec): Promise<void> {
+  private async launchJob(job: JobSpec): Promise<boolean> {
     const planId = this.activePlanId;
     if (!planId) {
       throw new Error('No active plan for job launch');
@@ -2371,15 +2405,14 @@ export class Orchestrator {
     const branch = job.branch ?? `mc/plan/${shortPlanId}/${job.name}`;
     const mode = job.mode ?? this.config.omo?.defaultMode ?? 'vanilla';
     const sanitizedName = job.name.replace(/[^a-zA-Z0-9_-]/g, '-');
-    // §7: per-execution identity for the serve path (same as relaunch).
-    // TUI legacy keeps the bare name for backward compat with unit fakes;
-    // serve scopes by execTag so parallel runs never collide.
+    // §7 + sonda 15: per-execution identity (serve AND TUI share the execTag
+    // scope so parallel runs never collide by bare name).
     const useServe = shouldUseServeMode(this.config as { useServeMode?: boolean });
     const execTag = job.id ? formatExecTag(planId, job.id) : shortPlanId;
-    const tmuxSessionName = useServe && execTag
+    const tmuxSessionName = execTag
       ? sessionNameForJob(sanitizedName, execTag)
       : `mc-${sanitizedName}`;
-    const windowName = useServe && execTag ? `${sanitizedName}-${execTag}` : sanitizedName;
+    const windowName = execTag ? `${sanitizedName}-${execTag}` : sanitizedName;
     const tmuxTarget =
       placement === 'session'
         ? tmuxSessionName
@@ -2391,11 +2424,58 @@ export class Orchestrator {
             return `${currentSession}:${windowName}`;
           })();
 
-    await updatePlanJob(planId, job.name, { status: 'running', branch }, undefined, this.effectiveRepoRoot());
+    // Sonda 15: atomic dispatch claim BEFORE any resource exists. Loser aborts
+    // without creating/killing anything (no tmux, no worktree, no prompt).
+    const repoRoot = this.effectiveRepoRoot();
+    const owner = this.planLaunchSessionID ?? `orchestrator-${process.pid}`;
+    try {
+      const claim = await claimJobForDispatch(planId, job.name, owner, repoRoot);
+      if (!claim.ok) {
+        if (claim.status === 'waiting_deps') {
+          // waiting_deps is a legitimate dispatch state once deps are merged:
+          // claim it atomically under the plan lock (same exclusivity).
+          const won = await withPlanLock(async () => {
+            const live = await loadPlan(repoRoot);
+            const cur = live?.jobs.find((j) => j.name === job.name || j.id === job.id);
+            if (!live || live.id !== planId || !cur) return false;
+            if (cur.status !== 'waiting_deps') return false;
+            cur.status = 'running';
+            // Persist via updatePlanJob path (same lock re-entry is safe:
+            // withFileLock serializes, nested call would deadlock — so write
+            // directly here through the already-held lock).
+            const { atomicWrite } = await import('./utils');
+            const { join } = await import('path');
+            const { getDataDir } = await import('./paths');
+            const filePath = join(await getDataDir(repoRoot), 'plan.json');
+            await atomicWrite(filePath, JSON.stringify(live, null, 2));
+            return true;
+          }, repoRoot).catch(() => false);
+          if (!won) return false;
+        } else {
+          return false;
+        }
+      }
+    } catch (e) {
+      // Claim itself failed (no plan / unknown job): fail-closed without
+      // creating anything; mark failed so the run never sticks queued.
+      const msg = e instanceof Error ? e.message : String(e);
+      // Already running means another driver won — quiet abort, no kill.
+      if (/already|running/i.test(msg) && !/no active plan|not found|mismatch/i.test(msg)) return false;
+      await updatePlanJob(planId, job.name, {
+        status: 'failed',
+        error: `dispatch claim failed: ${msg}`,
+      }, { force: true }, repoRoot).catch(() => {});
+      return false;
+    }
 
     let worktreePath = '';
     let promptFilePath: string | undefined;
     let servePort: number | undefined;
+    let servePassword: string | undefined;
+    let createdTmuxTarget: string | undefined;
+    // §8: register BEFORE the prompt so mc_report never sees "No active job".
+    const jobId = randomUUID();
+    let registered = false;
     try {
       const postCreate = resolvePostCreateHook(
         this.config.worktreeSetup,
@@ -2462,14 +2542,56 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const effective = this.ensureEffectiveModel();
       let serveUrl: string | undefined;
       let serveRemoteSessionID: string | undefined;
+      let modelRequested: V2ModelRef | undefined;
+      let modelObserved: V2ModelRef | undefined;
+
+      // §8 registro antes do prompt: o worker existe no job-state antes de
+      // poder reportar (addJob + updatePlanJob com running antes do launcher).
+      const existingState = await loadJobState();
+      const staleJobs = existingState.jobs.filter(
+        (j) => j.name === job.name && j.status !== 'running',
+      );
+      for (const stale of staleJobs) {
+        await removeReport(stale.id).catch(() => {});
+        await removeJob(stale.id).catch(() => {});
+      }
+      await addJob({
+        id: jobId,
+        name: job.name,
+        worktreePath,
+        branch,
+        tmuxTarget,
+        placement,
+        status: 'running',
+        prompt: job.prompt,
+        mode,
+        createdAt: new Date().toISOString(),
+        planId,
+        launchSessionID: this.planLaunchSessionID,
+      });
+      registered = true;
+      await updatePlanJob(planId, job.name, {
+        status: 'running',
+        branch,
+        worktreePath,
+        tmuxTarget,
+      }, undefined, this.effectiveRepoRoot());
+
       if (useServe) {
         const activeJobs = await getRunningJobs().catch(() => []);
         servePort = await allocatePort(this.config, activeJobs);
         serveUrl = `http://127.0.0.1:${servePort}`;
+        // Per-worker credential resolved BEFORE creating the session:
+        // serve ALWAYS requires auth, so without this the wait below
+        // could never succeed. Same value feeds launcher env + client,
+        // and is persisted on the job below so reconnects reuse it.
+        servePassword = resolveServePassword(
+          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+        );
         const serveLauncherPath = await writeServeLauncherScript(
           worktreePath,
           servePort,
-          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+          servePassword,
         );
         const { quoteShellPath } = await import('./sdk-client');
         const initialServeCommand = `bash ${quoteShellPath(serveLauncherPath)}`;
@@ -2478,19 +2600,49 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         } else {
           await createWindow({ session: getCurrentSession()!, name: windowName, workdir: worktreePath, command: initialServeCommand });
         }
+        createdTmuxTarget = tmuxTarget;
         await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
         cleanupLauncherScript(worktreePath);
         const client = await v2WaitForServer(servePort, {
-          password: (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+          password: servePassword,
         });
+        const agentOpt = (job as unknown as { agent?: string }).agent;
         const worker = await launchWorkerViaServe(client, {
           worktree: worktreePath,
           prompt: jobPrompt,
           model: { ...effective },
-          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          profile: {
+            permissions: buildWorktreePermissions(worktreePath),
+            title: job.name,
+            ...(agentOpt ? { agent: agentOpt } : {}),
+          },
           tmuxTarget,
         });
+        // §5 fail-closed: sem pin observado nunca é sucesso silencioso.
+        if (!worker.observedModel) {
+          throw new Error(
+            `[MC] serve worker without observed model pin — requested ${effective.providerID}/${effective.id} but server reported none. Fail-closed, never TUI silent.`,
+          );
+        }
         serveRemoteSessionID = worker.sessionId;
+        modelRequested = worker.requestedModel ? { ...worker.requestedModel } : { ...effective };
+        modelObserved = worker.observedModel ? { ...worker.observedModel } : undefined;
+        // §5 perfil serve: /start-work via comando serve-nativo (sem sendKeys).
+        if (mode === 'plan') {
+          try {
+            await v2RunCommand(client, worker.sessionId, '/start-work', '');
+          } catch {
+            // Best-effort: o prompt já orienta; falha do comando não invalida o pin.
+          }
+        }
+        await updateJob(jobId, {
+          ...(servePort !== undefined ? { port: servePort } : {}),
+          ...(serveUrl !== undefined ? { serverUrl: serveUrl } : {}),
+          ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
+          ...(servePassword !== undefined ? { serverPassword: servePassword } : {}),
+          ...(modelRequested ? { modelRequested: { ...modelRequested } } : {}),
+          ...(modelObserved ? { modelObserved: { ...modelObserved } } : {}),
+        }).catch(() => {});
       } else {
         const pin = describeTuiModelPin(effective);
         console.warn(`[MC] TUI launcher (unpinned model): requested ${pin.requested ?? 'none'} — ${pin.blockade}`);
@@ -2513,6 +2665,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
             command: initialCommand,
           });
         }
+        createdTmuxTarget = tmuxTarget;
 
         await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
         cleanupPromptFile(promptFilePath);
@@ -2541,34 +2694,6 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         }
       }
 
-      const existingState = await loadJobState();
-      const staleJobs = existingState.jobs.filter(
-        (j) => j.name === job.name && j.status !== 'running',
-      );
-      for (const stale of staleJobs) {
-        await removeReport(stale.id).catch(() => {});
-        await removeJob(stale.id).catch(() => {});
-      }
-
-      const jobId = randomUUID();
-      await addJob({
-        id: jobId,
-        name: job.name,
-        worktreePath,
-        branch,
-        tmuxTarget,
-        placement,
-        status: 'running',
-        prompt: job.prompt,
-        mode,
-        createdAt: new Date().toISOString(),
-        planId,
-        launchSessionID: this.planLaunchSessionID,
-        ...(servePort !== undefined ? { port: servePort } : {}),
-        ...(serveUrl !== undefined ? { serverUrl: serveUrl } : {}),
-        ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
-      });
-
       await updatePlanJob(planId, job.name, {
         status: 'running',
         branch,
@@ -2577,7 +2702,15 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         ...(servePort !== undefined ? { port: servePort } : {}),
         ...(serveUrl !== undefined ? { serverUrl: serveUrl } : {}),
         ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
-      });
+        ...(servePassword !== undefined ? { serverPassword: servePassword } : {}),
+      }, undefined, this.effectiveRepoRoot());
+      if (serveRemoteSessionID || modelRequested || modelObserved) {
+        // Persistir pin no JobSpec quando o schema permitir (best-effort).
+        await updatePlanJob(planId, job.name, {
+          ...(serveRemoteSessionID !== undefined ? { remoteSessionID: serveRemoteSessionID } : {}),
+        } as Partial<JobSpec>, undefined, this.effectiveRepoRoot()).catch(() => {});
+      }
+      return true;
     } catch (error) {
       if (promptFilePath) {
         cleanupPromptFile(promptFilePath, 0);
@@ -2586,19 +2719,30 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         await releasePort(servePort).catch(() => {});
       }
 
+      // §7 catch guard: só killar o que ESTA chamada criou (flag
+      // createdTmuxTarget + filtro de posse). Falha antes de createSession
+      // nunca mata homônima.
       try {
-        if (placement === 'session') {
-          await killSession(tmuxSessionName);
-        } else {
-          const [session, window] = tmuxTarget.split(':');
-          if (session && window) {
-            await killWindow(session, window);
+        if (createdTmuxTarget) {
+          const owned = filterOwnedKillTargets([createdTmuxTarget], createdTmuxTarget);
+          for (const cand of owned) {
+            if (placement === 'session') {
+              await killSession(cand);
+            } else {
+              const [session, window] = cand.split(':');
+              if (session && window) {
+                await killWindow(session, window);
+              }
+            }
           }
         }
       } catch {}
 
       if (worktreePath) {
         await this.removeJobWorktree(worktreePath, true).catch(() => {});
+      }
+      if (registered) {
+        await removeJob(jobId).catch(() => {});
       }
 
       // Recovery: the job never left queued/waiting_deps (no worktree yet),
@@ -2608,6 +2752,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         status: 'failed',
         error: error instanceof Error ? error.message : String(error),
       }, { force: true }, this.effectiveRepoRoot());
+      return true;
     }
   }
 
@@ -2729,18 +2874,19 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     const worktreePath = job.worktreePath;
     let promptFilePath: string | undefined;
     let relaunchPort: number | undefined;
+    let createdRelaunchTarget: string | undefined;
 
     // Never silently reuse a dirty worktree: checkpoint visible (add+commit)
     // so the correction starts from a recorded state. Refuse when the
-    // checkpoint itself fails. §4: permitted test artifacts (coverage/dist)
-    // never force a checkpoint — only relevant mutations do.
+    // checkpoint itself fails. §4: permitted outputs (coverage + untracked
+    // dist/build) never force a checkpoint — only relevant mutations do.
     const dirtyProbe = await gitCommand(['-C', worktreePath, 'status', '--porcelain']);
     if (dirtyProbe.exitCode !== 0) {
       throw new Error(
         `Cannot relaunch correction for job "${jobName}": cannot inspect worktree (${dirtyProbe.stderr || 'unknown'}) — refusing to reuse an unknown tree state`,
       );
     }
-    if (filterRelevantDirtyPaths(parsePorcelainDirtyPaths(dirtyProbe.stdout)).length > 0) {
+    if (filterRelevantDirtyEntries(parsePorcelainEntries(dirtyProbe.stdout)).length > 0) {
       const addRes = await gitCommand(['-C', worktreePath, 'add', '-A']);
       if (addRes.exitCode !== 0) {
         throw new Error(
@@ -2764,15 +2910,21 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const useServeRelaunch = shouldUseServeMode(this.config as { useServeMode?: boolean });
       const effectiveRelaunch = this.ensureEffectiveModel();
       let relaunchUrl: string | undefined;
+      let relaunchPassword: string | undefined;
       let relaunchRemoteSessionID: string | undefined;
+      let relaunchRequested: V2ModelRef | undefined;
+      let relaunchObserved: V2ModelRef | undefined;
       if (useServeRelaunch) {
         const activeJobs = await getRunningJobs().catch(() => []);
         relaunchPort = await allocatePort(this.config, activeJobs);
         relaunchUrl = `http://127.0.0.1:${relaunchPort}`;
+        relaunchPassword = resolveServePassword(
+          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+        );
         const serveLauncherPath = await writeServeLauncherScript(
           worktreePath,
           relaunchPort,
-          (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+          relaunchPassword,
         );
         const { quoteShellPath } = await import('./sdk-client');
         const initialServeCommand = `bash ${quoteShellPath(serveLauncherPath)}`;
@@ -2781,19 +2933,37 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         } else {
           await createWindow({ session: getCurrentSession()!, name: windowName, workdir: worktreePath, command: initialServeCommand });
         }
+        createdRelaunchTarget = tmuxTarget;
         await setPaneDiedHook(tmuxTarget, `run-shell "echo '${job.id}' >> .mission-control/completed-jobs.log"`);
         cleanupLauncherScript(worktreePath);
         const client = await v2WaitForServer(relaunchPort, {
-          password: (this.config as MCConfig & { serverPassword?: string }).serverPassword,
+          password: relaunchPassword,
         });
+        const agentOpt = (job as unknown as { agent?: string }).agent;
         const worker = await launchWorkerViaServe(client, {
           worktree: worktreePath,
           prompt: fullPrompt,
           model: { ...effectiveRelaunch },
-          profile: { permissions: buildWorktreePermissions(worktreePath) },
+          profile: {
+            permissions: buildWorktreePermissions(worktreePath),
+            title: job.name,
+            ...(agentOpt ? { agent: agentOpt } : {}),
+          },
           tmuxTarget,
         });
+        if (!worker.observedModel) {
+          throw new Error(
+            `[MC] serve relaunch without observed model pin — fail-closed, never TUI silent.`,
+          );
+        }
         relaunchRemoteSessionID = worker.sessionId;
+        relaunchRequested = worker.requestedModel ? { ...worker.requestedModel } : { ...effectiveRelaunch };
+        relaunchObserved = worker.observedModel ? { ...worker.observedModel } : undefined;
+        if (mode === 'plan') {
+          try {
+            await v2RunCommand(client, worker.sessionId, '/start-work', '');
+          } catch {}
+        }
       } else {
         const pin = describeTuiModelPin(effectiveRelaunch);
         console.warn(`[MC] TUI relaunch (unpinned model): requested ${pin.requested ?? 'none'} — ${pin.blockade}`);
@@ -2869,7 +3039,10 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         launchSessionID: this.planLaunchSessionID,
         ...(relaunchPort !== undefined ? { port: relaunchPort } : {}),
         ...(relaunchUrl !== undefined ? { serverUrl: relaunchUrl } : {}),
+        ...(relaunchPassword !== undefined ? { serverPassword: relaunchPassword } : {}),
         ...(relaunchRemoteSessionID !== undefined ? { remoteSessionID: relaunchRemoteSessionID } : {}),
+        ...(relaunchRequested ? { modelRequested: { ...relaunchRequested } } : {}),
+        ...(relaunchObserved ? { modelObserved: { ...relaunchObserved } } : {}),
       });
 
       await updatePlanJob(plan.id, job.name, {
@@ -2878,6 +3051,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         error: undefined,
         ...(relaunchPort !== undefined ? { port: relaunchPort } : {}),
         ...(relaunchUrl !== undefined ? { serverUrl: relaunchUrl } : {}),
+        ...(relaunchPassword !== undefined ? { serverPassword: relaunchPassword } : {}),
         ...(relaunchRemoteSessionID !== undefined ? { remoteSessionID: relaunchRemoteSessionID } : {}),
       });
     } catch (error) {
@@ -2888,13 +3062,19 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         await releasePort(relaunchPort).catch(() => {});
       }
 
+      // §7 catch guard (relaunch): só killar o que ESTA chamada criou.
       try {
-        if (placement === 'session') {
-          await killSession(tmuxSessionName);
-        } else {
-          const [session, window] = tmuxTarget.split(':');
-          if (session && window) {
-            await killWindow(session, window);
+        if (typeof createdRelaunchTarget === 'string' && createdRelaunchTarget) {
+          const owned = filterOwnedKillTargets([createdRelaunchTarget], createdRelaunchTarget);
+          for (const cand of owned) {
+            if (placement === 'session') {
+              await killSession(cand);
+            } else {
+              const [session, window] = cand.split(':');
+              if (session && window) {
+                await killWindow(session, window);
+              }
+            }
           }
         }
       } catch {}
@@ -2917,37 +3097,115 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     const planId = job.planId;
     (async () => {
+      // Idempotency guard: 'completed' is only reachable from 'running'
+      // (matrix). A late/duplicate complete arriving after the gate moved
+      // the job forward (ready_to_merge/merging/merged, or a failure/
+      // terminal state) must never force an invalid transition nor
+      // downgrade the job — just reconcile and return.
+      try {
+        const plan = await loadPlan();
+        const current =
+          plan && plan.id === planId
+            ? plan.jobs.find((j) => j.name === job.name)?.status
+            : undefined;
+        if (current && current !== 'running') {
+          await this.reconcile();
+          return;
+        }
+      } catch {
+        // Guard is best-effort; fall through to the write below so a
+        // genuine completion is never silently dropped.
+      }
       await updatePlanJob(planId, job.name, {
         status: 'completed',
       });
       await this.reconcile();
     })().catch((error) => {
+      // A lost race (job moved past 'running' between guard and write)
+      // surfaces as an invalid transition — benign, already reconciled
+      // above on the next pass. Only log real failures.
+      if (error instanceof Error && /Invalid job transition/.test(error.message)) {
+        return;
+      }
       console.error('Failed to reconcile completed job state:', error);
     });
   }
 
   private handleJobFailed = (job: Job): void => {
     if (job.planId && this.activePlanId && job.planId === this.activePlanId) {
-      updatePlanJob(job.planId, job.name, {
-        status: 'failed',
-        error: 'job monitor reported failure',
-      }).catch(() => {});
-
-      loadPlan()
-        .then(async (plan) => {
-          if (!plan || plan.id !== job.planId) {
+      const planId = job.planId;
+      const jobName = job.name;
+      // True when the event was a stale/duplicate that must not disturb
+      // the loop: the finally below must not stop the reconciler for it.
+      let ignored = false;
+      (async () => {
+        // Idempotency guard: a late failure arriving after the gate moved
+        // the job forward (ready_to_merge/completed/merging/merged) must
+        // never downgrade it nor pause the plan. Terminal and rebase
+        // states are likewise left alone; duplicates of 'failed' too.
+        try {
+          const plan = await loadPlan();
+          const current =
+            plan && plan.id === planId
+              ? plan.jobs.find((j) => j.name === jobName)?.status
+              : undefined;
+          if (
+            current === 'ready_to_merge' ||
+            current === 'completed' ||
+            current === 'merging' ||
+            current === 'merged' ||
+            current === 'failed' ||
+            current === 'stopped' ||
+            current === 'canceled' ||
+            current === 'conflict' ||
+            current === 'needs_rebase'
+          ) {
+            ignored = true;
             return;
           }
+          if (current === 'queued' || current === 'waiting_deps') {
+            // Recovery (same precedent as launch failure): queued/
+            // waiting_deps → failed is not a valid transition, so force
+            // it explicitly to keep a genuine pre-run worker failure
+            // visible (plan pauses below) instead of stuck queued.
+            await updatePlanJob(planId, jobName, {
+              status: 'failed',
+              error: 'job monitor reported failure',
+            }, { force: true });
+          } else {
+            await updatePlanJob(planId, jobName, {
+              status: 'failed',
+              error: 'job monitor reported failure',
+            });
+          }
+        } catch (error) {
+          if (error instanceof Error && /Invalid job transition/.test(error.message)) {
+            // Lost race: the job moved past a markable state between
+            // guard and write — stale event, ignore fully (no pause).
+            ignored = true;
+            return;
+          }
+          // Legacy behavior: any other write error still pauses the plan
+          // below (fail-closed) instead of silently dropping the failure.
+        }
 
-          this.showToast('Mission Control', `Job "${job.name}" failed. Plan paused.`, 'error');
-          this.notify(`❌ Job "${job.name}" failed. Fix and retry with mc_plan_approve(checkpoint: "on_error", retry: "${job.name}").`);
-          await this.setCheckpoint('on_error', plan, {
-            jobName: job.name,
-            failureKind: 'job_failed',
-          });
-        })
+        const plan = await loadPlan();
+        if (!plan || plan.id !== planId) {
+          return;
+        }
+
+        this.showToast('Mission Control', `Job "${jobName}" failed. Plan paused.`, 'error');
+        this.notify(`❌ Job "${jobName}" failed. Fix and retry with mc_plan_approve(checkpoint: "on_error", retry: "${jobName}").`);
+        await this.setCheckpoint('on_error', plan, {
+          jobName,
+          failureKind: 'job_failed',
+        });
+      })()
         .catch(() => {})
         .finally(() => {
+          if (ignored) {
+            return;
+          }
           if (!this.checkpoint) {
             this.stopReconciler();
             this.unsubscribeFromMonitorEvents();
@@ -3693,7 +3951,13 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       const sourceSession = sourceJob?.remoteSessionID ?? sourceJob?.launchSessionID;
       if (sourceJob?.port && sourceSession) {
         try {
-          const client = createV2Client(sourceJob.port, this.config.serverPassword);
+          const password = resolveJobPassword(sourceJob, this.config.serverPassword);
+          if (!password) {
+            throw new Error(
+              `[MC] fork of job "${sourceJob.name}" needs its serve password (job or config) — fail-closed, never unauthenticated.`,
+            );
+          }
+          const client = createV2Client(sourceJob.port, password);
           const forked = await v2ForkSession(client, sourceSession);
           if (newJob.prompt) {
             await v2Prompt(
@@ -3705,6 +3969,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
           newJob.port = sourceJob.port;
           newJob.launchSessionID = sourceJob.launchSessionID;
           newJob.remoteSessionID = sourceJob.remoteSessionID;
+          // Same serve instance, same credential: carry it so the forked
+          // job's own reconnects (monitor poll, relay) auth correctly.
+          newJob.serverPassword = password;
         } catch {
         }
       }
@@ -3874,6 +4141,11 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       this.activePlanId = plan.id;
       this.planPlacement = plan.placement ?? null;
       this.planLaunchSessionID = plan.launchSessionID;
+      // Conductor lease on boot (resume path): this process proves assumption.
+      // Best-effort so unit fakes keep working; handoff verifies by re-read.
+      try {
+        await claimConductorLease(plan.id, process.pid, `resume plan ${plan.id}`, 'orchestrator-resume', repoRoot);
+      } catch {}
       this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
 
       const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);

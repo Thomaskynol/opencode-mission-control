@@ -5,6 +5,7 @@ import {
   createV2Client,
   launchWorkerViaServe,
   v2CreateSessionWithVerifiedModel,
+  v2RunCommand,
 } from '../../src/lib/sdk-client';
 
 const realFetch = globalThis.fetch;
@@ -68,18 +69,39 @@ describe('v2 serve session with verified model (R03 observable pin)', () => {
     ).rejects.toThrow(/model mismatch/);
   });
 
-  it('echo mode: an absent echo proceeds (mocks omit it; the POST carried the pin)', async () => {
+  it('echo mode: an absent echo fails closed (a requested pin must be observed)', async () => {
     let gets = 0;
     stubFetch((url) => {
       if (!url.endsWith('/api/session')) gets += 1;
       return new Response(sessionPayload('ses_3', undefined), { status: 200 });
     });
 
-    const info = await v2CreateSessionWithVerifiedModel(createV2Client(17891), {
-      model: { ...WANT },
-    });
-    expect(info.id).toBe('ses_3');
+    // Absence is observable on real servers (2.2.5 omits `model` when no pin
+    // was sent), so it can never count as a verified pin — not even for
+    // mock compatibility. Mocks must echo the triple they receive.
+    await expect(
+      v2CreateSessionWithVerifiedModel(createV2Client(17891), {
+        model: { ...WANT },
+      }),
+    ).rejects.toThrow(/model absent|model mismatch/);
     expect(gets).toBe(0);
+  });
+
+  it('get mode: an absent model on the GET round-trip fails closed', async () => {
+    stubFetch((url, init) => {
+      if (url.endsWith('/api/session') && init?.method === 'POST') {
+        return new Response(sessionPayload('ses_3', undefined), { status: 200 });
+      }
+      return new Response(sessionPayload('ses_3', undefined), { status: 200 });
+    });
+
+    await expect(
+      v2CreateSessionWithVerifiedModel(
+        createV2Client(17891),
+        { model: { ...WANT } },
+        'get',
+      ),
+    ).rejects.toThrow(/model absent|model mismatch/);
   });
 
   it('get mode: verifies the triple back via GET /session/:id', async () => {
@@ -159,6 +181,43 @@ describe('assertServeSessionModelEcho (pure)', () => {
       ),
     ).toThrow(/model mismatch/);
   });
+
+  it('rejects an absent echo even though no mismatch string exists to compare', () => {
+    expect(() =>
+      assertServeSessionModelEcho(
+        { id: 's', projectID: 'p', location: { directory: '/w' } },
+        WANT,
+      ),
+    ).toThrow(/model absent/);
+  });
+
+  it("treats the server-canonical 'default' variant as no-pin (2.2.5 native), but not as a pinned variant", () => {
+    const noPin = { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor' };
+    // Pin without variant vs server echo variant:"default" → verified.
+    expect(() =>
+      assertServeSessionModelEcho(
+        {
+          id: 's',
+          projectID: 'p',
+          location: { directory: '/w' },
+          model: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'default' },
+        },
+        noPin,
+      ),
+    ).not.toThrow();
+    // Explicitly pinned #xhigh vs server "default" → still fail-closed.
+    expect(() =>
+      assertServeSessionModelEcho(
+        {
+          id: 's',
+          projectID: 'p',
+          location: { directory: '/w' },
+          model: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'default' },
+        },
+        WANT,
+      ),
+    ).toThrow(/model mismatch/);
+  });
 });
 
 describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
@@ -189,7 +248,14 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
 
     expect(handle.sessionId).toBe('ses_9');
     expect(handle.tmuxTarget).toBe('mc-work');
-    expect(handle.model).toMatchObject({ variant: 'xhigh' });
+    // Requested vs observed stay separate fields: the observed triple is the
+    // server echo, never the request repackaged.
+    expect(handle.requestedModel).toMatchObject({ variant: 'xhigh' });
+    expect(handle.observedModel).toMatchObject({
+      providerID: 'opencode-go',
+      id: 'muse-spark-1.3-contributor',
+      variant: 'xhigh',
+    });
     const post = seen.find((s) => s.url.endsWith('/api/session') && s.method === 'POST');
     expect(post?.body).toMatchObject({
       model: { ...WANT },
@@ -250,5 +316,60 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
     expect(seen[1]).toMatchObject({ method: 'GET' });
     expect(seen[1].url.endsWith('/api/session/ses_9')).toBe(true);
     expect(seen[2].url.endsWith('/api/session/ses_9/prompt')).toBe(true);
+  });
+
+  it('never reports the requested pin as observed: no pin, no observed model', async () => {
+    stubFetch((url) => {
+      if (url.endsWith('/api/session/ses_9/prompt')) {
+        return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+      }
+      return new Response(sessionPayload('ses_9', undefined), { status: 200 });
+    });
+
+    const handle = await launchWorkerViaServe(createV2Client(17891), {
+      worktree: '/tmp/mc-w',
+      prompt: 'hi',
+    });
+    expect(handle.sessionId).toBe('ses_9');
+    expect(handle.requestedModel).toBeUndefined();
+    expect(handle.observedModel).toBeUndefined();
+  });
+
+  it('absent echo with a requested pin rejects before the prompt (nothing to repackage)', async () => {
+    const seen: string[] = [];
+    stubFetch((url) => {
+      seen.push(url);
+      if (url.endsWith('/api/session/ses_9/prompt')) {
+        return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+      }
+      return new Response(sessionPayload('ses_9', undefined), { status: 200 });
+    });
+
+    await expect(
+      launchWorkerViaServe(createV2Client(17891), {
+        worktree: '/tmp/mc-w',
+        prompt: 'do the work',
+        model: { ...WANT },
+      }),
+    ).rejects.toThrow(/model absent/);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].endsWith('/api/session')).toBe(true);
+  });
+});
+
+describe('v2RunCommand (serve-native slash-command parity, e.g. /start-work)', () => {
+  it('POSTs {name, text} to /session/:id/command for OMO-mode parity without TUI keystrokes', async () => {
+    const seen: Array<{ url: string; method: string; body?: unknown }> = [];
+    stubFetch((url, init) => {
+      seen.push({ url, method: init?.method ?? 'GET', body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+    });
+
+    await v2RunCommand(createV2Client(17891), 'ses_9', '/start-work');
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url.endsWith('/api/session/ses_9/command')).toBe(true);
+    expect(seen[0].method).toBe('POST');
+    expect(seen[0].body).toMatchObject({ name: '/start-work' });
   });
 });

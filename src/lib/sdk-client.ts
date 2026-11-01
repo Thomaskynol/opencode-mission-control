@@ -145,14 +145,21 @@ export async function forkJobSession(
 }
 
 // ---------------------------------------------------------------------------
-// v2 session API (opencode 2.1.4 `serve`, JSON under the `/api` prefix).
+// v2 session API (opencode `serve`, JSON under the `/api` prefix).
 //
 // The legacy `OpencodeClient` above targets unprefixed paths the 2.x server
-// no longer serves, so the helpers below speak the verified 2.1.4 surface
+// no longer serves, so the helpers below speak the verified 2.x surface
 // directly over fetch: session.create {model:{providerID,id,variant},
-// agent, location:{directory}, permissions} plus prompt / generate /
-// interrupt / background / wait / log / message / active / fork / move /
-// compact. Additive only: nothing above this line changes.
+// agent, title, location:{directory}, permissions} plus prompt / command /
+// generate / interrupt / background / wait / log / message / active / fork /
+// move / compact. Additive only: nothing above this line changes.
+//
+// Provenance: verified live against opencode 2.1.4. Revalidated natively on
+// 2.2.5 (serve --port 17891, disposable dir): POST /api/session echoes the
+// full triple + agent + title, GET /session/:id returns them unchanged, and
+// a session created with NO model returns NO `model` key — so an absent
+// echo/model with a requested pin fails closed, never counts as verified.
+// Envelope claims below still cite 2.1.4 where 2.2.5 was not re-probed.
 // ---------------------------------------------------------------------------
 
 /** Model pin used at session creation: exact providerID/id/variant triple. */
@@ -300,18 +307,24 @@ export async function v2GetSession(
 
 /** Normalize an empty variant to undefined so "no pin" compares cleanly. */
 function normalizeVariant(variant?: string): string | undefined {
-  return variant && variant.trim() ? variant : undefined;
+  if (!variant) return undefined;
+  const v = variant.trim();
+  // 2.2.5 canonicalizes an unpinned variant slot to the literal "default"
+  // (observed natively: pin without variant → GET echoes variant:"default").
+  // Treat it as no-pin so a variant-less request verifies; an explicitly
+  // pinned variant (e.g. #xhigh) still must match exactly.
+  return v && v !== 'default' ? v : undefined;
 }
 
 /**
  * Create a worker session with the pinned model triple and verify it back.
- * Two modes (R03 observable pin, mock-compatible):
+ * Two modes, both fail-closed on an absent or divergent model:
  * - 'echo' (default): compares the create-response echo against the
- *   requested triple — no extra calls, so unit tests that mock only
- *   v2CreateSession keep passing. Verified live against opencode 2.1.4
- *   `serve`: create echoes the full triple. An absent echo (mocks, older
- *   servers) proceeds: the POST already carried the pin.
- * - 'get': strict POST + GET /session/:id round-trip; any mismatch throws.
+ *   requested triple — no extra calls. An absent echo (or GET model) with a
+ *   requested pin throws: real servers omit `model` when no pin applied
+ *   (verified on 2.2.5), so absence can never count as verified.
+ * - 'get': strict POST + GET /session/:id round-trip; any mismatch or
+ *   absence throws.
  * A silent server default is never reported as pinned in either mode:
  * a present-but-different echo/mismatch throws fail-closed.
  */
@@ -322,7 +335,13 @@ export function assertServeSessionModelEcho(
   want: V2ModelRef,
 ): void {
   const got = created.model;
-  if (!got) return;
+  if (!got) {
+    throw new Error(
+      `v2 session model absent: requested ${want.providerID}/${want.id}${want.variant ? `#${want.variant}` : ''}, ` +
+        `but the server reported no model (session ${created.id}). ` +
+        `Absence never counts as a verified pin — the worker must not run.`,
+    );
+  }
   if (
     got.providerID !== want.providerID ||
     got.id !== want.id ||
@@ -382,16 +401,20 @@ export interface ServeWorkerInput {
 export interface ServeWorkerHandle {
   sessionId: string;
   tmuxTarget?: string;
-  /** Observed model (server echo) or, when the echo is absent, the requested pin. */
-  model?: V2ModelRef;
+  /** The pin that was requested (echo of the caller's input, not evidence). */
+  requestedModel?: V2ModelRef;
+  /** The model the server actually reported (echo/GET). Never repackaged. */
+  observedModel?: V2ModelRef;
 }
 
 /**
  * Create a serve session with the pinned triple (fail-closed via echo/GET),
  * deliver the prompt, and return the handle.
  * Echo mode performs exactly two calls (POST session + POST prompt) with no
- * extra GET; get mode adds the verification GET. A present-but-different
- * echo/mismatch throws before the prompt is sent.
+ * extra GET; get mode adds the verification GET. A present-but-different or
+ * ABSENT echo/mismatch throws before the prompt is sent. Requested and
+ * observed stay separate fields: callers persist `observedModel` as the
+ * verified pin and must never treat `requestedModel` as evidence.
  */
 export async function launchWorkerViaServe(
   client: V2Client,
@@ -406,11 +429,11 @@ export async function launchWorkerViaServe(
   };
   const created = await v2CreateSessionWithVerifiedModel(client, body, input.verify ?? 'echo');
   await v2Prompt(client, created.id, input.prompt);
-  const model = created.model ? { ...created.model } : input.model ? { ...input.model } : undefined;
   return {
     sessionId: created.id,
     ...(input.tmuxTarget !== undefined ? { tmuxTarget: input.tmuxTarget } : {}),
-    ...(model ? { model } : {}),
+    ...(input.model ? { requestedModel: { ...input.model } } : {}),
+    ...(created.model ? { observedModel: { ...created.model } } : {}),
   };
 }
 
@@ -431,6 +454,30 @@ export async function v2Prompt(
     { text },
   );
   return unwrapData<unknown>(payload, 'prompt');
+}
+
+/**
+ * Run a slash command on a serve session (2.2.5: POST /session/:id/command
+ * {name, text}, "Run command" per the 2.2.5 openapi). This is the
+ * serve-native equivalent of TUI keystrokes for OMO modes (e.g. name
+ * '/start-work'): no tmux sendKeys needed.
+ * Verified: endpoint exists with {name, text} schema on 2.2.5. Presumed
+ * (not run here): a specific OMO command executing to completion inside a
+ * worker session — that needs a paid model + OMO installed. Like
+ * v2Generate, returns the raw payload (no data envelope assumed).
+ */
+export async function v2RunCommand(
+  client: V2Client,
+  sessionID: string,
+  name: string,
+  text = '',
+): Promise<unknown> {
+  return v2Request(
+    client,
+    'POST',
+    `/session/${encodeURIComponent(sessionID)}/command`,
+    { name, text },
+  );
 }
 
 export async function v2Generate(

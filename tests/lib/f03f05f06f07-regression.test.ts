@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -36,7 +36,30 @@ function validDraft(extra?: Record<string, unknown>) {
 
 describe('F05 permission decision fail-closed (public path)', () => {
   const realFetch = globalThis.fetch;
-  afterEach(() => { globalThis.fetch = realFetch; });
+  let f05StateDir = '';
+  let f05RestoreDataDir: () => void = () => {};
+  beforeEach(async () => {
+    // Isolation: plan-state/config suites vi.mock paths.getDataDir, which leaks
+    // a mocked getDataDir (undefined) into this file when bun runs all files
+    // in one process (same guard as F03/F07/dest-branch). Pin state at a temp
+    // dir so loadConfig succeeds (defaults) and the permission reply is sent.
+    const fs = await import('fs');
+    f05StateDir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-f05-'));
+    try {
+      const paths = await import('../../src/lib/paths');
+      const spy = spyOn(paths, 'getDataDir').mockResolvedValue(f05StateDir);
+      f05RestoreDataDir = () => (spy as unknown as { mockRestore: () => void }).mockRestore();
+    } catch { f05RestoreDataDir = () => {}; }
+  });
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    try { f05RestoreDataDir(); } catch {}
+    try {
+      const fs = await import('fs');
+      if (f05StateDir && fs.existsSync(f05StateDir)) fs.rmSync(f05StateDir, { recursive: true, force: true });
+    } catch {}
+    f05StateDir = '';
+  });
 
   async function decisionFor(response: string): Promise<{ sent: boolean; body?: unknown; error?: string }> {
     const calls: Array<{ url: string; body: unknown }> = [];

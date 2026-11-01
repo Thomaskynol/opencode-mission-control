@@ -157,7 +157,7 @@ describe('toctou kill launcher integration', () => {
     const portAlloc = await import('../../src/lib/port-allocator');
     spyOn(portAlloc, 'allocatePort').mockResolvedValue(14111 as never);
     spyOn(sdkClientMod, 'v2WaitForServer').mockResolvedValue({ baseUrl: '', headers: {} } as any);
-    const serveSpy = spyOn(sdkClientMod, 'launchWorkerViaServe').mockResolvedValue({ sessionId: 'sess-1', tmuxTarget: 'x' } as any);
+    const serveSpy = spyOn(sdkClientMod, 'launchWorkerViaServe').mockResolvedValue({ sessionId: 'sess-1', tmuxTarget: 'x', requestedModel: { providerID: 'opencode-go', id: 'm' }, observedModel: { providerID: 'opencode-go', id: 'm' } } as any);
 
     await (orch as any).relaunchJobForCorrection('total', [], []);
     expect(killSpy).not.toHaveBeenCalledWith('mc-total');
@@ -180,6 +180,14 @@ describe('toctou kill launcher integration', () => {
     spyOn(planStateMod, 'loadPlan').mockImplementation(async () => JSON.parse(JSON.stringify(saved)));
     spyOn(planStateMod, 'updatePlanJob').mockImplementation(async (_id: string, name: string, u: Partial<JobSpec>) => {
       saved.jobs = saved.jobs.map((j) => (j.name === name ? { ...j, ...u } : j));
+    });
+    // Atomic claim (sonda 15): unit fake wins immediately, no disk.
+    spyOn(planStateMod, 'claimJobForDispatch').mockImplementation(async (pid: string, name: string) => {
+      const cur = saved.jobs.find((j) => j.name === name);
+      if (!cur) throw new Error(`Job "${name}" not found`);
+      if (cur.status !== 'queued') return { ok: false, status: cur.status } as never;
+      cur.status = 'running' as const;
+      return { ok: true, status: 'running' } as never;
     });
     spyOn(tmuxMod, 'createSession').mockResolvedValue();
     spyOn(tmuxMod, 'setPaneDiedHook').mockResolvedValue();
@@ -209,7 +217,8 @@ describe('toctou kill launcher integration', () => {
     const serveSpy = spyOn(sdkClientMod, 'launchWorkerViaServe').mockResolvedValue({
       sessionId: 'sess-9',
       tmuxTarget: 'mc-worker-a-plan-123',
-      model: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'xhigh' },
+      requestedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'xhigh' },
+      observedModel: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'xhigh' },
     } as any);
     const jobState = await import('../../src/lib/job-state');
     spyOn(jobState, 'loadJobState').mockResolvedValue({ version: 2, jobs: [], updatedAt: '' } as any);
