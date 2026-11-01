@@ -6,9 +6,11 @@ import {
   readAllReports,
   buildFinalReportMarkdown,
   writeFinalReport,
+  describeOmoLimitation,
   type ReportStatus,
 } from '../lib/reports';
 import { writeReport } from '../lib/reports';
+import { detectOMO } from '../lib/omo';
 
 export const mc_report: ToolDefinition = tool({
   description:
@@ -156,6 +158,18 @@ export const mc_report_final: ToolDefinition = tool({
         return { command: rec.testCommand!, result: rec.testStatus ?? 'skipped', output: rec.testOutput };
       });
     const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
+    // OMO status declared explicitly (never a silent success): without OMO
+    // the report records vanilla-only execution as the limitation.
+    // missingContributionJobs needs no separate call — buildFinalReportMarkdown
+    // already names merged jobs without mc_report under Per-Instance
+    // Contributions and Gaps.
+    let omoLine = 'Limitation: OMO status unknown — vanilla execution only.';
+    try {
+      const omo = await detectOMO().catch(() => null);
+      if (omo) omoLine = describeOmoLimitation(omo.detected, omo.configSource ?? undefined);
+    } catch {
+      // Best-effort: the unknown-status line above already fails closed.
+    }
 
     const markdown = buildFinalReportMarkdown({
       title: plan.name,
@@ -194,7 +208,7 @@ export const mc_report_final: ToolDefinition = tool({
       verified,
       unmet,
       unverified,
-      limitations: ['Local completion only; no push/PR without explicit humanAuth'],
+      limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine],
       nextSteps: unverified.length > 0 || unmet.length > 0
         ? ['Resolve the Gaps above, then re-run this report']
         : [],

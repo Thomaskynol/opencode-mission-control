@@ -211,6 +211,16 @@ export async function detectInstallCommand(worktreePath: string): Promise<string
   }
 }
 
+/**
+ * Execute a test command in a worktree directory.
+ *
+ * Scope protection lives in the orchestrator (gatherScopeEvidence wraps this
+ * call with protectInputsDuringRun: snapshot hash before, read-only
+ * hardening, re-hash during/after, hash+mtime verdict). This function stays
+ * raw on purpose so legitimate builds keep working: untracked dist/build
+ * outputs, coverage/tmp/logs are writable outputs, never blocked here —
+ * versioned dist modifications are refused upstream as identity failures.
+ */
 export async function runTestCommand(
   worktreePath: string,
   command: string,

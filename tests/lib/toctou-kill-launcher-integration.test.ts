@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { join } from 'path';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
 import { EventEmitter } from 'events';
 import type { JobSpec, PlanSpec } from '../../src/lib/plan-types';
@@ -74,6 +74,11 @@ describe('toctou kill launcher integration', () => {
     spyOn(mergeTrainMod, 'runTestCommand').mockImplementation(async (dir: string, _cmd: string, _t: number) => {
       calls += 1;
       if (calls === 1) {
+        // Adaptive attacker: scope inputs are hardened read-only during the
+        // run (protectInputsDuringRun), so re-enable writes first — the same
+        // pattern as candidate-identity's A→B→A test. Detection (transient
+        // hit + identity refusal, never a clean pass) is what matters here.
+        try { chmodSync(join(dir, 'total.mjs'), 0o644); } catch {}
         writeFileSync(join(dir, 'total.mjs'), 'export function total(xs){ return 3; }\n');
         return { success: true, output: 'ok', timedOut: false };
       }

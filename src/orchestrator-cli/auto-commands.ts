@@ -22,7 +22,15 @@ import {
   setAutoIntakeStatus,
   type AutoIntakeRecord,
 } from '../lib/durable-state';
-import { loadPlan } from '../lib/plan-state';
+import {
+  loadPlan,
+  claimConductorLease,
+  readConductorLease,
+  verifyConductorLease,
+  recordHeartbeat,
+  DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS,
+  DEFAULT_CONDUCTOR_MAX_PROGRESS_MS,
+} from '../lib/plan-state';
 import {
   getActiveRepoRoot,
   withRepoRoot,
@@ -593,6 +601,10 @@ async function checkWorkerContinuity(): Promise<ConductorEvidence> {
 export interface PersistentConductor {
   pid: number;
   command: string;
+  /** Fencing identity: the lease token at spawn time (proves assumption). */
+  token?: string;
+  /** Fencing identity: the lease epoch at spawn time (old leaders rejected). */
+  epoch?: number;
 }
 
 /** True when the pid answers to signal 0 (alive). Never throws. */
@@ -606,6 +618,23 @@ export function isConductorAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Conductor freshness budgets (configurable via env, else plan-state
+ * defaults). Handoff verification rejects stale holders — pid-alive alone
+ * never suffices, and an old leader with a smaller epoch never passes.
+ */
+export const CONDUCTOR_MAX_HEARTBEAT_MS = DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS;
+export const CONDUCTOR_MAX_PROGRESS_MS = DEFAULT_CONDUCTOR_MAX_PROGRESS_MS;
+
+function conductorStaleOpts(): { maxHeartbeatMs: number; maxProgressMs: number } {
+  const hb = Number(process.env.MC_MAX_HEARTBEAT_MS ?? process.env.MC_CONDUCTOR_MAX_HEARTBEAT_MS ?? CONDUCTOR_MAX_HEARTBEAT_MS);
+  const pg = Number(process.env.MC_MAX_PROGRESS_MS ?? process.env.MC_CONDUCTOR_MAX_PROGRESS_MS ?? CONDUCTOR_MAX_PROGRESS_MS);
+  return {
+    maxHeartbeatMs: Number.isFinite(hb) && hb > 0 ? hb : CONDUCTOR_MAX_HEARTBEAT_MS,
+    maxProgressMs: Number.isFinite(pg) && pg > 0 ? pg : CONDUCTOR_MAX_PROGRESS_MS,
+  };
 }
 
 /**
@@ -652,11 +681,17 @@ export async function spawnPersistentConductor(
   // (the integrator wires claimConductorLease into the resume path). Until
   // then the spawner records its intent so the handoff can verify a durable
   // claim exists — pid-alive alone never counts (the handoff re-reads the
-  // lease before the temp detaches and fails closed when it is absent).
+  // lease with token/epoch+frescor and fails closed when it is absent).
   if (planId) {
     try {
-      const { claimConductorLease } = await import('../lib/plan-state');
-      await claimConductorLease(planId, pid, command, `driver-spawn:${process.pid}`, repoRoot);
+      const lease = await claimConductorLease(planId, pid, command, `driver-spawn:${process.pid}`, repoRoot);
+      try {
+        const confirmed = await readConductorLease(repoRoot).catch(() => null);
+        if (confirmed && confirmed.planId === planId && confirmed.pid === pid) {
+          return { pid, command, token: confirmed.token, epoch: confirmed.epoch };
+        }
+      } catch {}
+      return { pid, command, token: lease.token, epoch: lease.epoch };
     } catch {
       // Best-effort provisional claim: verification below reports absence.
     }
@@ -666,22 +701,31 @@ export async function spawnPersistentConductor(
 
 /**
  * Wait for the new conductor's proof of assumption: a lease with the same
- * planId+pid re-readable from disk. The driver writes it via
- * claimConductorLease on boot; the temp confirms before detaching.
- * Returns the lease owner+timestamp for the handoff line, or null on timeout.
+ * planId+pid re-readable from disk, verified with token/epoch+frescor
+ * (stale holders and old leaders with a smaller epoch are rejected — never
+ * assumed). The driver writes it via claimConductorLease on boot; the temp
+ * confirms before detaching. Returns the lease owner+timestamp for the
+ * handoff line, or null on timeout.
  */
 async function awaitConductorLease(
   planId: string,
   pid: number,
   repoRoot: string,
   timeoutMs = 2000,
+  expected?: { token?: string; epoch?: number },
 ): Promise<{ owner: string; acquiredAt: string } | null> {
-  const { readConductorLease } = await import('../lib/plan-state');
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const lease = await readConductorLease(repoRoot).catch(() => null);
-    if (lease && lease.planId === planId && lease.pid === pid) {
-      return { owner: lease.owner, acquiredAt: lease.acquiredAt };
+    const owned = await verifyConductorLease(planId, pid, repoRoot, {
+      ...(expected?.token !== undefined ? { token: expected.token } : {}),
+      ...(expected?.epoch !== undefined ? { epoch: expected.epoch } : {}),
+      ...conductorStaleOpts(),
+    }).catch(() => false);
+    if (owned) {
+      const lease = await readConductorLease(repoRoot).catch(() => null);
+      if (lease && lease.planId === planId && lease.pid === pid) {
+        return { owner: lease.owner, acquiredAt: lease.acquiredAt };
+      }
     }
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -752,15 +796,30 @@ async function recordConductorHandoff(
       (j) => j.status === 'running' || j.status === 'merging',
     ).length;
     // Idempotent reuse: a live lease for the same plan is the owner — never
-    // spawn a second driver when the first is still alive.
-    const { readConductorLease } = await import('../lib/plan-state');
+    // spawn a second driver when the first is still alive. Verified with
+    // token/epoch+frescor: an old leader with a smaller epoch is rejected,
+    // never reused (fencing).
     const existing = await readConductorLease(repoRoot).catch(() => null);
     let conductor: PersistentConductor | null = null;
     let leaseProof: { owner: string; acquiredAt: string } | null = null;
     if (existing && existing.planId === plan.id && isConductorAlive(existing.pid)) {
-      conductor = { pid: existing.pid, command: existing.command };
-      leaseProof = { owner: existing.owner, acquiredAt: existing.acquiredAt };
-    } else {
+      const stillOwned = await verifyConductorLease(plan.id, existing.pid, repoRoot, {
+        token: existing.token,
+        epoch: existing.epoch,
+        ...conductorStaleOpts(),
+      }).catch(() => false);
+      if (stillOwned) {
+        conductor = { pid: existing.pid, command: existing.command, token: existing.token, epoch: existing.epoch };
+        leaseProof = { owner: existing.owner, acquiredAt: existing.acquiredAt };
+        // Periodic liveness on reuse: the re-verified owner heartbeats now.
+        try {
+          await recordHeartbeat(plan.id, existing.pid, repoRoot, { token: existing.token });
+        } catch {
+          // Best-effort: the verify above already proved ownership.
+        }
+      }
+    }
+    if (!conductor) {
       const spawnFn = opts?.spawnConductor ?? ((id, root) => spawnPersistentConductor(id, root, plan.id));
       try {
         conductor = await spawnFn(record.id, repoRoot);
@@ -779,9 +838,13 @@ async function recordConductorHandoff(
       }
       // Possession proof: pid-alive alone never suffices — the new conductor
       // must have claimed the plan lease (it writes it on boot; the default
-      // spawner records a provisional claim). The temp re-reads before
-      // detaching and fails closed on absence (sonda 13).
-      leaseProof = await awaitConductorLease(plan.id, conductor.pid, repoRoot);
+      // spawner records a provisional claim with token/epoch). The temp
+      // re-reads with token/epoch+frescor before detaching and fails closed
+      // on absence or fencing mismatch (sonda 13).
+      leaseProof = await awaitConductorLease(plan.id, conductor.pid, repoRoot, 2000, {
+        ...(conductor.token !== undefined ? { token: conductor.token } : {}),
+        ...(conductor.epoch !== undefined ? { epoch: conductor.epoch } : {}),
+      });
       if (!leaseProof) {
         throw new Error(
           `handoff not confirmed for intake ${record.id}: conductor pid ${conductor.pid} alive but never claimed plan ${plan.id} ` +
@@ -1182,16 +1245,29 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
     } else {
       const running = plan.jobs.filter((j) => j.status === 'running' || j.status === 'merging').length;
       // Possession proof: the staying coordinator claims the lease for its own
-      // pid (idempotent overwrite) and re-reads it — a resume that cannot
-      // persist its ownership fails explicitly instead of declaring continuity.
+      // pid (idempotent overwrite) and verifies it with token/epoch+frescor —
+      // a resume that cannot persist its ownership fails explicitly instead
+      // of declaring continuity. An old leader with a smaller epoch never
+      // verifies here (fencing).
       try {
-        const { claimConductorLease, readConductorLease } = await import('../lib/plan-state');
-        await claimConductorLease(plan.id, process.pid, `resume --intake ${record.id}`, 'resume', repoRoot);
+        const lease = await claimConductorLease(plan.id, process.pid, `resume --intake ${record.id}`, 'resume', repoRoot);
+        const owned = await verifyConductorLease(plan.id, process.pid, repoRoot, {
+          token: lease.token,
+          epoch: lease.epoch,
+          ...conductorStaleOpts(),
+        }).catch(() => false);
+        if (!owned) {
+          throw new Error('lease failed fencing verification after claim (stale token/epoch)');
+        }
         const confirmed = await readConductorLease(repoRoot).catch(() => null);
         if (!confirmed || confirmed.planId !== plan.id || confirmed.pid !== process.pid) {
           throw new Error('lease not re-readable after claim');
         }
-        line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid} lease resume@${confirmed.acquiredAt}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
+        // Periodic proof from here on: heartbeat now, progress with the pass.
+        try {
+          await recordHeartbeat(plan.id, process.pid, repoRoot, { token: confirmed.token });
+        } catch {}
+        line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid} lease resume@${confirmed.acquiredAt} epoch ${confirmed.epoch}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
       } catch (error) {
         throw new Error(
           `resume not confirmed for intake ${record.id}: conductor ownership failed (${error instanceof Error ? error.message : String(error)}). Plan stays ${plan.status}; retry resume to assume it.`,

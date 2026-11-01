@@ -99,9 +99,20 @@ export interface ReviewInput {
   testPaths?: string[];
   /**
    * Future OpenCode revisor decision (structured, linked to the candidate).
-   * Reserved for a later round; the local coordinator check decides now.
+   * When present with `reviewer: 'opencode'`, its verdict is enforced: an
+   * external `fail` blocks even with local coverage (fail-closed), and an
+   * external `pass` still requires the local check below — neither side
+   * passes alone. Produced by `reviewFunctionallyViaOpenCode`
+   * (src/lib/opencode-reviewer.ts), which the integrator attaches.
    */
   sufficiency?: SufficiencyDecision | null;
+  /**
+   * Strict composition for the production path: pass requires an external
+   * opencode pass decision in `sufficiency` — the local heuristic never
+   * decides alone. Absent external pass ⇒ fail-closed (never a pass).
+   * Off by default so unit scope stays deterministic.
+   */
+  requireExternalSufficiency?: boolean;
 }
 
 export interface ReviewVerdict {
@@ -559,10 +570,10 @@ function hasBoundAssertion(testContent: string, symbol: string, required: string
 function extractImplCandidates(implSources: string): string[] {
   const out: string[] = [];
   const re =
-    /(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)|\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(|\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b|(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:\(|function|=>)|def\s+([A-Za-z_][A-Za-z0-9_]*)\b|fn\s+([A-Za-z_][A-Za-z0-9_]*)\b)/g;
+    /(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)|\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(|\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b|(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:\(|function|=>)|def\s+([A-Za-z_][A-Za-z0-9_]*)\b|fn\s+([A-Za-z_][A-Za-z0-9_]*)\b|export\s+(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(|(?:exports|module\.exports)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(implSources)) !== null) {
-    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? m[6];
+    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? m[6] ?? m[7] ?? m[8];
     if (!name) continue;
     if (REQUIREMENT_STOPWORDS.has(name.toLowerCase())) continue;
     if (!out.some((s) => s.toLowerCase() === name.toLowerCase())) out.push(name);
@@ -571,47 +582,83 @@ function extractImplCandidates(implSources: string): string[] {
   return out;
 }
 
-/** Minimal def lookup: params + body of `function sym(...) {...}` or `sym = (...) => ...`. */
+/** Balanced `{...}` slice starting at braceIdx (which must be `{`). */
+function extractBraceBody(code: string, braceIdx: number): string | null {
+  let depth = 0;
+  for (let i = braceIdx; i < code.length; i++) {
+    if (code[i] === '{') depth++;
+    else if (code[i] === '}') {
+      depth--;
+      if (depth === 0) return code.slice(braceIdx + 1, i);
+    }
+  }
+  return null;
+}
+
+/**
+ * Minimal def lookup: params + body of `function sym(...) {...}`,
+ * `sym = (...) => ...`, and their `export`/`exports` forms
+ * (`export function sym`, `export const sym =`, bare `export sym(...)`,
+ * `exports.sym =` / `module.exports.sym =`).
+ */
 function findFunctionDef(
   implSources: string,
   name: string,
 ): { params: string[]; body: string } | null {
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const code = stripCommentsKeepStrings(implSources);
-  const fnRe = new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)`);
+  const fnRe = new RegExp(`(?:export\\s+(?:default\\s+)?)?(?:async\\s+)?function\\s+${esc}\\s*\\(([^)]*)\\)`);
   const fnM = fnRe.exec(code);
   if (fnM) {
     const brace = code.indexOf('{', fnM.index + fnM[0].length);
-    if (brace < 0) return null;
-    let depth = 0;
-    for (let i = brace; i < code.length; i++) {
-      if (code[i] === '{') depth++;
-      else if (code[i] === '}') {
-        depth--;
-        if (depth === 0) return { params: splitParams(fnM[1] ?? ''), body: code.slice(brace + 1, i) };
-      }
+    if (brace >= 0) {
+      const body = extractBraceBody(code, brace);
+      if (body !== null) return { params: splitParams(fnM[1] ?? ''), body };
     }
-    return null;
   }
-  const arrowRe = new RegExp(`(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s*)?\\(?([^)=;]*)\\)?\\s*=>\\s*`);
+  const arrowRe = new RegExp(
+    `(?:export\\s+(?:default\\s+)?)?(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s*)?\\(?([^)=;]*)\\)?\\s*=>\\s*`,
+  );
   const arrowM = arrowRe.exec(code);
   if (arrowM) {
     const bodyStart = arrowM.index + arrowM[0].length;
     if (code[bodyStart] === '{') {
-      let depth = 0;
-      for (let i = bodyStart; i < code.length; i++) {
-        if (code[i] === '{') depth++;
-        else if (code[i] === '}') {
-          depth--;
-          if (depth === 0) return { params: splitParams(arrowM[1] ?? ''), body: code.slice(bodyStart + 1, i) };
-        }
-      }
-      return null;
+      const body = extractBraceBody(code, bodyStart);
+      if (body !== null) return { params: splitParams(arrowM[1] ?? ''), body };
+    } else {
+      const semi = code.indexOf(';', bodyStart);
+      const nl = code.indexOf('\n', bodyStart);
+      const end = semi < 0 ? (nl < 0 ? code.length : nl) : nl < 0 ? semi : Math.min(semi, nl);
+      return { params: splitParams(arrowM[1] ?? ''), body: code.slice(bodyStart, end) };
     }
-    const semi = code.indexOf(';', bodyStart);
-    const nl = code.indexOf('\n', bodyStart);
-    const end = semi < 0 ? (nl < 0 ? code.length : nl) : nl < 0 ? semi : Math.min(semi, nl);
-    return { params: splitParams(arrowM[1] ?? ''), body: code.slice(bodyStart, end) };
+  }
+  // Bare export form (`export sym(...) {...}`) and CommonJS
+  // (`exports.sym = function(...) {...}` / `= (...) => ...`).
+  const bareRe = new RegExp(`export\\s+(?:async\\s+)?${esc}\\s*\\(([^)]*)\\)`);
+  const bareM = bareRe.exec(code);
+  if (bareM) {
+    const brace = code.indexOf('{', bareM.index + bareM[0].length);
+    if (brace >= 0) {
+      const body = extractBraceBody(code, brace);
+      if (body !== null) return { params: splitParams(bareM[1] ?? ''), body };
+    }
+  }
+  const cjsRe = new RegExp(
+    `(?:exports\\s*\\.\\s*${esc}|module\\s*\\.\\s*exports\\s*\\.\\s*${esc})\\s*=\\s*(?:async\\s*)?(?:function\\s*\\(([^)]*)\\)|\\(?([^)=;]*)\\)?\\s*=>)\\s*`,
+  );
+  const cjsM = cjsRe.exec(code);
+  if (cjsM) {
+    const params = splitParams((cjsM[1] ?? cjsM[2] ?? '') as string);
+    const bodyStart = cjsM.index + cjsM[0].length;
+    if (code[bodyStart] === '{') {
+      const body = extractBraceBody(code, bodyStart);
+      if (body !== null) return { params, body };
+    } else {
+      const semi = code.indexOf(';', bodyStart);
+      const nl = code.indexOf('\n', bodyStart);
+      const end = semi < 0 ? (nl < 0 ? code.length : nl) : nl < 0 ? semi : Math.min(semi, nl);
+      return { params, body: code.slice(bodyStart, end) };
+    }
   }
   return null;
 }
@@ -636,6 +683,83 @@ function isVacuousImpl(implSources: string, name: string): boolean {
   if (!def || def.params.length === 0) return false;
   const stripped = stripStringsAndComments(def.body);
   return !def.params.some((p) => new RegExp(`\\b${p}\\b`).test(stripped));
+}
+
+/**
+ * True when the function only measures its input size
+ * (`p.length`/`p.size`/`p.count`) without ever touching elements: e.g.
+ * `total(xs) { return xs.length; }` coincides with a sum ONLY on the empty
+ * input, so it proves nothing about an aggregation requirement. General
+ * category (cardinality projection vs element computation), never a
+ * single-name regex.
+ * shortcut: member-access heuristic — upgrade to a structured parser if it misfires.
+ */
+function isCardinalityOnlyImpl(implSources: string, name: string): boolean {
+  const def = findFunctionDef(implSources, name);
+  if (!def || def.params.length === 0) return false;
+  let body = stripStringsAndComments(def.body);
+  for (const p of def.params) {
+    const esc = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    body = body.replace(new RegExp(`\\b${esc}\\s*\\.\\s*(?:length|size|count)\\b\\s*(?:\\(\\s*\\))?`, 'g'), ' ');
+    body = body.replace(new RegExp(`\\bObject\\s*\\.\\s*keys\\s*\\(\\s*${esc}\\s*\\)\\s*\\.\\s*length\\b`, 'g'), ' ');
+  }
+  return !def.params.some((p) => new RegExp(`\\b${p}\\b`).test(body));
+}
+
+/** The requirement is specifically about the empty/zero case (`[]` is then a real case). */
+function isEmptySpecificRequirement(text: string): boolean {
+  return /empty|zero|blank|vac[ií]o|nulo|no\s+(items|elements|entries)|without\s+(items|elements)/i.test(text);
+}
+
+/** The requirement asks for a size/count (a cardinality projection then computes it). */
+function isCardinalitySpecificRequirement(text: string): boolean {
+  return /length|size|count|how\s+many|number\s+of|tamanho|quantidade|comprimento/i.test(text);
+}
+
+/**
+ * True when the args of a `symbol(` call carry a distinguishing value: a
+ * non-empty collection/object literal, a non-empty string, or a non-zero
+ * number. `[]`, `''`, `0`, `null` alone never distinguish a correct
+ * implementation from degenerate ones (constant, `length`, identity) that
+ * coincide on the trivial input.
+ * shortcut: literal-shape heuristic — upgrade to a structured parser if it misfires.
+ */
+function callArgsDistinguishing(args: string): boolean {
+  if (/\[[^\[\]]*\S[^\[\]]*\]/.test(args)) return true;
+  if (/\{[^{}]*\S[^{}]*}/.test(args)) return true;
+  const strs = args.match(/'([^']*)'|"([^"]*)"|`([^`]*)`/g) ?? [];
+  if (strs.some((s) => s.length > 2)) return true;
+  if (/\b[1-9]\d*(?:\.\d+)?\b/.test(args)) return true;
+  return false;
+}
+
+/**
+ * True when some assert-verb snippet invoking `symbol(` passes a
+ * distinguishing input (see callArgsDistinguishing). Exit-code harnesses
+ * (`got = sym(...); if (got !== <lit>) process.exit(1)`) count when the
+ * call itself carries one.
+ */
+function callHasDistinguishingInput(testContent: string, symbol: string): boolean {
+  const code = removeImportRequireLines(stripCommentsKeepStrings(testContent));
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const s of assertionSnippets(code)) {
+    const at = s.search(new RegExp(`\\b${escaped}\\s*\\(`));
+    if (at < 0) continue;
+    const open = s.indexOf('(', at);
+    const bal = extractBalanced(s, open);
+    if (bal && callArgsDistinguishing(bal)) return true;
+  }
+  if (/\bprocess\.exit\b|\bthrow\b/.test(code)) {
+    const stripped = stripStringsAndComments(testContent);
+    const callRe = new RegExp(`\\b${escaped}\\s*\\(`, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = callRe.exec(stripped)) !== null) {
+      const open = stripped.indexOf('(', m.index);
+      const bal = extractBalanced(stripped, open);
+      if (bal && callArgsDistinguishing(bal)) return true;
+    }
+  }
+  return false;
 }
 
 export interface FunctionalCoverage {
@@ -722,29 +846,68 @@ export function assessFunctionalCoverage(
 
   // 2b. Behavioural NL: no code refs — link any asserted implementation call.
   // A vacuous implementation (ignores its own inputs) never demonstrates a
-  // behavioural requirement, even when a trivial-case assert passes.
+  // behavioural requirement, even when a trivial-case assert passes. The same
+  // holds for a cardinality-only body (`return xs.length` coincides with a
+  // sum only on `[]`) and for trivial-case-only asserts: when the requirement
+  // pins values down (numbers, quoted literals) the assert arguments must
+  // bind the call to those values, and otherwise the tests must still show a
+  // distinguishing (non-empty, non-zero) asserted call — unless the
+  // requirement is itself about the empty case. No vocabulary obligation.
   if (!hasCodeReferences(fullText)) {
     const candidates = extractImplCandidates(implSources);
+    const required = extractRequiredLiterals(fullText);
+    const emptySpecific = isEmptySpecificRequirement(fullText);
+    const cardinalitySpecific = isCardinalitySpecificRequirement(fullText);
     const vacuous: string[] = [];
+    const shallow: string[] = [];
+    const unbound: string[] = [];
+    const trivialOnly: string[] = [];
     for (const cand of candidates) {
-      let asserted = false;
-      for (const tp of testPool) {
-        if (hasAssertedCall(contents[tp] ?? '', cand)) {
-          asserted = true;
-          break;
-        }
-      }
-      if (!asserted) continue;
+      const assertedIn = testPool.filter((tp) => hasAssertedCall(contents[tp] ?? '', cand));
+      if (assertedIn.length === 0) continue;
       if (isVacuousImpl(implSources, cand)) {
         if (!vacuous.some((s) => s.toLowerCase() === cand.toLowerCase())) vacuous.push(cand);
         continue;
       }
-      return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${testPool.find((tp) => hasAssertedCall(contents[tp] ?? '', cand))} asserts ${cand}()` };
+      if (!cardinalitySpecific && isCardinalityOnlyImpl(implSources, cand)) {
+        if (!shallow.some((s) => s.toLowerCase() === cand.toLowerCase())) shallow.push(cand);
+        continue;
+      }
+      if (
+        required.length > 0 &&
+        !assertedIn.some((tp) => hasBoundAssertion(contents[tp] ?? '', cand, required))
+      ) {
+        if (!unbound.some((s) => s.toLowerCase() === cand.toLowerCase())) unbound.push(cand);
+        continue;
+      }
+      if (!emptySpecific && !assertedIn.some((tp) => callHasDistinguishingInput(contents[tp] ?? '', cand))) {
+        if (!trivialOnly.some((s) => s.toLowerCase() === cand.toLowerCase())) trivialOnly.push(cand);
+        continue;
+      }
+      return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${assertedIn[0]} asserts ${cand}()` };
     }
     if (vacuous.length > 0) {
       return {
         covered: false,
         reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation ${vacuous.join('/')}() ignores its inputs so a passing trivial-case assert proves nothing about the requirement (static heuristic, not a proof — a model reviewer would confirm) — fix the implementation to compute from its inputs`,
+      };
+    }
+    if (shallow.length > 0) {
+      return {
+        covered: false,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): implementation ${shallow.join('/')}() only measures input size (length/size/count) instead of computing the required behaviour — fix the implementation to compute from the input elements`,
+      };
+    }
+    if (unbound.length > 0) {
+      return {
+        covered: false,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${unbound.join('/')}() but no assertion binds the call to required ${required.join('/')} — fix the tests to assert the implementation result for the required case`,
+      };
+    }
+    if (trivialOnly.length > 0) {
+      return {
+        covered: false,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests only assert ${trivialOnly.join('/')}() on a trivial (empty/zero) input, which cannot distinguish a correct implementation from a degenerate one — fix the tests to assert a distinguishing non-empty case`,
       };
     }
     return {
@@ -885,6 +1048,22 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
   if (ev.exitCode !== 0) {
     reasons.push(`tests did not pass: exit code ${ev.exitCode}`);
     if (input.claimedPass) reasons.push('optimistic report without proof: claimed pass but tests failed');
+  }
+
+  // External revisor (opencode) is enforced when present, and mandatory
+  // under requireExternalSufficiency. Either way the local functional check
+  // below still runs: pass needs both, fail needs only one (fail-closed).
+  const suf = input.sufficiency ?? null;
+  if (suf && suf.reviewer === 'opencode') {
+    if (suf.decision !== 'pass') {
+      reasons.push(
+        `external functional review (opencode) did not pass: ${(suf.reasons ?? []).join('; ') || 'no reason recorded'} — fail-closed`,
+      );
+    }
+  } else if (input.requireExternalSufficiency) {
+    reasons.push(
+      'external functional review required (requireExternalSufficiency) but no opencode decision present — fail-closed: the local heuristic never decides alone',
+    );
   }
 
   // R01 sufficiency: stdout anchor text NEVER decides pass. Each requirement

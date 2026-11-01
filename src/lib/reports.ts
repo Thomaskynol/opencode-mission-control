@@ -102,12 +102,41 @@ export async function removeReport(jobId: string): Promise<void> {
   }
 }
 
+/**
+ * OMO status line for the final report. Without OMO the report declares
+ * the limitation explicitly (vanilla execution only) — never a silent
+ * success. With OMO it records the parity path (serve /command, no TUI
+ * keystrokes). The launch path already reads detectOMO (non-vanilla
+ * without OMO fails closed there, before any session exists); this
+ * helper is how that outcome is registered in the report.
+ */
+export function describeOmoLimitation(detected: boolean, mode?: string): string {
+  const scope = mode && mode !== 'vanilla' ? ` (mode "${mode}")` : '';
+  if (detected) {
+    return `OMO detected${scope} — slash-command parity via serve /command, no TUI keystrokes.`;
+  }
+  return `Limitation: OMO not detected${scope} — OMO paths unavailable; vanilla execution only, no silent OMO fallback.`;
+}
+
 /** Max length for one-line report summaries shown in the human TUI. */
 export const REPORT_LINE_MAX = 140;
 
 function truncateLine(text: string, maxLength: number = REPORT_LINE_MAX): string {
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Jobs merged into the integration branch with no per-instance mc_report
+ * contribution. A merge is integration, not authorship: without the
+ * worker report the final document must name the gap explicitly instead
+ * of printing a clean Verified section next to a placeholder.
+ */
+function missingContributionJobs(input: FinalReportInput): string[] {
+  const merged = input.integration?.merged ?? [];
+  if (merged.length === 0) return [];
+  const have = new Set((input.contributions ?? []).map((c) => c.job));
+  return merged.filter((name) => !have.has(name));
 }
 
 /**
@@ -258,6 +287,12 @@ function finalReportLines(items: string[] | undefined, emptyNote: string): strin
  * live in separate sections by construction.
  */
 export function buildFinalReportMarkdown(input: FinalReportInput): string {
+  // Merged jobs with no mc_report contribution: named explicitly here and
+  // under Gaps — never a clean Verified section next to a placeholder.
+  const missingReports = missingContributionJobs(input);
+  const missingGapEntries = missingReports
+    .filter((name) => !(input.unverified ?? []).some((entry) => entry.includes(name)))
+    .map((name) => `missing per-instance report for "${name}" (merged without mc_report)`);
   const lines: string[] = [
     `# Final Report: ${input.title}`,
     '',
@@ -290,9 +325,14 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
     '',
     '## Per-Instance Contributions',
     '',
-    ...((input.contributions ?? []).length > 0
-      ? input.contributions!.map((c) => `- ${c.instance} / ${c.job}: ${c.summary}`)
-      : ['- No per-instance contributions reported']),
+    ...(() => {
+      const listed = (input.contributions ?? []).map((c) => `- ${c.instance} / ${c.job}: ${c.summary}`);
+      const gaps = missingReports.map(
+        (name) => `- Missing per-instance report for merged job "${name}" (no mc_report received — see Gaps)`,
+      );
+      if (listed.length === 0 && gaps.length === 0) return ['- No per-instance contributions reported'];
+      return [...listed, ...gaps];
+    })(),
     '',
     '## Files & Branches',
     '',
@@ -361,7 +401,7 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
     ),
     '',
     ...finalReportLines(
-      (input.unverified ?? []).map((item) => `Unverified: ${item}`),
+      [...(input.unverified ?? []), ...missingGapEntries].map((item) => `Unverified: ${item}`),
       'No unverified items reported',
     ),
     '',

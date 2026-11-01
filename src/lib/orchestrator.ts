@@ -1,16 +1,18 @@
 import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
-import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, withPlanLock } from './plan-state';
+import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
-import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type TestEvidence } from './reviewer';
+import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
+import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
+import { protectInputsDuringRun, decideIdentityVerdict, type FileIdentity } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, resolveJobPassword, type Job } from './job-state';
 import { JobMonitor } from './monitor';
-import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport } from './reports';
+import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport, describeOmoLimitation } from './reports';
 import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, resolveServePassword, describeTuiModelPin } from './prompt-file';
@@ -97,6 +99,28 @@ export function parseModelRef(raw: string): V2ModelRef | undefined {
  */
 export function modelRefToCliString(ref: V2ModelRef): string {
   return `${ref.providerID}/${ref.id}`;
+}
+
+/**
+ * Conductor freshness budgets (configurable via env, else plan-state defaults).
+ * The reconciler heartbeats under these; verify rejects stale holders —
+ * an old leader with a smaller epoch never passes verification.
+ */
+export const DEFAULT_MAX_HEARTBEAT_MS = DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS;
+export const DEFAULT_MAX_PROGRESS_MS = DEFAULT_CONDUCTOR_MAX_PROGRESS_MS;
+
+function conductorStaleOpts(): { maxHeartbeatMs: number; maxProgressMs: number } {
+  const hb = Number(process.env.MC_MAX_HEARTBEAT_MS ?? process.env.MC_CONDUCTOR_MAX_HEARTBEAT_MS ?? DEFAULT_MAX_HEARTBEAT_MS);
+  const pg = Number(process.env.MC_MAX_PROGRESS_MS ?? process.env.MC_CONDUCTOR_MAX_PROGRESS_MS ?? DEFAULT_MAX_PROGRESS_MS);
+  return {
+    maxHeartbeatMs: Number.isFinite(hb) && hb > 0 ? hb : DEFAULT_MAX_HEARTBEAT_MS,
+    maxProgressMs: Number.isFinite(pg) && pg > 0 ? pg : DEFAULT_MAX_PROGRESS_MS,
+  };
+}
+
+/** Unit scope (bun test) stays deterministic: the local heuristic decides alone. */
+function isTestScope(): boolean {
+  return process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
 }
 
 /**
@@ -428,6 +452,14 @@ export class Orchestrator {
   private coordinatedJobs = new Set<string>();
   private jobComms: JobComms = new JobComms();
   private pendingReplanActions: Map<string, () => Promise<void>> = new Map();
+  /**
+   * Conductor fencing identity for this instance (set on start/resume claim).
+   * The reconciler verifies + heartbeats with token/epoch+frescor; an old
+   * leader whose epoch no longer matches is rejected and steps down.
+   * Undefined until this instance claims (unit fakes never claim → skipped).
+   */
+  private conductorToken?: string;
+  private conductorEpoch?: number;
 
   /** F02: explicit repo root (canonical) for this execution. */
   getRepoRoot(): string | null {
@@ -659,6 +691,74 @@ export class Orchestrator {
   }
 
   /**
+   * R01 public gate: fold the external opencode functional review into the
+   * local check. Pass needs BOTH (external pass + local coverage); either
+   * side failing blocks. Fail-closed: an unavailable reviewer (missing
+   * binary, timeout, unparseable output) or missing evidence never passes —
+   * the local heuristic stays auxiliary and never synthesizes a pass.
+   */
+  private async reviewWithExternalSufficiency(
+    input: ReviewInput,
+    gradedRequirements: EssentialRequirement[],
+    requireExternal: boolean,
+  ): Promise<ReviewVerdict> {
+    if (!requireExternal || gradedRequirements.length === 0 || !input.evidence || !input.fileContents) {
+      return reviewJob(requireExternal ? { ...input, requireExternalSufficiency: true } : input);
+    }
+    try {
+      const decision = await this.attachExternalSufficiency(gradedRequirements, input);
+      if (!decision) return reviewJob({ ...input, requireExternalSufficiency: true });
+      return reviewJob({ ...input, sufficiency: decision, requireExternalSufficiency: true });
+    } catch {
+      return reviewJob({ ...input, requireExternalSufficiency: true });
+    }
+  }
+
+  /**
+   * Ask a real OpenCode run for per-criterion functional verdicts and fold
+   * them via toSufficiencyDecision. Never throws: every failure mode
+   * resolves to an all-fail decision (fail-closed, never a pass).
+   */
+  private async attachExternalSufficiency(
+    gradedRequirements: EssentialRequirement[],
+    input: ReviewInput,
+  ): Promise<SufficiencyDecision | null> {
+    if (gradedRequirements.length === 0 || !input.evidence || !input.fileContents) return null;
+    const criteria: FunctionalCriterionInput[] = gradedRequirements.map((r) => ({
+      id: r.id,
+      description: r.description,
+      anchors: r.testAnchors,
+    }));
+    const contents = input.fileContents;
+    const testSet = new Set((input.testPaths ?? []).filter((p) => p in contents));
+    const implFiles: Record<string, string> = {};
+    const tests: Record<string, string> = {};
+    for (const [path, content] of Object.entries(contents)) {
+      if (testSet.has(path)) tests[path] = content;
+      else implFiles[path] = content;
+    }
+    // Unified diff as complementary context (best-effort, never blocking).
+    let implDiff: string | undefined;
+    try {
+      const repoRoot = this.effectiveRepoRoot();
+      const diff = await gitCommand(['diff', `${input.baseBranch}...${input.jobBranch}`], { cwd: repoRoot });
+      if (diff.exitCode === 0 && diff.stdout.trim()) implDiff = diff.stdout.slice(0, 20000);
+    } catch {
+      implDiff = undefined;
+    }
+    const timeoutMs = Number(process.env.MC_REVIEW_TIMEOUT_MS ?? 120000);
+    const results = await reviewFunctionallyViaOpenCode({
+      requirements: criteria,
+      ...(Object.keys(implFiles).length > 0 ? { implFiles } : {}),
+      ...(implDiff ? { implDiff } : {}),
+      ...(Object.keys(tests).length > 0 ? { tests } : {}),
+      outputs: input.evidence.output ?? '',
+      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
+    });
+    return toSufficiencyDecision(results);
+  }
+
+  /**
    * R01: per-task functional gate on the real approval path. NEVER passes on
    * diff alone: derives requirements from the task's acceptance criteria,
    * inspects implementation + tests, runs task-scoped verification (the test
@@ -694,6 +794,10 @@ export class Orchestrator {
     // and keep the strict anchor rule.
     const acceptanceLess = !hasAcceptanceCriteria(job.prompt ?? '');
     const gradedRequirements = acceptanceLess ? [] : requirements;
+    // Public path (reconcile/merge): a pass requires an external opencode
+    // pass decision — the local heuristic never decides alone. Unit scope
+    // (bun test) stays deterministic and keeps the local check only.
+    const requireExternal = !isTestScope() && gradedRequirements.length > 0;
     const touchSet = job.touchSet?.length ? [...job.touchSet] : undefined;
     const baseInput: ReviewInput = {
       jobName: job.name,
@@ -706,6 +810,7 @@ export class Orchestrator {
       requirements: gradedRequirements,
       evidence: null,
       claimedPass: true,
+      ...(requireExternal ? { requireExternalSufficiency: true as const } : {}),
     };
     // Inline evidence cycle: review → gather product-observed evidence →
     // re-review, bounded with quarantine on repeating signatures.
@@ -713,7 +818,7 @@ export class Orchestrator {
     const loop = await runReviewFixLoop({
       input: baseInput,
       options: { maxFixCycles: 1, backoffMs: 0, quarantineAfterRepeats: 2 },
-      review: (input) => reviewJob(input),
+      review: (input) => this.reviewWithExternalSufficiency(input, gradedRequirements, requireExternal),
       fix: async (_attempt, _last, input) => {
         // Evidence present but insufficient: needs a worker, not another probe.
         if (input.evidence) return null;
@@ -946,6 +1051,44 @@ export class Orchestrator {
     return { contents, testPaths };
   }
 
+  /**
+   * Scope paths executed by a candidate run: changed files plus test files
+   * referenced by the test command and discovered test-likes (capped).
+   */
+  private async collectScopePaths(dir: string, changedFiles: string[], command: string | undefined): Promise<string[]> {
+    const refs = command !== undefined ? this.extractCommandFileRefs(command) : [];
+    let discovered: string[] = [];
+    try {
+      discovered = await this.discoverCandidateTests(dir);
+    } catch {
+      discovered = [];
+    }
+    return [...new Set([...changedFiles, ...refs, ...discovered])]
+      .filter((p) => p !== '' && !p.includes('..'))
+      .slice(0, 24);
+  }
+
+  /** Tracked set for the dist/build allowlist (unknown tracking fails closed). */
+  private async buildIsTracked(dir: string): Promise<((rel: string) => boolean) | undefined> {
+    try {
+      const ls = await gitCommand(['-C', dir, 'ls-files']);
+      if (ls.exitCode !== 0) return undefined;
+      const set = new Set(ls.stdout.split('\n').map((l) => l.trim()).filter(Boolean));
+      return (rel: string) => set.has(rel);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Content snapshots as FileIdentity records for the canonical verdict. */
+  private scopeFileIdentities(contents: Record<string, string>): Record<string, FileIdentity> {
+    const out: Record<string, FileIdentity> = {};
+    for (const [key, value] of Object.entries(contents)) {
+      out[key] = { hash: hashScopeContents({ [key]: value }), mtimeMs: 0, size: value.length, exists: true };
+    }
+    return out;
+  }
+
   private async gatherScopeEvidence(
     job: JobSpec,
     jobHead: string,
@@ -997,30 +1140,64 @@ export class Orchestrator {
       let contentsA: Record<string, string> = {};
       let testsA: string[] = [];
       if (cmdA) {
-        // §4 TOCTOU: snapshot content BEFORE the run so a mutation during the
-        // test is detected afterwards (HEAD/dirty alone miss content swaps
-        // that keep the ref still).
+        // §4 TOCTOU A→B→A: the run executes under protected inputs
+        // (snapshot hash before, read-only hardening, re-hash on a short
+        // poll, hash+mtime compare after). A swap that executes and restores
+        // — invisible to HEAD/dirty/content-after — still refuses identity.
+        // Allowlist respected inside: untracked dist/build outputs stay
+        // writable, versioned dist stays a protected input.
         const scopedBefore = await this.readScopeContents(jobCandidate, changedFiles, cmdA).catch(() => null);
-        const result = await runTestCommand(jobCandidate, cmdA, timeout);
+        const scopePathsA = await this.collectScopePaths(jobCandidate, changedFiles, cmdA);
+        const isTrackedA = await this.buildIsTracked(jobCandidate);
+        let runA: { success: boolean; output: string; timedOut: boolean } | undefined;
+        const protectionA = await protectInputsDuringRun({
+          dir: jobCandidate,
+          scopePaths: scopePathsA,
+          ...(isTrackedA ? { isTracked: isTrackedA } : {}),
+          runFn: async () => {
+            runA = await runTestCommand(jobCandidate, cmdA, timeout);
+          },
+        });
+        const result = runA ?? {
+          success: false,
+          output: `protection refused the run: ${protectionA.reason ?? 'write denied on protected input'}`,
+          timedOut: false,
+        };
         // Re-observe AFTER the run AND after reading: never stamp the
         // pre-test head over changed content (§4 Bloqueante B).
         const observedAfter = await this.observeCandidateState(jobCandidate);
         const scoped = await this.readScopeContents(jobCandidate, changedFiles, cmdA);
         contentsA = scoped.contents;
         testsA = scoped.testPaths;
+        // Canonical identity verdict over the executed bytes: content hash
+        // plus transient hits observed DURING the run. testedCommit is never
+        // stamped clean over a transient mutation — it fails here.
+        const canonicalA = scopedBefore
+          ? decideIdentityVerdict(
+              this.scopeFileIdentities(scopedBefore.contents),
+              this.scopeFileIdentities(contentsA),
+              protectionA.transientHits,
+            )
+          : protectionA.verdict === 'fail'
+            ? { verdict: 'fail' as const, reason: protectionA.reason }
+            : { verdict: 'pass' as const };
         const mutated = scopedBefore
           ? hasRelevantContentChange(scopedBefore.contents, contentsA)
           : false;
+        const protectionFail = protectionA.verdict === 'fail' || canonicalA.verdict === 'fail';
         const diverged = observedAfter.head !== observedJob.head;
-        const dirtyAfter = observedAfter.dirty || mutated || diverged;
+        const dirtyAfter = observedAfter.dirty || mutated || diverged || protectionFail;
+        const refusalA = protectionFail
+          ? (protectionA.reason ?? canonicalA.reason ?? 'identity refused: input changed during run')
+          : undefined;
         evidenceA = this.toScopeEvidence(
           cmdA,
           result,
           { testedCommit: observedAfter.head ?? jobHead, dirty: dirtyAfter },
           `worktree:${jobCandidate} (product-executed, job scope, ${process.platform})`,
-          dirtyAfter && result.success
+          refusalA ?? (dirtyAfter && result.success
             ? `identity refused: tree changed during test (head ${observedJob.head?.slice(0, 8)}→${observedAfter.head?.slice(0, 8)}, dirty=${observedAfter.dirty}, content-changed=${mutated}) — not attributed to ${jobHead.slice(0, 8)}`
-            : undefined,
+            : undefined),
         );
         if (result.success && !dirtyAfter && observedAfter.head === jobHead && observedAfter.head === observedJob.head) {
           return { evidence: evidenceA, fileContents: contentsA, testPaths: testsA };
@@ -1041,18 +1218,46 @@ export class Orchestrator {
       const cmdB = configured ?? await detectTestCommand(candidateDir);
       if (!cmdB) return evidenceA ? { evidence: evidenceA, fileContents: contentsA, testPaths: testsA } : null;
       const scopedBBefore = await this.readScopeContents(candidateDir, changedFiles, cmdB).catch(() => null);
-      const resultB = await runTestCommand(candidateDir, cmdB, timeout);
+      const scopePathsB = await this.collectScopePaths(candidateDir, changedFiles, cmdB);
+      const isTrackedB = await this.buildIsTracked(candidateDir);
+      let runB: { success: boolean; output: string; timedOut: boolean } | undefined;
+      const protectionB = await protectInputsDuringRun({
+        dir: candidateDir,
+        scopePaths: scopePathsB,
+        ...(isTrackedB ? { isTracked: isTrackedB } : {}),
+        runFn: async () => {
+          runB = await runTestCommand(candidateDir, cmdB, timeout);
+        },
+      });
+      const resultB = runB ?? {
+        success: false,
+        output: `protection refused the run: ${protectionB.reason ?? 'write denied on protected input'}`,
+        timedOut: false,
+      };
       // §4: same re-observation as scope 1 — never stamp the pre-test
       // candidate head over content changed by the test run.
       const candidateAfter = await this.observeCandidateState(candidateDir);
       const scopedB = await this.readScopeContents(candidateDir, changedFiles, cmdB);
       const contentsB = scopedB.contents;
       const testsB = scopedB.testPaths;
+      const canonicalB = scopedBBefore
+        ? decideIdentityVerdict(
+            this.scopeFileIdentities(scopedBBefore.contents),
+            this.scopeFileIdentities(contentsB),
+            protectionB.transientHits,
+          )
+        : protectionB.verdict === 'fail'
+          ? { verdict: 'fail' as const, reason: protectionB.reason }
+          : { verdict: 'pass' as const };
       const mutatedB = scopedBBefore
         ? hasRelevantContentChange(scopedBBefore.contents, contentsB)
         : false;
+      const protectionFailB = protectionB.verdict === 'fail' || canonicalB.verdict === 'fail';
       const divergedB = candidateAfter.head !== candidateObserved.head;
-      const dirtyAfterB = candidateAfter.dirty || mutatedB || divergedB;
+      const dirtyAfterB = candidateAfter.dirty || mutatedB || divergedB || protectionFailB;
+      const refusalB = protectionFailB
+        ? (protectionB.reason ?? canonicalB.reason ?? 'identity refused: candidate input changed during run')
+        : undefined;
       const evidenceB = this.toScopeEvidence(
         cmdB,
         resultB,
@@ -1064,9 +1269,9 @@ export class Orchestrator {
           dirty: dirtyAfterB,
         },
         `integration-candidate:${candidateDir} (base ${integrationBranch}@${(baseObserved.head ?? '').slice(0, 8)} + job ${jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
-        dirtyAfterB && resultB.success
+        refusalB ?? (dirtyAfterB && resultB.success
           ? `identity refused: candidate changed during test (head ${candidateObserved.head?.slice(0, 8)}→${candidateAfter.head?.slice(0, 8)}, dirty=${candidateAfter.dirty}, content-changed=${mutatedB})`
-          : undefined,
+          : undefined),
       );
       if (resultB.success && !dirtyAfterB && candidateAfter.head === candidateObserved.head) return { evidence: evidenceB, fileContents: contentsB, testPaths: testsB };
       // Both scopes failed: combined evidence so the diagnosis names both.
@@ -1282,6 +1487,68 @@ export class Orchestrator {
   }
 
   /**
+   * Claim conductor ownership and keep the fencing identity (token/epoch).
+   * Best-effort so unit fakes without state dir keep working; the handoff
+   * verifies by re-read and fails closed when absent.
+   */
+  private async claimConductorOwnership(planId: string, command: string, owner: string, repoRoot: string): Promise<void> {
+    try {
+      const lease = await claimConductorLease(planId, process.pid, command, owner, repoRoot);
+      this.conductorToken = lease.token;
+      this.conductorEpoch = lease.epoch;
+    } catch {
+      // Best-effort: the public handoff re-reads the lease and fails closed.
+    }
+  }
+
+  /**
+   * Periodic liveness: verify ownership with token/epoch+frescor, then
+   * heartbeat. Returns false when this instance no longer owns the plan
+   * (takeover bumped the epoch, token rotated, or lease went stale) — the
+   * old leader must step down, never keep driving. Skipped until this
+   * instance claims (unit fakes without a claim never heartbeat) and in
+   * unit scope (bun test stays deterministic — fencing itself is covered
+   * by the plan-state and handoff suites with real state dirs, never by
+   * the loop here).
+   */
+  private async heartbeatConductor(planId: string, repoRoot: string): Promise<boolean> {
+    if (isTestScope()) return true;
+    if (this.conductorToken === undefined && this.conductorEpoch === undefined) return true;
+    try {
+      const owned = await verifyConductorLease(planId, process.pid, repoRoot, {
+        token: this.conductorToken,
+        epoch: this.conductorEpoch,
+        ...conductorStaleOpts(),
+      });
+      if (!owned) return false;
+      try {
+        const lease = await recordHeartbeat(planId, process.pid, repoRoot, { token: this.conductorToken });
+        this.conductorToken = lease.token;
+        this.conductorEpoch = lease.epoch;
+      } catch {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Mark work progress (also refreshes liveness). Best-effort, never throws.
+   * Skipped in unit scope (same determinism precedent as the heartbeat). */
+  private async progressConductor(planId: string, repoRoot: string): Promise<void> {
+    if (isTestScope()) return;
+    if (this.conductorToken === undefined && this.conductorEpoch === undefined) return;
+    try {
+      const lease = await recordProgress(planId, process.pid, repoRoot, { token: this.conductorToken });
+      this.conductorToken = lease.token;
+      this.conductorEpoch = lease.epoch;
+    } catch {
+      // Best-effort: a fencing mismatch surfaces on the next heartbeat verify.
+    }
+  }
+
+  /**
    * Auto final report (best-effort, never throws): same fail-closed shape as
    * mc_report_final, written from live state when the run reaches its end.
    * F09: carries the real request, decisions, files, tests and verified
@@ -1391,6 +1658,15 @@ export class Orchestrator {
         .filter((r) => r.testCommand)
         .map((r) => ({ command: `${r.scope === 'integration' ? '[integration] ' : r.scope === 'task' ? '[task] ' : ''}${r.testCommand!}`, result: r.testStatus, output: r.testOutput }));
       const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
+      // OMO status declared explicitly (never a silent success): without OMO
+      // the report records vanilla-only execution as the limitation.
+      let omoLine = 'Limitation: OMO status unknown — vanilla execution only.';
+      try {
+        const omo = await detectOMO().catch(() => null);
+        if (omo) omoLine = describeOmoLimitation(omo.detected, omo.configSource ?? undefined);
+      } catch {
+        // Best-effort: the unknown-status line above already fails closed.
+      }
       const markdown = buildFinalReportMarkdown({
         title: plan.name,
         request: intake?.request?.trim() ? intake.request.trim() : `Plan "${plan.name}" (${plan.mode}) — ${plan.jobs.length} job(s).`,
@@ -1426,6 +1702,7 @@ export class Orchestrator {
         unverified,
         limitations: [
           'Local completion only; no push/PR without explicit humanAuth',
+          omoLine,
           ...(unverified.length > 0 || unmet.length > 0 ? [] : []),
         ],
         nextSteps: unverified.length > 0 || unmet.length > 0
@@ -1755,11 +2032,10 @@ export class Orchestrator {
     this.planPlacement = spec.placement ?? null;
     this.planLaunchSessionID = spec.launchSessionID;
     // Conductor lease on boot: this driver proves assumption (sonda 13).
-    // Best-effort so unit fakes without state dir keep working; the public
-    // handoff re-reads the lease and fails closed when absent.
-    try {
-      await claimConductorLease(plan.id, process.pid, `start plan ${plan.id}`, 'orchestrator-start', repoRoot);
-    } catch {}
+    // Keeps the fencing identity (token/epoch) for periodic heartbeat +
+    // verify in the reconciler; best-effort so unit fakes without state dir
+    // keep working (the public handoff re-reads the lease and fails closed).
+    await this.claimConductorOwnership(plan.id, `start plan ${plan.id}`, 'orchestrator-start', repoRoot);
     this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
     this.subscribeToMonitorEvents();
     this.ensureMonitorRunning();
@@ -1869,6 +2145,20 @@ export class Orchestrator {
 
       if (plan.status === 'paused' || this.checkpoint) {
         return;
+      }
+
+      // Conductor liveness: verify ownership (token/epoch+frescor) and
+      // heartbeat periodically. An old leader whose epoch no longer matches
+      // (takeover bumped it) is rejected here and steps down — never drives.
+      // Skipped until this instance claims (unit fakes never claim).
+      if (this.conductorToken !== undefined || this.conductorEpoch !== undefined) {
+        const stillOwner = await this.heartbeatConductor(plan.id, repoRoot);
+        if (!stillOwner) {
+          console.warn(`[MC] conductor fencing: pid ${process.pid} no longer owns plan ${plan.id} (epoch ${this.conductorEpoch}) — stepping down.`);
+          this.stopReconciler();
+          this.unsubscribeFromMonitorEvents();
+          return;
+        }
       }
 
       this.activePlanId = plan.id;
@@ -2143,6 +2433,8 @@ export class Orchestrator {
             current.status = 'merged';
             current.mergedAt = mergeResult.mergedAt;
           }
+          // Conductor progress: a merge proves work advanced (periodic proof).
+          await this.progressConductor(plan.id, repoRoot);
           // F09: conserve product-observed evidence for the final report.
           // R05 trail: the per-merge write carries merge metadata only. When
           // the merge ran with skipTest (no repo-wide run here), verification
@@ -4143,9 +4435,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       this.planLaunchSessionID = plan.launchSessionID;
       // Conductor lease on boot (resume path): this process proves assumption.
       // Best-effort so unit fakes keep working; handoff verifies by re-read.
-      try {
-        await claimConductorLease(plan.id, process.pid, `resume plan ${plan.id}`, 'orchestrator-resume', repoRoot);
-      } catch {}
+      await this.claimConductorOwnership(plan.id, `resume plan ${plan.id}`, 'orchestrator-resume', repoRoot);
       this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
 
       const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);

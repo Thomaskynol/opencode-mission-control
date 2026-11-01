@@ -305,7 +305,12 @@ export async function v2GetSession(
   return unwrapData<V2SessionInfo>(payload, 'get session');
 }
 
-/** Normalize an empty variant to undefined so "no pin" compares cleanly. */
+/** Normalize an empty variant to undefined so "no pin" compares cleanly.
+ * The 2.2.5 server echoes the literal "default" when a session was created
+ * without a variant: that echo means NO pin was applied and verifies only
+ * against a variant-less request. An explicitly pinned variant (e.g.
+ * #xhigh) must still match exactly — "default" never masks a real pin,
+ * and a real pin never matches "default". */
 function normalizeVariant(variant?: string): string | undefined {
   if (!variant) return undefined;
   const v = variant.trim();

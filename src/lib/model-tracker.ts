@@ -124,6 +124,23 @@ export function getCurrentModelRef(sessionID?: string): { providerID: string; id
 }
 
 /**
+ * Fail-closed accessor for the serve/worker path: returns the tracked
+ * triple (variant preserved) or throws — never a silent installation
+ * default. String fallbacks (getCurrentModel / config) drop the variant;
+ * this ref keeps it so planner and worker share the effective model.
+ */
+export function requireTrackedModelRef(sessionID?: string): { providerID: string; id: string; variant?: string } {
+  const ref = getCurrentModelRef(sessionID);
+  if (!ref) {
+    throw new Error(
+      '[MC] serve mode requires a pinned model, none tracked for this session — ' +
+      'set it via the model tracker (or coordinator snapshot) instead of running unpinned.',
+    );
+  }
+  return ref;
+}
+
+/**
  * Clear the tracked model.
  * If sessionID is provided, clears only that session entry.
  * If no sessionID, clears lastSetModel.
