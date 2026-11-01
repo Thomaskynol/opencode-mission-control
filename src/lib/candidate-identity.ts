@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { isAbsolute, join } from 'path';
 
@@ -182,7 +182,19 @@ function sha256Hex(bytes: Buffer): string {
 function snapshotOne(dir: string, rel: string): { identity: FileIdentity; mode: number } {
   const missing: FileIdentity = { hash: '', mtimeMs: 0, size: -1, exists: false };
   try {
-    const st = statSync(join(dir, rel));
+    const st = lstatSync(join(dir, rel));
+    if (st.isSymbolicLink()) {
+      let target = '';
+      try {
+        target = readlinkSync(join(dir, rel));
+      } catch {
+        return { identity: missing, mode: 0 };
+      }
+      return {
+        identity: { hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, size: st.size, exists: true },
+        mode: st.mode & 0o777,
+      };
+    }
     if (!st.isFile()) return { identity: missing, mode: 0 };
     const bytes = readFileSync(join(dir, rel));
     return {
@@ -341,7 +353,19 @@ function snapshotStrict(dir: string, rel: string): StrictSnapshot {
     ctimeMs: -1,
   };
   try {
-    const st = statSync(join(dir, rel));
+    const st = lstatSync(join(dir, rel));
+    if (st.isSymbolicLink()) {
+      let target = '';
+      try {
+        target = readlinkSync(join(dir, rel));
+      } catch {
+        return missing;
+      }
+      return {
+        identity: { hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, size: st.size, exists: true },
+        ctimeMs: typeof st.ctimeMs === 'number' ? st.ctimeMs : -1,
+      };
+    }
     if (!st.isFile()) return missing;
     const bytes = readFileSync(join(dir, rel));
     return {
@@ -401,8 +425,16 @@ async function resolveHead(dir: string, jobHead?: string): Promise<string | unde
 
 /**
  * Run testCommand in a tmp snapshot of the committed (or hash-verified
- * copied) inputs and refuse attribution when the original was touched during
- * the run. The snapshot dir is removed afterwards unless keepSnapshotDir.
+ * copied) inputs and refuse attribution when the original OR the executed
+ * snapshot copy was touched during the run. The snapshot dir is removed
+ * afterwards unless keepSnapshotDir.
+ *
+ * A: snapshot-local swap+restore (write evil, import it, restore) changes
+ * ctime even when hash+mtime are forged back, so it fails instead of
+ * passing. Snapshot protected inputs are hardened read-only best-effort;
+ * a chmod bypass still bumps ctime and fails. Untracked dist/build/coverage
+ * outputs stay writable (not in protectedPaths). Missing node_modules in
+ * the copy is a test failure (success false), never a PASS.
  */
 export async function runTestsOnImmutableSnapshot(
   options: ImmutableSnapshotOptions,
@@ -424,6 +456,7 @@ export async function runTestsOnImmutableSnapshot(
 
   let test: { success: boolean; output: string; timedOut: boolean };
   let racedCopy: string | undefined;
+  const snapBefore = new Map<string, StrictSnapshot>();
   try {
     const head = await resolveHead(options.dir, options.jobHead);
     let materialized = false;
@@ -456,6 +489,16 @@ export async function runTestsOnImmutableSnapshot(
         }
       }
     }
+    // Harden executed inputs read-only best-effort (defense in depth; the
+    // ctime after-compare below is the proof, even as root or after chmod).
+    for (const rel of protectedPaths) {
+      try {
+        chmodSync(join(snapshotDir, rel), ENFORCED_MODE);
+      } catch {
+        // Best-effort: missing/allowed outputs stay as-is; detection applies.
+      }
+    }
+    for (const rel of protectedPaths) snapBefore.set(rel, snapshotStrict(snapshotDir, rel));
     test =
       racedCopy !== undefined
         ? { success: false, output: '', timedOut: false }
@@ -484,25 +527,63 @@ export async function runTestsOnImmutableSnapshot(
       ctimeHits.push(rel);
     }
   }
+  const snapBeforeIds: Record<string, FileIdentity> = {};
+  const snapAfterIds: Record<string, FileIdentity> = {};
+  const snapCtimeHits: string[] = [];
+  for (const rel of protectedPaths) {
+    const b = snapBefore.get(rel);
+    if (b === undefined) continue;
+    const liveSnap = snapshotStrict(snapshotDir, rel);
+    // Unversioned dist/build outputs are writable: a file absent from the
+    // committed snapshot (not in git archive) that appears afterwards is a
+    // legit build output, never a protected input. Versioned dist/build
+    // exists in snapBefore, so it stays protected and blocks attribution.
+    // shortcut: when tracking is unknown (isTracked undefined) archive
+    // absence is the versioned proof; upgrade to explicit isTracked when
+    // stricter fail-closed is needed.
+    if (!b.identity.exists && DIST_BUILD_PREFIX.test(rel)) continue;
+    snapBeforeIds[rel] = b.identity;
+    snapAfterIds[rel] = liveSnap.identity;
+    if (
+      b.identity.exists &&
+      liveSnap.identity.exists &&
+      b.ctimeMs >= 0 &&
+      liveSnap.ctimeMs >= 0 &&
+      b.ctimeMs !== liveSnap.ctimeMs
+    ) {
+      snapCtimeHits.push(rel);
+    }
+  }
+  const decideWithCtime = (
+    bIds: Record<string, FileIdentity>,
+    aIds: Record<string, FileIdentity>,
+    hits: string[],
+    where: 'original' | 'snapshot',
+  ): IdentityVerdict => {
+    if (hits.length > 0) {
+      const contentVerdict = decideIdentityVerdict(bIds, aIds, []);
+      if (contentVerdict.verdict === 'fail') return contentVerdict;
+      const names = [...hits].sort().join(', ');
+      return {
+        verdict: 'fail',
+        reason: `identity refused: ${where} input restored after write during run (${names}, content identical but ctime changed — A→B→A with mtime forgery detected)`,
+      };
+    }
+    return decideIdentityVerdict(bIds, aIds, []);
+  };
   let decided: IdentityVerdict;
   if (racedCopy !== undefined) {
     decided = {
       verdict: 'fail',
       reason: `identity refused: snapshot copy raced a concurrent mutation (${racedCopy}) — executed bytes may differ from snapshotted bytes`,
     };
-  } else if (ctimeHits.length > 0) {
-    const contentVerdict = decideIdentityVerdict(beforeIds, afterIds, []);
-    if (contentVerdict.verdict === 'fail') {
-      decided = contentVerdict;
-    } else {
-      const names = [...ctimeHits].sort().join(', ');
-      decided = {
-        verdict: 'fail',
-        reason: `identity refused: input restored after write during run (${names}, content identical but ctime changed — A→B→A with mtime forgery detected)`,
-      };
-    }
   } else {
-    decided = decideIdentityVerdict(beforeIds, afterIds, []);
+    const snapDecided = decideWithCtime(snapBeforeIds, snapAfterIds, snapCtimeHits, 'snapshot');
+    if (snapDecided.verdict === 'fail') {
+      decided = snapDecided;
+    } else {
+      decided = decideWithCtime(beforeIds, afterIds, ctimeHits, 'original');
+    }
   }
   cleanup();
   return {

@@ -5,7 +5,7 @@ import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validat
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
-import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit } from './merge-train';
+import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit, matchesTouchPattern } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
 import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
 import { runTestsOnImmutableSnapshot } from './candidate-identity';
@@ -445,12 +445,14 @@ export function canMergeJobNow(
  * (empty diff)` legado. O job `failed` nunca é re-revisado (review só roda na
  * fila de merge), então nem reconcile, nem resume, nem retry resolvem.
  *
- * Cura fail-closed: só cura quando (a) há mergeEvidence PASS com reviewedCommit,
- * (b) a branch do job ainda está NO MESMO commit (evidência fresca, nunca stale),
- * e (c) o conteúdo está contido na integration — ancestralidade direta
- * (`merge-base --is-ancestor`, caso ff) OU diff vazio por arquivo do
- * touchSet/changedFiles (caso squash, que cria commit novo). Falha funcional
- * sem PASS e commit divergente nunca curam.
+ * Cura fail-closed: só cura quando (a) há mergeEvidence PASS task-scoped com
+ * reviewedCommit, (b) a branch do job ainda está NO MESMO commit (evidência
+ * fresca, nunca stale), e (c) o conteúdo está contido na integration —
+ * ancestralidade direta (`merge-base --is-ancestor`, caso ff) OU diff vazio
+ * por arquivo efetivamente alterado (caso squash, que cria commit novo).
+ * Exige scope task pinado ao commit; comprova presença via diff --name-only
+ * real, distingue renames/deletes, padrão sem correspondência NÃO conta,
+ * diff vazio rejeita. Falha funcional sem PASS e commit divergente nunca curam.
  */
 export async function shouldHealFailedAsMerged(opts: {
   repoRoot: string;
@@ -461,6 +463,9 @@ export async function shouldHealFailedAsMerged(opts: {
   const ev = opts.evidence;
   if (!ev || ev.testStatus !== 'passed' || !ev.reviewedCommit) {
     return { heal: false, reason: 'no PASS evidence (functional failure stays failed)' };
+  }
+  if (ev.scope !== 'task') {
+    return { heal: false, reason: `requires task-scoped evidence (got scope ${ev.scope ?? 'missing'}) — integration/global smoke never heals` };
   }
   const branch = opts.job.branch;
   if (!branch || !opts.integrationBranch) {
@@ -477,27 +482,71 @@ export async function shouldHealFailedAsMerged(opts: {
   if (ancestor.exitCode === 0) {
     return { heal: true, reason: `reviewed commit ${ev.reviewedCommit.slice(0, 8)} is an ancestor of ${opts.integrationBranch}` };
   }
-  const paths = (opts.job.touchSet?.length ? opts.job.touchSet : ev.changedFiles) ?? [];
-  let checked = 0;
-  for (const rel of paths) {
+  const rawChanged = Array.isArray(ev.changedFiles) ? ev.changedFiles : [];
+  const changed: string[] = [];
+  for (const rel of rawChanged) {
     const safe = rel.replace(/^\/+/, '').trim();
     if (!safe || safe.includes('..')) continue;
+    if (!changed.includes(safe)) changed.push(safe);
+  }
+  if (changed.length === 0) {
+    return { heal: false, reason: 'not an ancestor and no changedFiles to verify containment (empty diff rejects)' };
+  }
+  const rawTouch = Array.isArray(opts.job.touchSet) ? opts.job.touchSet : [];
+  const touchPatterns = rawTouch.map((p) => p.replace(/^\/+/, '').trim()).filter((p) => p !== '' && !p.includes('..'));
+  if (touchPatterns.length > 0) {
+    for (const file of changed) {
+      let covered = false;
+      for (const pattern of touchPatterns) {
+        try {
+          if (matchesTouchPattern(pattern, file)) {
+            covered = true;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+      if (!covered) {
+        return { heal: false, reason: `changed file ${file} outside touchSet scope — inconsistent evidence` };
+      }
+    }
+  }
+  let checked = 0;
+  for (const file of changed) {
+    const existsReviewed = await gitCommand(['cat-file', '-e', `${ev.reviewedCommit}:${file}`], { cwd: opts.repoRoot });
+    const existsIntegration = await gitCommand(['cat-file', '-e', `${opts.integrationBranch}:${file}`], { cwd: opts.repoRoot });
+    const inReviewed = existsReviewed.exitCode === 0;
+    const inIntegration = existsIntegration.exitCode === 0;
+    if (!inReviewed && !inIntegration) {
+      return { heal: false, reason: `${file} absent in both reviewed and integration (delete without proof / pattern without correspondence) — requires manual` };
+    }
+    if (inReviewed !== inIntegration) {
+      return { heal: false, reason: `${file} presence diverges from ${opts.integrationBranch} (rename/delete) — requires manual` };
+    }
     const diff = await gitCommand(
-      ['diff', opts.integrationBranch, ev.reviewedCommit, '--', safe],
+      ['diff', opts.integrationBranch, ev.reviewedCommit, '--', file],
       { cwd: opts.repoRoot },
     );
     if (diff.exitCode !== 0) {
-      return { heal: false, reason: `containment check failed for ${safe} (grounded)` };
+      return { heal: false, reason: `containment check failed for ${file} (grounded)` };
     }
     if (diff.stdout.trim() !== '') {
-      return { heal: false, reason: `${safe} diverges from ${opts.integrationBranch}` };
+      return { heal: false, reason: `${file} diverges from ${opts.integrationBranch}` };
+    }
+    const status = await gitCommand(
+      ['diff', '--name-status', opts.integrationBranch, ev.reviewedCommit, '--', file],
+      { cwd: opts.repoRoot },
+    );
+    if (status.exitCode === 0 && /^[RC]\d*\s/m.test(status.stdout)) {
+      return { heal: false, reason: `${file} rename/copy detected — requires manual` };
     }
     checked += 1;
   }
   if (checked === 0) {
     return { heal: false, reason: 'not an ancestor and no touchSet/changedFiles to verify containment' };
   }
-  return { heal: true, reason: `touchSet content of ${ev.reviewedCommit.slice(0, 8)} already contained in ${opts.integrationBranch}` };
+  return { heal: true, reason: `task content of ${ev.reviewedCommit.slice(0, 8)} already contained in ${opts.integrationBranch} (${checked} file(s) verified)` };
 }
 
 export class Orchestrator {
