@@ -76,8 +76,7 @@ describe('test-env parity (F)', () => {
     expect(r.output).toMatch(/ENV-UNPREPARED/);
   });
 
-  it('parity: same commit with deps available → same success both ways', async () => {
-    const { dir } = makeFixture(false, false);
+  it('parity: same commit with deps available → same success both ways', async () => {    const { dir } = makeFixture(false, false);
     const { runTestsOnImmutableSnapshot } = await import('../../src/lib/candidate-identity');
     const { runTestCommand } = await import('../../src/lib/merge-train');
     const head = (await Bun.$`git -C ${dir} rev-parse HEAD`.text()).trim();
@@ -91,5 +90,16 @@ describe('test-env parity (F)', () => {
     } finally {
       await Bun.$`rm -rf ${review.snapshotDir}`.quiet();
     }
+  });
+
+  it('relative missing require stays test failure, never env-failure', async () => {
+    const { isExternalMissingModule } = await import('../../src/lib/test-env');
+    expect(isExternalMissingModule(`Error: Cannot find module './utls'`)).toBe(false);
+  });
+
+  it('bare missing specifier is env-failure', async () => {
+    const { isExternalMissingModule, ENV_UNPREPARED } = await import('../../src/lib/test-env');
+    expect(isExternalMissingModule(`Error: Cannot find module 'fake-dep-xyz'`)).toBe(true);
+    expect(ENV_UNPREPARED).toMatch(/ENV-UNPREPARED/);
   });
 });

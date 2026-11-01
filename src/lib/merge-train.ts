@@ -975,9 +975,14 @@ export class MergeTrain {
       // F parity: undeclared missing dep (MODULE_NOT_FOUND) with no install
       // path is env-failure, not a code test failure. Fail closed as
       // env-failure (never pass/skip), preserving toctou-style tests.
+      // Only bare (external) specifiers convert: relative/absolute requires
+      // are genuine code bugs and stay test failures.
       if (!testResult.timedOut && /Cannot find module|MODULE_NOT_FOUND/i.test(testResult.output)) {
         try {
-          const { ENV_UNPREPARED } = await import('./test-env.js');
+          const { ENV_UNPREPARED, isExternalMissingModule } = await import('./test-env.js');
+          if (!isExternalMissingModule(testResult.output)) {
+            // relative/absolute require typo: code defect, not env — fall through to normal failure
+          } else {
           const out = testResult.output.includes('ENV-UNPREPARED') ? testResult.output : `${ENV_UNPREPARED}\n${testResult.output}`;
           await rollbackMergeToHead(this.integrationWorktree, headBeforeStr);
           return {
@@ -995,6 +1000,7 @@ export class MergeTrain {
               },
             },
           };
+          }
         } catch {}
       }
       const fixTimeout = this.config?.fixBeforeRollbackTimeout ?? DEFAULT_FIX_BEFORE_ROLLBACK_TIMEOUT_MS;

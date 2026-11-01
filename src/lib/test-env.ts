@@ -14,6 +14,22 @@ import { join } from 'path';
 export const ENV_UNPREPARED =
   'ENV-UNPREPARED: test dependencies cannot be prepared (missing node_modules, no lockfile/install command or install failed/offline) — failing closed, never pass/skip';
 
+/**
+ * True when test output shows a missing BARE (non-relative, non-absolute)
+ * module specifier — i.e. an undeclared/external dependency, not a code bug.
+ * Node prints `Cannot find module '<spec>'`; relative (`./x`, `../x`) and
+ * absolute (`/x`) specifiers are genuine code defects and must stay test
+ * failures. When no specifier is extractable, returns true (fail-closed:
+ * preserve the previous conversion behavior).
+ */
+export function isExternalMissingModule(output: string): boolean {
+  const m = /Cannot find module '([^']+)'/.exec(output) ?? /Cannot find module "([^"]+)"/.exec(output);
+  if (!m) return true;
+  const spec = m[1];
+  if (spec.startsWith('.') || spec.startsWith('/')) return false;
+  return true;
+}
+
 export type EnvPreparation =
   | { status: 'ready'; commands: string[]; output: string }
   | { status: 'failed'; commands: string[]; output: string }

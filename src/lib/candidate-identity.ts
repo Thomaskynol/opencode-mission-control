@@ -529,12 +529,14 @@ export async function runTestsOnImmutableSnapshot(
     // install from) surfaces as MODULE_NOT_FOUND after the run. Convert to
     // env-failure with ENV-UNPREPARED (fail-closed, never pass/skip), preserving
     // toctou-style tests that need no deps (their output is identity-based).
+    // Only bare (external) specifiers convert: relative/absolute requires are
+    // genuine code bugs and stay test failures.
     if (test.success === false && test.timedOut === false && test.output) {
       const missingDep = /Cannot find module|MODULE_NOT_FOUND/i.test(test.output);
       if (missingDep) {
         try {
-          const { ENV_UNPREPARED } = await import('./test-env.js');
-          if (!test.output.includes('ENV-UNPREPARED')) {
+          const { ENV_UNPREPARED, isExternalMissingModule } = await import('./test-env.js');
+          if (!test.output.includes('ENV-UNPREPARED') && isExternalMissingModule(test.output)) {
             test = { success: false, output: `${ENV_UNPREPARED}\n${test.output}`, timedOut: false };
           }
         } catch {}
