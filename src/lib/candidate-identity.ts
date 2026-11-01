@@ -31,7 +31,9 @@ import { isAbsolute, join } from 'path';
  * Limits: a DIRTY working tree at snapshot time still snapshots committed
  * bytes via git archive (copy fallback snapshots working bytes and fails on
  * a raced copy); the original is watched, not locked — a test that reaches
- * it via absolute path or `..` is DETECTED (fail), not prevented; system
+ * it via absolute path or `..` and MUTATES it is DETECTED (fail), not
+ * prevented; a read-only reach with no concurrent mutation passes harmlessly
+ * (same bytes), with a concurrent mutation it still fails via ctime; system
  * clock tampering is out of scope.
  *
  * Integrator plug (orchestrator.ts runScopeSnapshot → gatherScopeEvidence):

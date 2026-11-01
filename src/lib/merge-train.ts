@@ -70,7 +70,11 @@ const INSTALL_COMMAND_BY_LOCKFILE = [
  * "this directory and everything inside it" (`src/` = `src/**`).
  */
 export function matchesTouchPattern(pattern: string, file: string): boolean {
-  const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;
+  // Paridade com auto-plan/coordinator (normalizeCoherencePath,
+  // touchPatternsOverlap): "./" inicial não muda o caminho — sem isso
+  // planning aceita e validateTouchSet/reviewer rejeitam o mesmo scope.
+  const unprefixed = pattern.startsWith('./') ? pattern.slice(2) : pattern;
+  const normalized = unprefixed.endsWith('/') ? `${unprefixed}**` : unprefixed;
   return new Bun.Glob(normalized).match(file);
 }
 

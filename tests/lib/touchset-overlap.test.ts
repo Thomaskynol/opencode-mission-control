@@ -108,3 +108,17 @@ describe('C — overlap canônico caminho/padrão (RED no HEAD)', () => {
     ).rejects.toThrow(/overlap|no dependsOn ordering/i);
   });
 });
+
+describe('C — acordo planning/dispatch/integration em padrões "./"-prefixados', () => {
+  it('./src/** cobre src/total.js em todos os níveis (matcher, covers, overlap)', () => {
+    // planning (touchSetCovers) e overlap já normalizam "./"; o matcher
+    // canônico precisa concordar ou validateTouchSet/reviewer divergem.
+    expect(touchSetCovers(['./src/**'], 'src/total.js')).toBe(true);
+    expect(touchPatternsOverlap('./src/**', 'src/total.js')).toBe(true);
+    expect(matchesTouchPattern('./src/**', 'src/total.js')).toBe(true);
+  });
+
+  it('./src/total.js casa src/total.js no matcher canônico', () => {
+    expect(matchesTouchPattern('./src/total.js', 'src/total.js')).toBe(true);
+  });
+});
