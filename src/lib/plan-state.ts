@@ -9,6 +9,53 @@ import { atomicWrite } from './utils';
 
 const PLAN_FILE = 'plan.json';
 
+/** Fencing identity for writes: must match the live conductor lease. */
+export interface PlanFencing {
+  token?: string;
+  epoch?: number;
+  pid?: number;
+}
+
+/**
+ * Fail-closed fencing: when a conductor lease exists for this plan, a write
+ * without a matching token/epoch is a stale-holder write and is rejected.
+ * No lease (or lease for a different plan) allows the write (plan creation
+ * happens before the first claim; legacy callers without a lease keep working).
+ * Owner-process fast path: a write from the lease owner pid without explicit
+ * fencing is allowed (orchestrator legacy paths run in the owner process);
+ * any other pid without fencing is rejected. Explicit fencing must always match.
+ */
+export async function assertPlanFencing(
+  planId: string,
+  repoRoot?: string,
+  fencing?: PlanFencing,
+): Promise<void> {
+  const lease = await readConductorLease(repoRoot);
+  if (!lease) return;
+  if (lease.planId !== planId) return;
+  if (!fencing) {
+    if (process.pid === lease.pid) return;
+    throw new Error(
+      `Conductor lease fencing: write to plan "${planId}" requires fencing (epoch ${lease.epoch}) — stale holder without token rejected.`,
+    );
+  }
+  if (lease.token && fencing.token !== lease.token) {
+    throw new Error(
+      `Conductor lease fencing: stale token for plan "${planId}" (epoch ${lease.epoch}) — write rejected.`,
+    );
+  }
+  if (fencing.epoch !== lease.epoch) {
+    throw new Error(
+      `Conductor lease fencing: stale epoch ${String(fencing.epoch)} (current ${lease.epoch}) for plan "${planId}" — write rejected.`,
+    );
+  }
+  if (fencing.pid !== undefined && fencing.pid !== lease.pid) {
+    throw new Error(
+      `Conductor lease fencing: pid ${fencing.pid} does not own plan "${planId}" (owner ${lease.pid}) — write rejected.`,
+    );
+  }
+}
+
 /** Cross-process lock for plan.json read-modify-write cycles (see file-lock.ts). */
 export async function withPlanLock<T>(fn: () => Promise<T>, repoRoot?: string): Promise<T> {
   const dataDir = await getDataDir(repoRoot);
@@ -43,12 +90,22 @@ export async function loadPlan(repoRoot?: string): Promise<PlanSpec | null> {
   }
 }
 
-export async function savePlan(plan: PlanSpec, repoRoot?: string): Promise<void> {
+export async function savePlan(plan: PlanSpec, repoRoot?: string, fencing?: PlanFencing): Promise<void>;
+export async function savePlan(plan: PlanSpec, fencing?: PlanFencing): Promise<void>;
+export async function savePlan(plan: PlanSpec, repoRoot?: string | PlanFencing, fencing?: PlanFencing): Promise<void> {
+  const effectiveFencing: PlanFencing | undefined =
+    fencing ?? (typeof repoRoot === 'object' && repoRoot !== null ? (repoRoot as PlanFencing) : undefined);
+  const effectiveRepo: string | undefined =
+    typeof repoRoot === 'string' ? repoRoot : undefined;
   await withPlanLock(async () => {
-    const existing = await loadPlan(repoRoot);
+    const existing = await loadPlan(effectiveRepo);
 
     if (existing && existing.id !== plan.id) {
       throw new Error('active plan already exists');
+    }
+
+    if (existing && existing.id === plan.id) {
+      await assertPlanFencing(plan.id, effectiveRepo, effectiveFencing);
     }
 
     if (existing && existing.status !== plan.status) {
@@ -60,14 +117,14 @@ export async function savePlan(plan: PlanSpec, repoRoot?: string): Promise<void>
     const ghAuthenticated = await validateGhAuth();
     const planToSave = { ...plan, ghAuthenticated };
 
-    const filePath = await getPlanFilePath(repoRoot);
+    const filePath = await getPlanFilePath(effectiveRepo);
     try {
       const data = JSON.stringify(planToSave, null, 2);
       await atomicWrite(filePath, data);
     } catch (error) {
       throw new Error(`Failed to save plan state to ${filePath}: ${error}`);
     }
-  }, repoRoot);
+  }, effectiveRepo);
 }
 
 export async function getActivePlan(repoRoot?: string): Promise<PlanSpec | null> {
@@ -78,12 +135,15 @@ export async function updatePlanJob(
   planId: string,
   jobName: string,
   updates: Partial<JobSpec>,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; fencing?: PlanFencing } | string,
   repoRoot?: string,
+  fencing?: PlanFencing,
 ): Promise<void> {
   // Back-compat: updatePlanJob(id, name, updates, "repoRoot-string") treats 4th arg as repoRoot.
   const effectiveRepo = typeof opts === 'string' ? (opts as unknown as string) : repoRoot;
   const effectiveOpts = typeof opts === 'string' ? undefined : opts;
+  const effectiveFencing: PlanFencing | undefined =
+    fencing ?? effectiveOpts?.fencing;
   await withPlanLock(async () => {
     const plan = await loadPlan(effectiveRepo);
 
@@ -96,6 +156,8 @@ export async function updatePlanJob(
         `Plan ID mismatch: expected ${planId}, got ${plan.id}`,
       );
     }
+
+    await assertPlanFencing(planId, effectiveRepo, effectiveFencing);
 
     const jobIndex = plan.jobs.findIndex((j) => j.name === jobName);
     if (jobIndex === -1) {
@@ -152,10 +214,15 @@ export interface PlanFieldUpdates {
 export async function updatePlanFields(
   planId: string,
   updates: PlanFieldUpdates,
-  repoRoot?: string,
+  repoRoot?: string | PlanFencing,
+  fencing?: PlanFencing,
 ): Promise<void> {
+  const effectiveFencing: PlanFencing | undefined =
+    fencing ?? (typeof repoRoot === 'object' && repoRoot !== null ? (repoRoot as PlanFencing) : undefined);
+  const effectiveRepo: string | undefined =
+    typeof repoRoot === 'string' ? repoRoot : undefined;
   await withPlanLock(async () => {
-    const plan = await loadPlan(repoRoot);
+    const plan = await loadPlan(effectiveRepo);
 
     if (!plan) {
       throw new Error('No active plan exists');
@@ -166,6 +233,8 @@ export async function updatePlanFields(
         `Plan ID mismatch: expected ${planId}, got ${plan.id}`,
       );
     }
+
+    await assertPlanFencing(planId, effectiveRepo, effectiveFencing);
 
     if (updates.status !== undefined && updates.status !== plan.status) {
       if (!isValidPlanTransition(plan.status, updates.status)) {
@@ -189,14 +258,14 @@ export async function updatePlanFields(
     const ghAuthenticated = await validateGhAuth();
     const planToSave = { ...plan, ghAuthenticated };
 
-    const filePath = await getPlanFilePath(repoRoot);
+    const filePath = await getPlanFilePath(effectiveRepo);
     try {
       const data = JSON.stringify(planToSave, null, 2);
       await atomicWrite(filePath, data);
     } catch (error) {
       throw new Error(`Failed to save plan state to ${filePath}: ${error}`);
     }
-  }, repoRoot);
+  }, effectiveRepo);
 }
 
 export async function clearPlan(repoRoot?: string): Promise<void> {
@@ -500,7 +569,7 @@ export async function recordHeartbeat(
   planId: string,
   pid: number,
   repoRoot?: string,
-  opts?: { token?: string },
+  opts?: { token?: string; epoch?: number },
 ): Promise<ConductorLease> {
   const filePath = await getConductorFilePath(repoRoot);
   let result: ConductorLease | null = null;
@@ -513,6 +582,9 @@ export async function recordHeartbeat(
     }
     if (opts?.token !== undefined && current.token && opts.token !== current.token) {
       throw new Error(`Conductor lease fencing: stale token for pid ${pid} (epoch ${current.epoch}).`);
+    }
+    if (opts?.epoch !== undefined && opts.epoch !== current.epoch) {
+      throw new Error(`Conductor lease fencing: stale epoch ${opts.epoch} (current ${current.epoch}) for plan "${planId}".`);
     }
     result = { ...current, lastHeartbeat: new Date().toISOString() };
     await atomicWrite(filePath, JSON.stringify(result, null, 2));
@@ -526,7 +598,7 @@ export async function recordProgress(
   planId: string,
   pid: number,
   repoRoot?: string,
-  opts?: { token?: string },
+  opts?: { token?: string; epoch?: number },
 ): Promise<ConductorLease> {
   const filePath = await getConductorFilePath(repoRoot);
   let result: ConductorLease | null = null;
@@ -539,6 +611,9 @@ export async function recordProgress(
     }
     if (opts?.token !== undefined && current.token && opts.token !== current.token) {
       throw new Error(`Conductor lease fencing: stale token for pid ${pid} (epoch ${current.epoch}).`);
+    }
+    if (opts?.epoch !== undefined && opts.epoch !== current.epoch) {
+      throw new Error(`Conductor lease fencing: stale epoch ${opts.epoch} (current ${current.epoch}) for plan "${planId}".`);
     }
     const nowIso = new Date().toISOString();
     result = { ...current, lastHeartbeat: nowIso, lastProgress: nowIso };
@@ -606,15 +681,21 @@ export async function claimJobForDispatch(
   planId: string,
   jobName: string,
   owner: string,
-  repoRoot?: string,
+  repoRoot?: string | PlanFencing,
+  fencing?: PlanFencing,
 ): Promise<{ ok: boolean; status: JobSpec['status'] }> {
   void owner;
+  const effectiveFencing: PlanFencing | undefined =
+    fencing ?? (typeof repoRoot === 'object' && repoRoot !== null ? (repoRoot as PlanFencing) : undefined);
+  const effectiveRepo: string | undefined =
+    typeof repoRoot === 'string' ? repoRoot : undefined;
   return withPlanLock(async () => {
-    const plan = await loadPlan(repoRoot);
+    const plan = await loadPlan(effectiveRepo);
     if (!plan) throw new Error('No active plan exists');
     if (plan.id !== planId) {
       throw new Error(`Plan ID mismatch: expected ${planId}, got ${plan.id}`);
     }
+    await assertPlanFencing(planId, effectiveRepo, effectiveFencing);
     const jobIndex = plan.jobs.findIndex((j) => j.name === jobName || j.id === jobName);
     if (jobIndex === -1) {
       throw new Error(`Job "${jobName}" not found in plan "${plan.name}"`);
@@ -627,8 +708,8 @@ export async function claimJobForDispatch(
       return { ok: false as const, status: current };
     }
     plan.jobs[jobIndex] = { ...plan.jobs[jobIndex], status: 'running' };
-    const filePath = await getPlanFilePath(repoRoot);
+    const filePath = await getPlanFilePath(effectiveRepo);
     await atomicWrite(filePath, JSON.stringify(plan, null, 2));
     return { ok: true as const, status: 'running' as const };
-  }, repoRoot);
+  }, effectiveRepo);
 }

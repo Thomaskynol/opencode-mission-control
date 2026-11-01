@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
-import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock } from './plan-state';
+import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock, type PlanFencing } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
@@ -1615,17 +1615,30 @@ export class Orchestrator {
 
   /**
    * Claim conductor ownership and keep the fencing identity (token/epoch).
-   * Best-effort so unit fakes without state dir keep working; the handoff
+   * Surfaces acquire-failure as false (clears identity) instead of swallowing
+   * void — start/resume fail closed in prod when the claim fails. Unit fakes
+   * without a state dir keep working: they run in test scope where the
+   * reconciler skips fencing (heartbeat early-return), and the handoff
    * verifies by re-read and fails closed when absent.
    */
-  private async claimConductorOwnership(planId: string, command: string, owner: string, repoRoot: string): Promise<void> {
+  private async claimConductorOwnership(planId: string, command: string, owner: string, repoRoot: string): Promise<boolean> {
     try {
       const lease = await claimConductorLease(planId, process.pid, command, owner, repoRoot);
       this.conductorToken = lease.token;
       this.conductorEpoch = lease.epoch;
-    } catch {
-      // Best-effort: the public handoff re-reads the lease and fails closed.
+      return true;
+    } catch (error) {
+      this.conductorToken = undefined;
+      this.conductorEpoch = undefined;
+      console.warn(`[MC] conductor claim failed for plan ${planId}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
+  }
+
+  /** Fencing identity for this instance's writes (undefined until claimed). */
+  private fencing(): PlanFencing | undefined {
+    if (this.conductorToken === undefined || this.conductorEpoch === undefined) return undefined;
+    return { token: this.conductorToken, epoch: this.conductorEpoch, pid: process.pid };
   }
 
   /**
@@ -2180,9 +2193,13 @@ export class Orchestrator {
     this.planLaunchSessionID = spec.launchSessionID;
     // Conductor lease on boot: this driver proves assumption (sonda 13).
     // Keeps the fencing identity (token/epoch) for periodic heartbeat +
-    // verify in the reconciler; best-effort so unit fakes without state dir
-    // keep working (the public handoff re-reads the lease and fails closed).
-    await this.claimConductorOwnership(plan.id, `start plan ${plan.id}`, 'orchestrator-start', repoRoot);
+    // verify in the reconciler; fails closed in prod when the claim fails
+    // (no-lease start never drives); unit fakes without a state dir keep
+    // working in test scope (the public handoff re-reads the lease).
+    const claimed = await this.claimConductorOwnership(plan.id, `start plan ${plan.id}`, 'orchestrator-start', repoRoot);
+    if (!claimed && !isTestScope()) {
+      throw new Error(`Conductor lease fencing: failed to claim ownership for plan "${plan.id}" — start refused (no-lease start fails closed).`);
+    }
     this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
     this.subscribeToMonitorEvents();
     this.ensureMonitorRunning();
@@ -2297,8 +2314,25 @@ export class Orchestrator {
       // Conductor liveness: verify ownership (token/epoch+frescor) and
       // heartbeat periodically. An old leader whose epoch no longer matches
       // (takeover bumped it) is rejected here and steps down — never drives.
-      // Skipped until this instance claims (unit fakes never claim).
-      if (this.conductorToken !== undefined || this.conductorEpoch !== undefined) {
+      // Fail-closed in prod: no claim (never claimed or claim failed) never
+      // drives when a lease exists or when ownership cannot be proven.
+      // Skipped in test scope (unit fakes never claim; fencing itself is
+      // covered by the plan-state and handoff suites with real state dirs).
+      if (!isTestScope()) {
+        if (this.conductorToken === undefined || this.conductorEpoch === undefined) {
+          console.warn(`[MC] conductor fencing: pid ${process.pid} has no ownership for plan ${plan.id} — refusing to drive (no-lease start fails closed).`);
+          this.stopReconciler();
+          this.unsubscribeFromMonitorEvents();
+          return;
+        }
+        const stillOwner = await this.heartbeatConductor(plan.id, repoRoot);
+        if (!stillOwner) {
+          console.warn(`[MC] conductor fencing: pid ${process.pid} no longer owns plan ${plan.id} (epoch ${this.conductorEpoch}) — stepping down.`);
+          this.stopReconciler();
+          this.unsubscribeFromMonitorEvents();
+          return;
+        }
+      } else if (this.conductorToken !== undefined || this.conductorEpoch !== undefined) {
         const stillOwner = await this.heartbeatConductor(plan.id, repoRoot);
         if (!stillOwner) {
           console.warn(`[MC] conductor fencing: pid ${process.pid} no longer owns plan ${plan.id} (epoch ${this.conductorEpoch}) — stepping down.`);
@@ -2860,6 +2894,20 @@ export class Orchestrator {
       throw new Error('No active plan for job launch');
     }
 
+    // Conductor gate: only the live owner dispatches. In prod a missing or
+    // stale identity fails closed (never dispatches without ownership);
+    // in test scope unit fakes without a claim keep working.
+    if (!isTestScope()) {
+      const owned = await verifyConductorLease(planId, process.pid, this.effectiveRepoRoot(), {
+        token: this.conductorToken,
+        epoch: this.conductorEpoch,
+      }).catch(() => false);
+      if (!owned) {
+        console.warn(`[MC] conductor fencing: launch of job "${job.name}" refused — pid ${process.pid} does not own plan ${planId}.`);
+        return false;
+      }
+    }
+
     // Coerência pré-despacho: bloqueia ANTES do claim/worktree/prompt, sem
     // despachar. Diagnóstico pede ampliar touchSet ou mover o teste p/ job
     // dependente. Claim atômico continua primeiro entre recursos.
@@ -2870,7 +2918,7 @@ export class Orchestrator {
       await updatePlanJob(planId, job.name, {
         status: 'failed',
         error: `dispatch blocked (incoherent touchSet/acceptance): ${msg}`,
-      }, { force: true }, this.effectiveRepoRoot()).catch(() => {});
+      }, { force: true, fencing: this.fencing() }, this.effectiveRepoRoot()).catch(() => {});
       return false;
     }
 
@@ -2903,7 +2951,7 @@ export class Orchestrator {
     const repoRoot = this.effectiveRepoRoot();
     const owner = this.planLaunchSessionID ?? `orchestrator-${process.pid}`;
     try {
-      const claim = await claimJobForDispatch(planId, job.name, owner, repoRoot);
+      const claim = await claimJobForDispatch(planId, job.name, owner, repoRoot, this.fencing());
       if (!claim.ok) {
         if (claim.status === 'waiting_deps') {
           // waiting_deps is a legitimate dispatch state once deps are merged:
@@ -2930,15 +2978,17 @@ export class Orchestrator {
         }
       }
     } catch (e) {
-      // Claim itself failed (no plan / unknown job): fail-closed without
+      // Claim itself failed (no plan / unknown job / fencing): fail-closed without
       // creating anything; mark failed so the run never sticks queued.
+      // Fencing rejections (stale holder) also land here — never dispatch.
       const msg = e instanceof Error ? e.message : String(e);
       // Already running means another driver won — quiet abort, no kill.
-      if (/already|running/i.test(msg) && !/no active plan|not found|mismatch/i.test(msg)) return false;
+      // Fencing mismatches are never "already running": they fail closed below.
+      if (/already|running/i.test(msg) && !/no active plan|not found|mismatch|fencing/i.test(msg)) return false;
       await updatePlanJob(planId, job.name, {
         status: 'failed',
         error: `dispatch claim failed: ${msg}`,
-      }, { force: true }, repoRoot).catch(() => {});
+      }, { force: true, fencing: this.fencing() }, repoRoot).catch(() => {});
       return false;
     }
 
@@ -4747,8 +4797,12 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
       this.planPlacement = plan.placement ?? null;
       this.planLaunchSessionID = plan.launchSessionID;
       // Conductor lease on boot (resume path): this process proves assumption.
-      // Best-effort so unit fakes keep working; handoff verifies by re-read.
-      await this.claimConductorOwnership(plan.id, `resume plan ${plan.id}`, 'orchestrator-resume', repoRoot);
+      // Fails closed in prod when the claim fails; unit fakes keep working
+      // in test scope (handoff verifies by re-read).
+      const resumed = await this.claimConductorOwnership(plan.id, `resume plan ${plan.id}`, 'orchestrator-resume', repoRoot);
+      if (!resumed && !isTestScope()) {
+        throw new Error(`Conductor lease fencing: failed to claim ownership for plan "${plan.id}" — resume refused.`);
+      }
       this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
 
       const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
