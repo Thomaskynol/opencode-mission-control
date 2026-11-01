@@ -18,13 +18,13 @@ export type MergeResult
     };
 
 type MergeSetupReport = {
-  status: 'passed' | 'failed' | 'skipped';
+  status: 'passed' | 'failed' | 'skipped' | 'env-failure';
   commands: string[];
   output?: string;
 };
 
 export type MergeTestReport = {
-  status: 'passed' | 'failed' | 'skipped';
+  status: 'passed' | 'failed' | 'skipped' | 'env-failure';
   command?: string;
   output?: string;
   timedOut?: boolean;
@@ -347,8 +347,30 @@ async function ensureTestDependencies(
   output: string;
   timedOut: boolean;
   commands: string[];
-  status: 'passed' | 'failed' | 'skipped';
+  status: 'passed' | 'failed' | 'skipped' | 'env-failure';
 }> {
+  // Shared helper (F): same preparation as review snapshots. Deps go into a
+  // copy for review; here the integration worktree already IS the copy under
+  // test (tracked bytes attributed, untracked node_modules writable). When
+  // preparation is impossible, fail closed as env-failure (never pass/skip).
+  try {
+    const { prepareTestEnv, ENV_UNPREPARED } = await import('./test-env.js');
+    const prep = await prepareTestEnv({ snapshotDir: worktreePath, sourceDir: worktreePath, setupCommands, timeoutMs });
+    if (prep.status === 'ready') {
+      // Preserve legacy setup statuses: explicit setup/install → passed,
+      // already-present/no-op → skipped. Both mean ready to run.
+      if (prep.commands.length > 0) {
+        return { success: true, output: prep.output, timedOut: false, commands: prep.commands, status: 'passed' };
+      }
+      return { success: true, output: prep.output, timedOut: false, commands: [], status: 'skipped' };
+    }
+    if (prep.status === 'failed') {
+      return { success: false, output: prep.output, timedOut: false, commands: prep.commands, status: 'failed' };
+    }
+    return { success: false, output: prep.output || ENV_UNPREPARED, timedOut: false, commands: prep.commands, status: 'env-failure' };
+  } catch {
+    // Fall through to legacy path if helper unavailable (never pass silently).
+  }
   const configuredSetupCommands = normalizeCommands(setupCommands);
   if (configuredSetupCommands.length > 0) {
     for (const command of configuredSetupCommands) {
@@ -908,14 +930,15 @@ export class MergeTrain {
 
     if (!dependencySetupResult.success) {
       await rollbackMergeToHead(this.integrationWorktree, headBeforeStr);
+      const isEnvFailure = dependencySetupResult.status === 'env-failure';
       return {
         success: false,
         type: 'test_failure',
         output: dependencySetupResult.output,
         testReport: {
-          status: 'skipped',
+          status: isEnvFailure ? 'env-failure' : 'skipped',
           command: testCommand,
-          reason: 'Dependency setup failed before tests could run',
+          reason: isEnvFailure ? dependencySetupResult.output : 'Dependency setup failed before tests could run',
           setup: {
             status: dependencySetupResult.status,
             commands: dependencySetupResult.commands,
@@ -949,6 +972,31 @@ export class MergeTrain {
     }
 
     if (!testResult.success) {
+      // F parity: undeclared missing dep (MODULE_NOT_FOUND) with no install
+      // path is env-failure, not a code test failure. Fail closed as
+      // env-failure (never pass/skip), preserving toctou-style tests.
+      if (!testResult.timedOut && /Cannot find module|MODULE_NOT_FOUND/i.test(testResult.output)) {
+        try {
+          const { ENV_UNPREPARED } = await import('./test-env.js');
+          const out = testResult.output.includes('ENV-UNPREPARED') ? testResult.output : `${ENV_UNPREPARED}\n${testResult.output}`;
+          await rollbackMergeToHead(this.integrationWorktree, headBeforeStr);
+          return {
+            success: false,
+            type: 'test_failure',
+            output: out,
+            testReport: {
+              status: 'env-failure',
+              command: testCommand,
+              output: out,
+              setup: {
+                status: 'env-failure',
+                commands: dependencySetupResult.commands,
+                output: out,
+              },
+            },
+          };
+        } catch {}
+      }
       const fixTimeout = this.config?.fixBeforeRollbackTimeout ?? DEFAULT_FIX_BEFORE_ROLLBACK_TIMEOUT_MS;
       const isServeMode = job.port !== undefined;
 

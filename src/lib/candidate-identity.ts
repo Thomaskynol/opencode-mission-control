@@ -331,6 +331,8 @@ export interface ImmutableSnapshotOptions {
   jobHead?: string;
   /** Keep the snapshot dir for inspection (tests); default removes it. */
   keepSnapshotDir?: boolean;
+  /** Optional setup commands run INSIDE the snapshot copy (shared prepareTestEnv). */
+  setupCommands?: string[];
 }
 
 export interface ImmutableSnapshotResult extends IdentityVerdict {
@@ -501,10 +503,43 @@ export async function runTestsOnImmutableSnapshot(
       }
     }
     for (const rel of protectedPaths) snapBefore.set(rel, snapshotStrict(snapshotDir, rel));
+    // Shared env prep (F): deps symlinked/installed INTO the copy, never
+    // mutating the attributed original. Impossible prep → env-failure that
+    // fails closed (success false, ENV-UNPREPARED), never pass/skip.
+    // Never versions node_modules (symlink only, no git add).
+    let envPrep: { status: 'ready' | 'failed' | 'env-failure'; commands: string[]; output: string } | null = null;
+    try {
+      const { prepareTestEnv } = await import('./test-env.js');
+      envPrep = await prepareTestEnv({
+        snapshotDir,
+        sourceDir: options.dir,
+        ...(options.setupCommands ? { setupCommands: options.setupCommands } : {}),
+        timeoutMs: options.timeoutMs ?? 120000,
+      });
+    } catch {
+      envPrep = null;
+    }
     test =
       racedCopy !== undefined
         ? { success: false, output: '', timedOut: false }
-        : await runShellCommand(snapshotDir, options.testCommand, options.timeoutMs ?? 120000);
+        : envPrep !== null && (envPrep.status === 'env-failure' || envPrep.status === 'failed')
+          ? { success: false, output: envPrep.output, timedOut: false }
+          : await runShellCommand(snapshotDir, options.testCommand, options.timeoutMs ?? 120000);
+    // F parity: undeclared missing dep (no manifest entry, no lockfile to
+    // install from) surfaces as MODULE_NOT_FOUND after the run. Convert to
+    // env-failure with ENV-UNPREPARED (fail-closed, never pass/skip), preserving
+    // toctou-style tests that need no deps (their output is identity-based).
+    if (test.success === false && test.timedOut === false && test.output) {
+      const missingDep = /Cannot find module|MODULE_NOT_FOUND/i.test(test.output);
+      if (missingDep) {
+        try {
+          const { ENV_UNPREPARED } = await import('./test-env.js');
+          if (!test.output.includes('ENV-UNPREPARED')) {
+            test = { success: false, output: `${ENV_UNPREPARED}\n${test.output}`, timedOut: false };
+          }
+        } catch {}
+      }
+    }
   } catch (err) {
     cleanup();
     throw err;

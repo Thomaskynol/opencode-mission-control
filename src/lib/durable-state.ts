@@ -100,10 +100,10 @@ export interface MergeEvidenceRecord {
   reviewedBase?: string;
   changedFiles?: string[];
   testCommand?: string;
-  testStatus: 'passed' | 'failed' | 'skipped';
+  testStatus: 'passed' | 'failed' | 'skipped' | 'env-failure';
   testOutput?: string;
   setupCommands?: string[];
-  setupStatus?: 'passed' | 'failed' | 'skipped';
+  setupStatus?: 'passed' | 'failed' | 'skipped' | 'env-failure';
   /**
    * R05: which verification produced this record. Task-scoped evidence comes
    * from the per-task review (scoped test run on the candidate); integration
