@@ -713,7 +713,7 @@ async function awaitConductorLease(
   repoRoot: string,
   timeoutMs = 2000,
   expected?: { token?: string; epoch?: number },
-): Promise<{ owner: string; acquiredAt: string } | null> {
+): Promise<{ owner: string; acquiredAt: string; epoch: number; lastHeartbeat: string } | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const owned = await verifyConductorLease(planId, pid, repoRoot, {
@@ -724,7 +724,7 @@ async function awaitConductorLease(
     if (owned) {
       const lease = await readConductorLease(repoRoot).catch(() => null);
       if (lease && lease.planId === planId && lease.pid === pid) {
-        return { owner: lease.owner, acquiredAt: lease.acquiredAt };
+        return { owner: lease.owner, acquiredAt: lease.acquiredAt, epoch: lease.epoch, lastHeartbeat: lease.lastHeartbeat };
       }
     }
     if (Date.now() >= deadline) return null;
@@ -801,7 +801,7 @@ async function recordConductorHandoff(
     // never reused (fencing).
     const existing = await readConductorLease(repoRoot).catch(() => null);
     let conductor: PersistentConductor | null = null;
-    let leaseProof: { owner: string; acquiredAt: string } | null = null;
+    let leaseProof: { owner: string; acquiredAt: string; epoch: number; lastHeartbeat: string } | null = null;
     if (existing && existing.planId === plan.id && isConductorAlive(existing.pid)) {
       const stillOwned = await verifyConductorLease(plan.id, existing.pid, repoRoot, {
         token: existing.token,
@@ -810,7 +810,7 @@ async function recordConductorHandoff(
       }).catch(() => false);
       if (stillOwned) {
         conductor = { pid: existing.pid, command: existing.command, token: existing.token, epoch: existing.epoch };
-        leaseProof = { owner: existing.owner, acquiredAt: existing.acquiredAt };
+        leaseProof = { owner: existing.owner, acquiredAt: existing.acquiredAt, epoch: existing.epoch, lastHeartbeat: existing.lastHeartbeat };
         // Periodic liveness on reuse: the re-verified owner heartbeats now.
         try {
           await recordHeartbeat(plan.id, existing.pid, repoRoot, { token: existing.token });
@@ -854,7 +854,7 @@ async function recordConductorHandoff(
       }
     }
     handoff =
-      `${action}: conductor detached driver pid ${conductor.pid} (${conductor.command}, auto-spawned by reporter pid ${process.pid}, lease ${leaseProof.owner}@${leaseProof.acquiredAt}) — ` +
+      `${action}: conductor detached driver pid ${conductor.pid} (${conductor.command}, auto-spawned by reporter pid ${process.pid}, lease ${leaseProof.owner}@${leaseProof.acquiredAt} epoch ${leaseProof.epoch} token-verified heartbeat ${leaseProof.lastHeartbeat}) — ` +
       `plan ${plan.id} [${plan.status}] owned via persisted state (intake ${record.id}); ` +
       `workers live ${workers.live}/${workers.total} (tmux); ${profileLine}; ` +
       `one-shot controller detaches after this sync pass — ` +
@@ -1267,7 +1267,7 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
         try {
           await recordHeartbeat(plan.id, process.pid, repoRoot, { token: confirmed.token });
         } catch {}
-        line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid} lease resume@${confirmed.acquiredAt} epoch ${confirmed.epoch}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
+        line = `resume: conductor live (plan ${plan.id} [${plan.status}], pid ${process.pid} lease resume@${confirmed.acquiredAt} epoch ${confirmed.epoch} token-verified heartbeat ${confirmed.lastHeartbeat}, ${running} job(s) in flight, state persisted; follow detaches, close never cancels).`;
       } catch (error) {
         throw new Error(
           `resume not confirmed for intake ${record.id}: conductor ownership failed (${error instanceof Error ? error.message : String(error)}). Plan stays ${plan.status}; retry resume to assume it.`,

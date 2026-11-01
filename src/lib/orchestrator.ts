@@ -8,7 +8,7 @@ import { coordinateOnce, clampMaxParallel } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
 import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
-import { protectInputsDuringRun, decideIdentityVerdict, type FileIdentity } from './candidate-identity';
+import { protectInputsDuringRun, decideIdentityVerdict, runTestsOnImmutableSnapshot, type FileIdentity } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, resolveJobPassword, type Job } from './job-state';
 import { JobMonitor } from './monitor';
@@ -49,7 +49,9 @@ import {
   requiresUserReview,
   loadContextDocs,
   formatContextDocsForPrompt,
+  formatModelRefForArgv,
   nextStepsFor,
+  validateTaskCoherence,
   type AutoIntakeInput,
   type PlannerGenerate,
   type RuntimeDecision,
@@ -747,6 +749,9 @@ export class Orchestrator {
       implDiff = undefined;
     }
     const timeoutMs = Number(process.env.MC_REVIEW_TIMEOUT_MS ?? 120000);
+    // Modelo efetivo herdado (MC_REVIEW_MODEL vira override dentro do
+    // resolveReviewModel): sem ele o revisor falhava unpinned sem invocar.
+    const effectiveArgv = formatModelRefForArgv(this.ensureEffectiveModel());
     const results = await reviewFunctionallyViaOpenCode({
       requirements: criteria,
       ...(Object.keys(implFiles).length > 0 ? { implFiles } : {}),
@@ -754,7 +759,7 @@ export class Orchestrator {
       ...(Object.keys(tests).length > 0 ? { tests } : {}),
       outputs: input.evidence.output ?? '',
       ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
-    });
+    }, effectiveArgv);
     return toSufficiencyDecision(results);
   }
 
@@ -1424,13 +1429,15 @@ export class Orchestrator {
       let reverified = false;
       if (advanced) {
         // Destination advanced since the plan base: re-run tests on the merged tree.
+        // §4 identidade: executa no snapshot imutável (git archive) — mutação
+        // ou A→B→A restore no original durante o run falha, nunca é atribuído.
         const configured = this.getEffectiveTestCommand();
         const cmd = configured ?? await detectTestCommand(repoRoot);
         if (!cmd) {
           throw new Error('Destination advanced since plan base but no test command exists to reverify — refusing to complete');
         }
         const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
-        const retest = await runTestCommand(repoRoot, cmd, timeout);
+        const retest = await this.runImmutableRetest(repoRoot, cmd, timeout);
         reverified = true;
         if (!retest.success) {
           throw new Error(`Reverification on advanced destination failed (${cmd}): ${retest.output.slice(0, 500)}`);
@@ -2536,7 +2543,9 @@ export class Orchestrator {
             return;
           }
           const verifyTimeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
-          const verifyResult = await runTestCommand(verifyWorktree, verifyCommand, verifyTimeout);
+          // §4 identidade: verificação final também roda no snapshot imutável —
+          // mutação/A→B→A no worktree durante o run falha, nunca é atribuída.
+          const verifyResult = await this.runImmutableRetest(verifyWorktree, verifyCommand, verifyTimeout);
           if (!verifyResult.success) {
             const out = verifyResult.timedOut
               ? `Final integration verification timed out after ${verifyTimeout}ms`
@@ -2690,6 +2699,20 @@ export class Orchestrator {
     const planId = this.activePlanId;
     if (!planId) {
       throw new Error('No active plan for job launch');
+    }
+
+    // Coerência pré-despacho: bloqueia ANTES do claim/worktree/prompt, sem
+    // despachar. Diagnóstico pede ampliar touchSet ou mover o teste p/ job
+    // dependente. Claim atômico continua primeiro entre recursos.
+    try {
+      this.assertJobCoherent(job);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await updatePlanJob(planId, job.name, {
+        status: 'failed',
+        error: `dispatch blocked (incoherent touchSet/acceptance): ${msg}`,
+      }, { force: true }, this.effectiveRepoRoot()).catch(() => {});
+      return false;
     }
 
     const placement = this.planPlacement ?? this.config.defaultPlacement ?? 'session';
@@ -3065,6 +3088,18 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     }
     if (!job.worktreePath || !job.branch) {
       throw new Error(`Job "${jobName}" has no worktree or branch — cannot relaunch`);
+    }
+
+    // Coerência no relaunch: nunca reinjeta prompt contraditório em loop.
+    // Se o plano continua incoerente (aceite exige arquivo fora do touchSet),
+    // exige aceite revisado/replanejo com diagnóstico — NÃO relaunch cego.
+    try {
+      this.assertJobCoherent(job);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot relaunch correction for job "${jobName}": plan still incoherent — revise o aceite ou amplie o touchSet antes de relançar (replanejo necessário, não relaunch cego). ${msg}`,
+      );
     }
 
     const placement = this.planPlacement ?? this.config.defaultPlacement ?? 'session';
@@ -4585,6 +4620,66 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     };
   }
 
+  private jobAcceptanceCriteria(job: JobSpec): string[] {
+    const lines = (job.prompt ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => /^-\s*\[\s*\]\s+/.test(l))
+      .map((l) => l.replace(/^-\s*\[\s*\]\s+/, '').trim())
+      .filter((l) => l.length > 0);
+    return [...new Set(lines)];
+  }
+
+  private assertJobCoherent(job: JobSpec): void {
+    const acceptance = this.jobAcceptanceCriteria(job);
+    if (acceptance.length === 0) return;
+    validateTaskCoherence({ name: job.name, acceptance, touchSet: job.touchSet, dependsOn: job.dependsOn });
+  }
+
+  /**
+   * Immutable retest: runs the command in a `git archive` snapshot copy and
+   * refuses attribution when the ORIGINAL was touched during the run
+   * (hash+mtime+ctime). Identity fail → success=false with the reason in
+   * output, never a pass. Scope defaults to tracked files (ls-files).
+   */
+  private async runImmutableRetest(
+    dir: string,
+    command: string,
+    timeoutMs: number,
+    scopePaths?: string[],
+    jobHead?: string,
+  ): Promise<{ success: boolean; output: string; timedOut: boolean }> {
+    let scope = scopePaths?.filter((p) => p !== '' && !p.includes('..')) ?? [];
+    if (scope.length === 0) {
+      try {
+        const ls = await gitCommand(['-C', dir, 'ls-files']);
+        if (ls.exitCode === 0) {
+          scope = ls.stdout.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 200);
+        }
+      } catch {
+        scope = [];
+      }
+    }
+    try {
+      const r = await runTestsOnImmutableSnapshot({
+        dir,
+        scopePaths: scope,
+        testCommand: command,
+        timeoutMs,
+        ...(jobHead ? { jobHead } : {}),
+      });
+      if (r.verdict === 'fail') {
+        return { success: false, output: `${r.reason ?? 'identity refused'}${r.output ? `\n${r.output}` : ''}`.slice(0, 8000), timedOut: r.timedOut };
+      }
+      return { success: r.success, output: r.output, timedOut: r.timedOut };
+    } catch (error) {
+      // Fail-closed on snapshot failure (no silent unprotected rerun): surface
+      // as test failure so the caller pauses instead of merging unverified.
+      const msg = error instanceof Error ? error.message : String(error);
+      return { success: false, output: `immutable snapshot failed: ${msg}`.slice(0, 2000), timedOut: false };
+    }
+  }
+
   private validatePlan(spec: PlanSpec): void {
     const names = spec.jobs.map((job) => job.name);
     if (new Set(names).size !== names.length) {
@@ -4602,6 +4697,13 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     if (hasCircularDependency(spec.jobs)) {
       throw new Error('Plan contains circular dependencies');
+    }
+
+    // Coerência pré-despacho: aceite fora do touchSet bloqueia o plano aqui,
+    // antes do primeiro launch (diagnóstico pede ampliar touchSet ou mover
+    // o teste p/ job dependente).
+    for (const job of spec.jobs) {
+      this.assertJobCoherent(job);
     }
   }
 

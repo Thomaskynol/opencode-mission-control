@@ -16,6 +16,7 @@
 
 import type { V2ModelRef } from './sdk-client.js';
 import { evaluateDepthGuard, readInstanceDepth } from './instance-manager.js';
+import { extractAcceptanceFileRefs, touchSetCovers } from './auto-plan.js';
 
 export const MIN_PARALLEL = 4;
 export const MAX_PARALLEL = 8;
@@ -193,6 +194,11 @@ export interface PlanJobView {
   dependsOn?: string[];
   mergeOrder?: number;
   priority?: number;
+  /** Declared writable destinations (for touchSet ↔ acceptance coherence). */
+  touchSet?: string[];
+  /** Acceptance criteria (file refs must be covered by the touchSet). */
+  acceptance?: string[];
+  prompt?: string;
 }
 
 function depsSatisfied(job: PlanJobView, merged: Set<string>): boolean {
@@ -312,13 +318,16 @@ export function shouldContinueSession(sameWork: boolean): boolean {
 export interface ModelDispatchDecision {
   name: string;
   touchSet?: string[];
+  /** Acceptance the worker must satisfy (file refs must be touchSet-covered). */
+  acceptance?: string[];
+  prompt?: string;
 }
 
 /**
  * Validate one model dispatch decision against live plan state.
- * Throws explicitly on unknown task, unknown dep, unmerged dep or
- * disallowed destination — the adaptive loop treats that as "ask/fix",
- * never as work to fire.
+ * Throws explicitly on unknown task, unknown dep, unmerged dep,
+ * disallowed destination, or touchSet ↔ acceptance incoherence — the
+ * adaptive loop treats that as "ask/fix", never as work to fire.
  */
 export function validateModelDispatch(
   decision: ModelDispatchDecision,
@@ -346,6 +355,23 @@ export function validateModelDispatch(
     if (!trimmed || trimmed.startsWith('/') || trimmed.split('/').includes('..')) {
       throw new Error(
         `Model dispatch of "${job.name}" targets disallowed destination "${entry}". Refusing.`,
+      );
+    }
+  }
+  // Coherence: acceptance file refs must be writable by this job (own
+  // touchSet) or by a job it depends on (test living in a dependent job).
+  const acceptance = decision.acceptance ?? job.acceptance ?? [];
+  const refs = extractAcceptanceFileRefs(acceptance);
+  if (refs.length > 0) {
+    const own = decision.touchSet ?? job.touchSet;
+    const depOwned = (job.dependsOn ?? []).flatMap((dep) => byName.get(dep)?.touchSet ?? []);
+    const missing = refs.filter((ref) => !touchSetCovers(own, ref) && !touchSetCovers(depOwned, ref));
+    if (missing.length > 0) {
+      const quoted = missing.map((m) => `"${m}"`).join(', ');
+      const scope = (own ?? []).length > 0 ? `[${(own ?? []).join(', ')}]` : '(empty)';
+      throw new Error(
+        `Model dispatch of "${job.name}" is incoherent: acceptance references ${quoted} outside its touchSet ${scope}. ` +
+          `Widen the touchSet to include ${quoted}, or move the test into a job depending on "${job.name}". Refusing.`,
       );
     }
   }

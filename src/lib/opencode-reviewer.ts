@@ -19,6 +19,15 @@ export interface FunctionalCriterionInput {
   anchors: string[];
 }
 
+export interface ReviewModelRef {
+  providerID: string;
+  id: string;
+  variant?: string;
+}
+
+/** Model pin accepted by the reviewer: verbatim string or provider/id/variant triple. */
+export type ReviewModelInput = string | ReviewModelRef;
+
 export interface FunctionalReviewArgs {
   requirements: FunctionalCriterionInput[];
   implFiles?: Record<string, string>;
@@ -27,10 +36,57 @@ export interface FunctionalReviewArgs {
   tests?: Record<string, string>;
   /** Product-observed test output. */
   outputs?: string;
-  model?: string;
+  model?: ReviewModelInput;
   timeoutMs?: number;
   /** Binary under test; defaults to $MC_OPENCODE_BIN, $OPENCODE_BIN, `opencode`. */
   bin?: string;
+}
+
+/**
+ * Render a model triple for `opencode run --model` (variant preserved as
+ * `#variant`). Same shape as auto-plan's formatModelRefForArgv — kept local
+ * so this module stays dependency-free.
+ */
+export function formatReviewModelRef(ref: ReviewModelRef): string {
+  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ''}`;
+}
+
+/** Normalize a model input to its argv string; empty/invalid → undefined. */
+function normalizeReviewModelInput(input?: ReviewModelInput): string | undefined {
+  if (typeof input === 'string') {
+    const t = input.trim();
+    return t ? t : undefined;
+  }
+  if (input !== null && typeof input === 'object') {
+    const r = input as ReviewModelRef;
+    if (typeof r.providerID !== 'string' || typeof r.id !== 'string') return undefined;
+    if (!r.providerID.trim() || !r.id.trim()) return undefined;
+    const variant = typeof r.variant === 'string' && r.variant.trim() ? r.variant.trim() : undefined;
+    return formatReviewModelRef({ providerID: r.providerID.trim(), id: r.id.trim(), ...(variant ? { variant } : {}) });
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the review model pin. Precedence: args.model → MC_REVIEW_MODEL →
+ * effectiveModel (inherited) → unpinned (undefined, caller fails closed).
+ * Never falls back to a silent default: undefined means the caller must
+ * report `review model unpinned` without invoking the binary.
+ *
+ * Integrator note: the public review path never sets args.model, so the
+ * orchestrator's attachExternalSufficiency must pass the effective triple as
+ * `effectiveModel` — `formatModelRefForArgv(ensureEffectiveModel())` — making
+ * MC_REVIEW_MODEL an optional override, not a second required config.
+ */
+export function resolveReviewModel(
+  args: { model?: ReviewModelInput },
+  effectiveModel?: ReviewModelInput,
+): string | undefined {
+  const fromArgs = normalizeReviewModelInput(args?.model);
+  if (fromArgs) return fromArgs;
+  const fromEnv = process.env.MC_REVIEW_MODEL?.trim() || undefined;
+  if (fromEnv) return fromEnv;
+  return normalizeReviewModelInput(effectiveModel);
 }
 
 export interface FunctionalCriterionResult {
@@ -120,6 +176,12 @@ function extractResults(raw: string, requirements: FunctionalCriterionInput[]): 
   const texts: string[] = [];
   const trimmed = raw.trim();
   texts.push(trimmed);
+  // Unwrap `opencode run --format json` JSONL envelope lines first: the
+  // verdict JSON travels escaped inside text/content carriers, so the raw
+  // blob never parses (mirrors extractPlannerText's line handling in
+  // auto-plan.ts — kept local so this module stays dependency-free and the
+  // predicate stays verdict-specific instead of planner-draft-specific).
+  texts.push(...unwrapEnvelopeCandidates(trimmed));
   const fenced = [...trimmed.matchAll(/```(?:json)?\s*\n([\s\S]*?)\n```/g)].map((m) => m[1]!.trim());
   texts.push(...fenced);
   for (const t of texts) {
@@ -175,17 +237,99 @@ function extractResults(raw: string, requirements: FunctionalCriterionInput[]): 
 }
 
 /**
+ * Collect candidate payload strings from one envelope event, following only
+ * targeted text carriers (text/content/delta, part(s)/message(s)/data) so
+ * ids/markers never pollute reassembly. JSON.parse of the event line already
+ * unescaped the payload.
+ */
+function collectEnvelopeStrings(value: unknown, out: string[]): void {
+  if (typeof value === 'string') {
+    if (value.trim()) out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectEnvelopeStrings(item, out);
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    const o = value as Record<string, unknown>;
+    for (const key of ['text', 'content', 'delta']) {
+      const v = o[key];
+      if (typeof v === 'string') {
+        if (v.trim()) out.push(v);
+      } else if (Array.isArray(v)) {
+        collectEnvelopeStrings(v, out);
+      } else if (v !== null && typeof v === 'object') {
+        collectEnvelopeStrings(v, out);
+      }
+    }
+    for (const key of ['part', 'parts', 'message', 'messages', 'data']) {
+      const v = o[key];
+      if (typeof v === 'string') {
+        if (v.trim()) out.push(v);
+      } else if (v !== null && typeof v === 'object') {
+        collectEnvelopeStrings(v, out);
+      }
+    }
+  }
+}
+
+/**
+ * Per-line payloads from a JSONL envelope, plus their concatenation for a
+ * verdict split across text events. Non-JSON lines are ignored (the blob
+ * fallback below already covers verbatim/fenced answers).
+ */
+function unwrapEnvelopeCandidates(raw: string): string[] {
+  const perLine: string[] = [];
+  const payloads: string[] = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let evt: unknown;
+    try {
+      evt = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (typeof evt === 'string') {
+      if (evt.trim()) {
+        perLine.push(evt);
+        payloads.push(evt);
+      }
+      continue;
+    }
+    if (evt !== null && typeof evt === 'object') {
+      const found: string[] = [];
+      collectEnvelopeStrings(evt, found);
+      perLine.push(...found);
+      payloads.push(...found);
+    }
+  }
+  const joined = payloads.join('').trim();
+  if (joined) perLine.push(joined);
+  return perLine;
+}
+
+/**
  * Ask a real OpenCode (`run --standalone --format json`, separate context)
  * for per-criterion functional verdicts. Never throws: every failure mode
  * (missing binary, timeout, non-zero exit, unparseable output) resolves to
  * all-`fail` (fail-closed).
+ *
+ * Model pin (always `--model`, variant preserved as `#variant`): resolved via
+ * {@link resolveReviewModel} — args.model → MC_REVIEW_MODEL → effectiveModel
+ * (inherited triple from the integrator) → unpinned fail-closed without
+ * invoking the binary. The orchestrator's attachExternalSufficiency should
+ * pass `formatModelRefForArgv(ensureEffectiveModel())` as `effectiveModel`
+ * so MC_REVIEW_MODEL stays an optional override.
  */
 export async function reviewFunctionallyViaOpenCode(
   args: FunctionalReviewArgs,
+  effectiveModel?: ReviewModelInput,
 ): Promise<FunctionalCriterionResult[]> {
   const { requirements } = args;
   if (requirements.length === 0) return [];
-  const model = args.model?.trim() || process.env.MC_REVIEW_MODEL?.trim() || undefined;
+  const model = resolveReviewModel(args, effectiveModel);
   if (!model) return failClosed(requirements, 'review model unpinned (MC_REVIEW_MODEL not set)');
   const bin = args.bin ?? process.env.MC_OPENCODE_BIN ?? process.env.OPENCODE_BIN ?? 'opencode';
   const timeoutMs = args.timeoutMs ?? 300_000;

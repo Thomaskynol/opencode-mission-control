@@ -100,6 +100,7 @@ export function buildPlannerPrompt(intake: AutoIntakeInput): string {
     ' "decisions":[strings],"questions":[strings for the user],"nextSteps":[strings]}.',
     'Rules: names are unique slugs; dependsOn names existing tasks; no cycles;',
     ' task prompts are concrete and self-contained; every task lists acceptance criteria;',
+    ' acceptance file references (test files, docs) must live inside that task\'s touchSet, or in a dependent test job\'s touchSet;',
     ' task prompts are worktree-local: relative paths only, never absolute paths, never `cd` outside the worktree;',
     ' touchSet holds repo-relative paths only, never absolute or ../ escapes;',
     ' never push, publish, deploy, approve permissions, or touch the global config;',
@@ -316,6 +317,161 @@ export function assertAuthorizedActions(draft: AutoPlanDraft): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// touchSet ↔ acceptance coherence: the planner emits touchSet and acceptance
+// independently, so a plan can promise `bun test sum.test.js` while only
+// allowing `sum.js` writes — the worker then blocks on permission and the
+// run fails late. These pure validators fail that plan early instead.
+// ---------------------------------------------------------------------------
+
+/** File kinds whose mention in acceptance implies the job must own the file. */
+const COHERENCE_FILE_RE =
+  /(^|[\s"'`(\[])([A-Za-z0-9_.\-/]*[A-Za-z0-9_-]\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts|json|md|mdx|txt|py|go|rs|java|rb|php|css|html|yml|yaml|toml|sh))\b/g;
+
+/** Extract repo file references from acceptance/testCommand strings (deduped, in order). */
+export function extractAcceptanceFileRefs(texts: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const line of texts) {
+    COHERENCE_FILE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = COHERENCE_FILE_RE.exec(line)) !== null) {
+      const ref = m[2];
+      if (!seen.has(ref)) {
+        seen.add(ref);
+        out.push(ref);
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeCoherencePath(p: string): string {
+  return p
+    .trim()
+    .replace(/^["'`(\[]+|["'`)\].,;:]+$/g, '')
+    .replace(/^\.\//, '');
+}
+
+/** True when a touchSet entry covers an acceptance file ref (exact or src/-style suffix). */
+export function touchSetCovers(touchSet: string[] | undefined, ref: string): boolean {
+  const want = normalizeCoherencePath(ref);
+  if (!want) return false;
+  return (touchSet ?? []).some((entry) => {
+    const have = normalizeCoherencePath(entry);
+    if (!have) return false;
+    if (have === want) return true;
+    return have.endsWith('/' + want) || want.endsWith('/' + have);
+  });
+}
+
+export interface TaskCoherenceInput {
+  name: string;
+  acceptance: string[];
+  touchSet?: string[];
+  dependsOn?: string[];
+}
+
+/**
+ * Pure single-task coherence: every file referenced by acceptance must be
+ * inside the task's own touchSet.
+ *
+ * Integrator contract (orchestrator.ts owns the call sites — do NOT add them
+ * here): call `validateTaskCoherence({ name, acceptance, touchSet })` at the
+ * top of `launchJob(job)` and `relaunchJobForCorrection(...)`, before the
+ * dispatch claim, so a relaunch never preserves a contradictory prompt
+ * (acceptance demanding a file the touchSet forbids). Plan-wide, call
+ * `assertPlanCoherence(draft, { testCommand })` after `validatePlan`.
+ */
+export function validateTaskCoherence(task: TaskCoherenceInput): void {
+  const refs = extractAcceptanceFileRefs(task.acceptance ?? []);
+  if (refs.length === 0) return;
+  const owned = task.touchSet ?? [];
+  const missing = refs.filter((ref) => !touchSetCovers(owned, ref));
+  if (missing.length === 0) return;
+  const quoted = missing.map((m) => `"${m}"`).join(', ');
+  const scope = owned.length > 0 ? `[${owned.join(', ')}]` : '(empty — task declares no touchSet)';
+  throw new Error(
+    `Task "${task.name}" is incoherent: acceptance references ${quoted} outside its touchSet ${scope}. ` +
+      `Widen the touchSet to include ${quoted}, or move the test into a dependent job (dependsOn).`,
+  );
+}
+
+/**
+ * Plan-wide coherence: single-task checks plus cross-job diagnosis —
+ * concurrent writers of the same file without a dependsOn handoff, a test
+ * asserting on a file owned by an unrelated job, and a ceiling testCommand
+ * targeting files no job owns. Throws on the first incoherence found.
+ */
+export function assertPlanCoherence(draft: AutoPlanDraft, opts?: { testCommand?: string }): void {
+  const byName = new Map(draft.tasks.map((t) => [t.name, t]));
+
+  // Two workers writing the same destination with no ordering edge race.
+  const writers = new Map<string, string[]>();
+  for (const t of draft.tasks) {
+    for (const entry of t.touchSet ?? []) {
+      const key = normalizeCoherencePath(entry);
+      if (!key) continue;
+      writers.set(key, [...(writers.get(key) ?? []), t.name]);
+    }
+  }
+  for (const [file, names] of writers) {
+    for (let i = 0; i < names.length; i++) {
+      for (let j = i + 1; j < names.length; j++) {
+        const a = byName.get(names[i])!;
+        const b = byName.get(names[j])!;
+        const ordered =
+          (a.dependsOn ?? []).includes(b.name) || (b.dependsOn ?? []).includes(a.name);
+        if (!ordered) {
+          throw new Error(
+            `Jobs "${a.name}" and "${b.name}" both write "${file}" with no dependsOn ordering. ` +
+              `Add dependsOn so one hands off to the other, or split "${file}" between the jobs.`,
+          );
+        }
+      }
+    }
+  }
+
+  // Acceptance refs must be owned by the asserting task or by a linked job.
+  for (const t of draft.tasks) {
+    for (const ref of extractAcceptanceFileRefs(t.acceptance ?? [])) {
+      if (touchSetCovers(t.touchSet, ref)) continue;
+      const owners = draft.tasks
+        .filter((o) => o.name !== t.name && touchSetCovers(o.touchSet, ref))
+        .map((o) => o.name);
+      if (owners.length > 0) {
+        const linked = owners.some(
+          (o) => (t.dependsOn ?? []).includes(o) || (byName.get(o)?.dependsOn ?? []).includes(t.name),
+        );
+        if (linked) continue;
+        throw new Error(
+          `Task "${t.name}" asserts on "${ref}" which belongs to job ${owners.map((o) => `"${o}"`).join(', ')} (touchSet) with no dependsOn edge. ` +
+            `Move the test into a job depending on ${owners.map((o) => `"${o}"`).join(', ')}, or widen "${t.name}" touchSet to include "${ref}".`,
+        );
+      }
+      const owned = t.touchSet ?? [];
+      const scope = owned.length > 0 ? `[${owned.join(', ')}]` : '(empty — task declares no touchSet)';
+      throw new Error(
+        `Task "${t.name}" is incoherent: acceptance references "${ref}" outside its touchSet ${scope}. ` +
+          `Widen the touchSet to include "${ref}", or move the test into a dependent job (dependsOn).`,
+      );
+    }
+  }
+
+  // Ceiling testCommand must target files at least one job owns.
+  if (opts?.testCommand?.trim()) {
+    const cmd = opts.testCommand.trim();
+    const union = draft.tasks.flatMap((t) => t.touchSet ?? []);
+    const missing = extractAcceptanceFileRefs([cmd]).filter((ref) => !touchSetCovers(union, ref));
+    if (missing.length > 0) {
+      throw new Error(
+        `Plan is incoherent: testCommand "${cmd}" targets ${missing.map((m) => `"${m}"`).join(', ')} covered by no job touchSet. ` +
+          `Widen a touchSet to include ${missing.map((m) => `"${m}"`).join(', ')}, or scope the testCommand to covered files.`,
+      );
+    }
+  }
+}
+
 export type RuntimeAction = 'add_task' | 'adjust_deps' | 'ask_user' | 'record_note';
 
 export interface RuntimeDecision {
@@ -393,6 +549,7 @@ export function validateRuntimeDecision(
       questions: [],
       nextSteps: [],
     });
+    validateTaskCoherence({ name, acceptance: t.acceptance, touchSet: t.touchSet });
     return requiresUserReview(`${decision.reason} ${t.prompt}`) ? 'needs-user' : 'autonomous';
   }
 
@@ -541,6 +698,7 @@ export async function runAutoIntake(
   assertSafeDestinations(draft);
   assertAuthorizedActions(draft);
   assertLocalWorkerPrompts(draft);
+  assertPlanCoherence(draft, { testCommand: input.ceiling?.testCommand });
   return {
     intake: {
       id: randomUUID(),
@@ -655,6 +813,7 @@ export async function runAutoIntakeWithRetry(
       assertSafeDestinations(draft);
       assertAuthorizedActions(draft);
       assertLocalWorkerPrompts(draft);
+      assertPlanCoherence(draft, { testCommand: input.ceiling?.testCommand });
       return {
         intake: {
           id: opts?.intakeId ?? randomUUID(),
