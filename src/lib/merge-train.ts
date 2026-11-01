@@ -376,8 +376,9 @@ async function ensureTestDependencies(
  * (short `--short` prefix vs full 40-char SHA) faked a base/job move.
  * A pin that is a prefix of the live SHA (either direction) is the
  * SAME commit. Minimum 4 chars: git never resolves a shorter prefix.
+ * Exported so the orchestrator review path uses the same identity.
  */
-function isSameCommit(a: string, b: string): boolean {
+export function isSameCommit(a: string, b: string): boolean {
   const x = a.trim();
   const y = b.trim();
   if (!x || !y) return false;
@@ -555,6 +556,24 @@ export class MergeTrain {
     };
   }
 
+  /**
+   * B3: re-merge vazio do MESMO commit já verificado (verdict=pass nos pins
+   * do commit atual) é no-op success mesmo em modo estrito — nunca um
+   * `review_blocked` determinístico em loop. Sem verdict=pass no mesmo
+   * commit, o bloqueio estrito permanece (F01).
+   */
+  private async isVerifiedSameCommitNoOp(job: JobSpec, verdict: ReviewVerdict | null): Promise<boolean> {
+    if (!verdict || verdict.verdict !== 'pass' || verdict.blocking) return false;
+    if (!verdict.reviewedCommit || !job.branch) return false;
+    try {
+      const live = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', job.branch]);
+      if (live.exitCode !== 0) return false;
+      return isSameCommit(live.stdout.trim(), verdict.reviewedCommit);
+    } catch {
+      return false;
+    }
+  }
+
   private async processNextInner(job: JobSpec, reviewVerdict: ReviewVerdict | null, opts?: { skipTest?: boolean }): Promise<MergeResult> {
 
     // Save the HEAD before the merge so we can rollback if needed
@@ -611,6 +630,18 @@ export class MergeTrain {
         // verifiable delivery — block instead of succeeding skipped.
         if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
           if (this.config?.requireReviewPass) {
+            if (await this.isVerifiedSameCommitNoOp(job, reviewVerdict)) {
+              await rollbackMerge(this.integrationWorktree);
+              return {
+                success: true,
+                mergedAt: new Date().toISOString(),
+                testReport: {
+                  status: 'passed',
+                  reason: 'No changes to merge (already integrated, same commit verified) — no-op success',
+                  setup: { status: 'skipped', commands: [] },
+                },
+              };
+            }
             await rollbackMerge(this.integrationWorktree);
             return {
               success: false,
@@ -680,6 +711,18 @@ export class MergeTrain {
         // verifiable delivery — block instead of succeeding skipped.
         if (isEmptyCommitFailure(commitResult.stderr || commitResult.stdout)) {
           if (this.config?.requireReviewPass) {
+            if (await this.isVerifiedSameCommitNoOp(job, reviewVerdict)) {
+              await rollbackMerge(this.integrationWorktree);
+              return {
+                success: true,
+                mergedAt: new Date().toISOString(),
+                testReport: {
+                  status: 'passed',
+                  reason: 'No changes to merge (already integrated, same commit verified) — no-op success',
+                  setup: { status: 'skipped', commands: [] },
+                },
+              };
+            }
             await rollbackMerge(this.integrationWorktree);
             return {
               success: false,

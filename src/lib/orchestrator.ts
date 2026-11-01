@@ -4,8 +4,8 @@ import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, 
 import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
-import { coordinateOnce, clampMaxParallel } from './coordinator';
-import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet } from './merge-train';
+import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
+import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, runTestCommand, type MergeTestReport, validateTouchSet, isSameCommit } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
 import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
 import { protectInputsDuringRun, decideIdentityVerdict, runTestsOnImmutableSnapshot, type FileIdentity } from './candidate-identity';
@@ -412,6 +412,94 @@ export function topologicalSort(jobs: JobSpec[]): JobSpec[] {
   return sorted;
 }
 
+/**
+ * B4: merge readiness gate. A `ready_to_merge` job merges when its
+ * declared dependencies are merged and no earlier (mergeOrder) sibling
+ * with unfinished work blocks it. A `failed` earlier sibling never
+ * blocks an independent job — head-of-line blocking on a failed sibling
+ * stalled `pad-task` 4+ min behind a live conductor. Dependency edges
+ * still block (a dependent of the failed job stays put).
+ */
+export function canMergeJobNow(
+  jobs: Array<{ name: string; status: string; mergeOrder?: number; dependsOn?: string[] }>,
+  jobName: string,
+): boolean {
+  const byName = new Map(jobs.map((j) => [j.name, j]));
+  const job = byName.get(jobName);
+  if (!job || job.status !== 'ready_to_merge') return false;
+  const depsOk = (job.dependsOn ?? []).every((dep) => byName.get(dep)?.status === 'merged');
+  if (!depsOk) return false;
+  const order = job.mergeOrder ?? Number.MAX_SAFE_INTEGER;
+  for (const other of jobs) {
+    if (other.name === jobName) continue;
+    if ((other.mergeOrder ?? Number.MAX_SAFE_INTEGER) >= order) continue;
+    const s = other.status;
+    if (s === 'merged' || s === 'failed') continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * B3-deadlock: conteúdo já mergeado na integration mas o plano marca `failed
+ * (empty diff)` legado. O job `failed` nunca é re-revisado (review só roda na
+ * fila de merge), então nem reconcile, nem resume, nem retry resolvem.
+ *
+ * Cura fail-closed: só cura quando (a) há mergeEvidence PASS com reviewedCommit,
+ * (b) a branch do job ainda está NO MESMO commit (evidência fresca, nunca stale),
+ * e (c) o conteúdo está contido na integration — ancestralidade direta
+ * (`merge-base --is-ancestor`, caso ff) OU diff vazio por arquivo do
+ * touchSet/changedFiles (caso squash, que cria commit novo). Falha funcional
+ * sem PASS e commit divergente nunca curam.
+ */
+export async function shouldHealFailedAsMerged(opts: {
+  repoRoot: string;
+  integrationBranch: string;
+  job: { name: string; branch?: string; touchSet?: string[] };
+  evidence?: { testStatus?: string; reviewedCommit?: string; changedFiles?: string[]; scope?: string } | null;
+}): Promise<{ heal: boolean; reason: string }> {
+  const ev = opts.evidence;
+  if (!ev || ev.testStatus !== 'passed' || !ev.reviewedCommit) {
+    return { heal: false, reason: 'no PASS evidence (functional failure stays failed)' };
+  }
+  const branch = opts.job.branch;
+  if (!branch || !opts.integrationBranch) {
+    return { heal: false, reason: 'missing job branch or integration branch' };
+  }
+  const head = await getBranchHead(branch, opts.repoRoot);
+  if (!head.head || !isSameCommit(head.head, ev.reviewedCommit)) {
+    return { heal: false, reason: `stale evidence: branch ${branch} moved past reviewed commit` };
+  }
+  const ancestor = await gitCommand(
+    ['merge-base', '--is-ancestor', ev.reviewedCommit, opts.integrationBranch],
+    { cwd: opts.repoRoot },
+  );
+  if (ancestor.exitCode === 0) {
+    return { heal: true, reason: `reviewed commit ${ev.reviewedCommit.slice(0, 8)} is an ancestor of ${opts.integrationBranch}` };
+  }
+  const paths = (opts.job.touchSet?.length ? opts.job.touchSet : ev.changedFiles) ?? [];
+  let checked = 0;
+  for (const rel of paths) {
+    const safe = rel.replace(/^\/+/, '').trim();
+    if (!safe || safe.includes('..')) continue;
+    const diff = await gitCommand(
+      ['diff', opts.integrationBranch, ev.reviewedCommit, '--', safe],
+      { cwd: opts.repoRoot },
+    );
+    if (diff.exitCode !== 0) {
+      return { heal: false, reason: `containment check failed for ${safe} (grounded)` };
+    }
+    if (diff.stdout.trim() !== '') {
+      return { heal: false, reason: `${safe} diverges from ${opts.integrationBranch}` };
+    }
+    checked += 1;
+  }
+  if (checked === 0) {
+    return { heal: false, reason: 'not an ancestor and no touchSet/changedFiles to verify containment' };
+  }
+  return { heal: true, reason: `touchSet content of ${ev.reviewedCommit.slice(0, 8)} already contained in ${opts.integrationBranch}` };
+}
+
 export class Orchestrator {
   private monitor: JobMonitor;
   private config: MCConfig;
@@ -777,7 +865,37 @@ export class Orchestrator {
   private async reviewJobWithFixLoop(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
     this.lastReviewAutoFix = null;
     const pins = await this.buildStructuralPins(job, plan);
+    // B3: `merged` is terminal — never re-review the same commit. A retry
+    // that lands on an already-merged job is a no-op pass, never a
+    // spurious empty-diff failure in a loop.
+    if (job.status === 'merged') {
+      return {
+        verdict: 'pass',
+        blocking: false,
+        reasons: [],
+        jobName: job.name,
+        reviewedCommit: pins.jobHead,
+        reviewedBase: pins.baseHead,
+      };
+    }
     if (pins.changedFiles.length === 0) {
+      // B3: empty diff on the SAME commit already verified (task-scoped
+      // mergeEvidence PASS) is a no-op pass even in strict mode — the
+      // delivery was proven before integration, re-failing it is a loop.
+      try {
+        const evidence = await loadMergeEvidence().catch(() => null);
+        const prev = (evidence as Record<string, { testStatus?: string; reviewedCommit?: string }> | null)?.[job.name];
+        if (prev?.testStatus === 'passed' && prev.reviewedCommit && isSameCommit(prev.reviewedCommit, pins.jobHead)) {
+          return {
+            verdict: 'pass',
+            blocking: false,
+            reasons: [],
+            jobName: job.name,
+            reviewedCommit: pins.jobHead,
+            reviewedBase: pins.baseHead,
+          };
+        }
+      } catch {}
       return {
         verdict: 'fail',
         blocking: true,
@@ -1807,13 +1925,17 @@ export class Orchestrator {
       return await coordinateOnce({
         maxParallel,
         observe: async () => ({
-          jobs: plan.jobs.map((job) => ({
-            name: job.name,
-            status: byName.get(job.name)?.status ?? job.status,
-            dependsOn: job.dependsOn,
-            mergeOrder: job.mergeOrder,
-            priority: job.priority,
-          })),
+          jobs: plan.jobs.map((job) => {
+            const live = byName.get(job.name) ?? job;
+            return {
+              name: job.name,
+              status: live.status,
+              dependsOn: job.dependsOn,
+              mergeOrder: job.mergeOrder,
+              priority: job.priority,
+              error: live.error,
+            };
+          }),
           // Preserve the orchestrator's configured budget under the 4–8 clamp.
           // Clamped at 0: with maxParallel above the cap the raw compensation
           // goes negative, which would otherwise inflate the budget past the cap.
@@ -1826,7 +1948,23 @@ export class Orchestrator {
         }),
         dispatch: async (req) => {
           const current = byName.get(req.job.name);
-          if (!current || (current.status !== 'queued' && current.status !== 'waiting_deps')) {
+          if (!current) return { sessionID: '' };
+          // B2: a failed-infra pick re-enters via requeue first (failed →
+          // queued is a forced recovery transition) so the claim below sees
+          // a dispatchable state. Anything else non-queued stays skipped.
+          if (current.status === 'failed') {
+            if (!isDispatchInfraError(current.error) || parseDispatchAttempt(current.error) >= MAX_DISPATCH_ATTEMPTS) {
+              return { sessionID: '' };
+            }
+            const depsOk = (current.dependsOn ?? []).every((dep) => byName.get(dep)?.status === 'merged');
+            try {
+              await updatePlanJob(plan.id, current.name, { status: depsOk ? 'queued' : 'waiting_deps' }, { force: true }, this.effectiveRepoRoot());
+              current.status = depsOk ? 'queued' : 'waiting_deps';
+            } catch {
+              return { sessionID: '' };
+            }
+          }
+          if (current.status !== 'queued' && current.status !== 'waiting_deps') {
             return { sessionID: '' };
           }
           const key = `${plan.id}:${req.job.name}`;
@@ -2210,6 +2348,25 @@ export class Orchestrator {
       );
       const byName = new Map(plan.jobs.map((job) => [job.name, job]));
 
+      // B2: auto-recovery before dispatch — failed-infra jobs with budget
+      // left re-enter as queued/waiting_deps so this pass drives a real
+      // retry (a resume with zero attempts is the §7.5 stall). Functional
+      // failures stay failed (visible, need a fix, never silently retried).
+      try {
+        await this.requeueInfraFailures(plan, byName);
+      } catch {}
+
+      // B3-deadlock: cura failed-já-integrado antes do despacho (evidência
+      // PASS no mesmo commit + conteúdo contido na integration → merged
+      // terminal, sem re-review, sem exigir pause). Desbloqueia dependentes
+      // no mesmo passe.
+      try {
+        const healed = await this.healAlreadyIntegratedFailures(plan);
+        if (healed.length > 0) {
+          this.notify(`🩹 Healed ${healed.length} job(s) already integrated: ${healed.join(', ')} (failed→merged, no re-review).`);
+        }
+      } catch {}
+
       let launchedThisCycle = 0;
       for (const job of mergeOrder) {
         if (job.status !== 'queued' && job.status !== 'waiting_deps') {
@@ -2233,7 +2390,12 @@ export class Orchestrator {
         }
 
         const dispatched = await this.launchJob(job);
-        if (dispatched === false) continue;
+        if (dispatched === false) {
+          // B2: launchJob persists failed + syncs the in-memory job, never
+          // counts as running — the next pass (or requeue budget) owns it.
+          job.status = 'failed';
+          continue;
+        }
         runningCount += 1;
         launchedThisCycle += 1;
         job.status = 'running';
@@ -2307,14 +2469,9 @@ export class Orchestrator {
           continue;
         }
 
-        const earlierJobs = mergeOrder.filter(
-          (candidate) => (candidate.mergeOrder ?? 0) < (job.mergeOrder ?? 0),
-        );
-        const canMergeNow = earlierJobs.every((candidate) => {
-          const current = byName.get(candidate.name);
-          return current?.status === 'merged';
-        });
-        if (!canMergeNow) {
+        // B4: a failed earlier sibling never blocks an independent job
+        // (deps still gate: a dependent of the failed job stays put).
+        if (!canMergeJobNow(mergeOrder, job.name)) {
           continue;
         }
 
@@ -3060,14 +3217,22 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         await removeJob(jobId).catch(() => {});
       }
 
-      // Recovery: the job never left queued/waiting_deps (no worktree yet),
-      // but queued/waiting_deps → failed is not a valid transition. Force
-      // it explicitly so the failure is visible instead of stuck queued.
+      // B2: dispatch failure — the worker never started, so the error
+      // carries the infra marker + attempt budget. Callers must NOT treat
+      // this as launched (return false): the in-memory job stays failed so
+      // this pass never counts it as running, and the reconciler can
+      // requeue it (capped) via the public recovery path.
+      const rawCause = error instanceof Error ? error.message : String(error);
+      const consumed = parseDispatchAttempt(job.error);
+      const attempt = Math.min(consumed + 1, MAX_DISPATCH_ATTEMPTS);
+      const infraError = formatDispatchInfraError(rawCause, attempt);
+      job.status = 'failed';
+      job.error = infraError;
       await updatePlanJob(planId, job.name, {
         status: 'failed',
-        error: error instanceof Error ? error.message : String(error),
+        error: infraError,
       }, { force: true }, this.effectiveRepoRoot());
-      return true;
+      return false;
     }
   }
 
@@ -3410,6 +3575,117 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         `Failed to relaunch job "${jobName}" for correction: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /**
+   * B2: public recovery for dispatch-infra failures. A `failed` job whose
+   * error carries the infra marker (worker never started) returns to the
+   * dispatch pool as `queued` (deps satisfied) or `waiting_deps`, keeping
+   * its attempt count in the diagnostic. Functional failures (review/test/
+   * touchSet) are refused — they need a fix, not a requeue. The budget
+   * (`MAX_DISPATCH_ATTEMPTS`) is enforced: exhausted attempts throw
+   * instead of looping forever. Uses `force` because `failed → queued` is
+   * a recovery transition outside the happy-path matrix.
+   */
+  async requeueFailedDispatch(jobName: string): Promise<string> {
+    const repoRoot = this.effectiveRepoRoot();
+    const plan = await loadPlan(repoRoot);
+    if (!plan) throw new Error('No active plan');
+    const job = plan.jobs.find((j) => j.name === jobName);
+    if (!job) throw new Error(`Job "${jobName}" not found in plan`);
+    if (job.status !== 'failed') {
+      throw new Error(`Job "${jobName}" is not failed (current: ${job.status}) — nothing to requeue.`);
+    }
+    if (!isDispatchInfraError(job.error)) {
+      throw new Error(`Job "${jobName}" did not fail on dispatch-infra — fix the cause and retry via the approval path instead.`);
+    }
+    const attempt = parseDispatchAttempt(job.error);
+    if (attempt >= MAX_DISPATCH_ATTEMPTS) {
+      throw new Error(`Job "${jobName}" exhausted its dispatch budget (${attempt}/${MAX_DISPATCH_ATTEMPTS}) — inspect the cause (${job.error ?? 'unknown'}) instead of looping.`);
+    }
+    const depsOk = (job.dependsOn ?? []).every((dep) => plan.jobs.find((j) => j.name === dep)?.status === 'merged');
+    const target = depsOk ? 'queued' : 'waiting_deps';
+    await updatePlanJob(plan.id, job.name, { status: target }, { force: true }, repoRoot);
+    return `Job "${jobName}" requeued to ${target} (dispatch attempt ${attempt}/${MAX_DISPATCH_ATTEMPTS} consumed; next failure advances the budget). Cause kept: ${job.error ?? 'unknown'}`;
+  }
+
+  /**
+   * B2: reconciler-side auto-recovery. Requeues every `failed`-infra job
+   * with budget left before this pass dispatches, so a `resume` drives a
+   * real retry instead of stalling with zero attempts. Returns the names
+   * requeued. Budget-exhausted and functional failures are left alone.
+   */
+  private async requeueInfraFailures(
+    plan: PlanSpec,
+    byName: Map<string, JobSpec>,
+  ): Promise<string[]> {
+    const requeued: string[] = [];
+    const repoRoot = this.effectiveRepoRoot();
+    for (const job of plan.jobs) {
+      const current = byName.get(job.name) ?? job;
+      if (current.status !== 'failed') continue;
+      if (!isDispatchInfraError(current.error)) continue;
+      if (parseDispatchAttempt(current.error) >= MAX_DISPATCH_ATTEMPTS) continue;
+      const depsOk = (current.dependsOn ?? []).every((dep) => byName.get(dep)?.status === 'merged');
+      const target = depsOk ? 'queued' : 'waiting_deps';
+      try {
+        await updatePlanJob(plan.id, current.name, { status: target }, { force: true }, repoRoot);
+        current.status = target;
+        requeued.push(current.name);
+      } catch {
+        // Best-effort: a lost race keeps the job failed (visible, not lost).
+      }
+    }
+    return requeued;
+  }
+
+  /**
+   * B3-deadlock: antes do despacho, cura jobs `failed` cujo conteúdo já está
+   * integrado (evidência PASS no mesmo commit + contenção na integration).
+   * Marca `merged` terminal (force: failed→merged é inválida no fluxo normal)
+   * com decisão registrada, sem re-review e sem exigir pause. Dependentes com
+   * deps satisfeitas desbloqueiam no mesmo passe (byName é a mesma referência).
+   */
+  private async healAlreadyIntegratedFailures(plan: PlanSpec): Promise<string[]> {
+    const healed: string[] = [];
+    const repoRoot = this.effectiveRepoRoot();
+    let evidence: Record<string, { testStatus?: string; reviewedCommit?: string; changedFiles?: string[]; scope?: string }>;
+    try {
+      evidence = await loadMergeEvidence().catch(() => ({}));
+    } catch {
+      return [];
+    }
+    for (const job of plan.jobs) {
+      if (job.status !== 'failed') continue;
+      const rec = evidence[job.name];
+      let check: { heal: boolean; reason: string };
+      try {
+        check = await shouldHealFailedAsMerged({
+          repoRoot,
+          integrationBranch: plan.integrationBranch,
+          job: { name: job.name, branch: job.branch, touchSet: job.touchSet },
+          evidence: rec ?? undefined,
+        });
+      } catch {
+        continue;
+      }
+      if (!check.heal) continue;
+      try {
+        await updatePlanJob(plan.id, job.name, { status: 'merged', mergedAt: new Date().toISOString() }, { force: true }, repoRoot);
+        job.status = 'merged';
+        healed.push(job.name);
+        try {
+          const snap = await loadRuntimeSnapshot().catch(() => null);
+          const intakeId = snap?.autoIntake?.id;
+          if (intakeId) {
+            await appendAutoDecision(intakeId, `reconcile healed ${job.name}: failed→merged (already integrated; ${check.reason})`).catch(() => {});
+          }
+        } catch {}
+      } catch {
+        // Best-effort: mantém failed visível em vez de perder o estado.
+      }
+    }
+    return healed;
   }
 
   private handleJobComplete = (job: Job): void => {

@@ -50,8 +50,31 @@ async function writeLockedPorts(ports: number[]): Promise<void> {
 }
 
 /**
+ * OS-level availability probe: can we actually bind this port right now?
+ * Detects holders invisible to the lock file / job list (another XDG
+ * instance, a leaked serve process, anything else on the machine).
+ * A successful bind means free — the probe server is stopped immediately.
+ */
+async function isPortFree(port: number): Promise<boolean> {
+  try {
+    const server = Bun.serve({
+      port,
+      hostname: '127.0.0.1',
+      fetch: () => new Response('mc-port-probe', { status: 404 }),
+    });
+    server.stop(true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Allocate the next available port from the configured range.
  * Scans active jobs for used ports and checks the lock file to prevent races.
+ * Before delivering a candidate, probes whether the OS will actually let us
+ * bind it — ports held by foreign processes (other XDG instances, leaked
+ * servers) are skipped instead of reallocated into a deterministic collision.
  */
 export async function allocatePort(
   config: MCConfig,
@@ -68,18 +91,29 @@ export async function allocatePort(
     );
     const lockedPorts = await readLockedPorts();
     const usedPorts = new Set([...jobPorts, ...lockedPorts]);
+    const osOccupied: number[] = [];
 
     for (let port = rangeStart; port <= rangeEnd; port++) {
-      if (!usedPorts.has(port)) {
-        lockedPorts.push(port);
-        await writeLockedPorts(lockedPorts);
-        return port;
+      if (usedPorts.has(port)) {
+        continue;
       }
+      if (!(await isPortFree(port))) {
+        osOccupied.push(port);
+        continue;
+      }
+      lockedPorts.push(port);
+      await writeLockedPorts(lockedPorts);
+      return port;
     }
 
+    const osHint =
+      osOccupied.length > 0
+        ? ` ${osOccupied.length} port(s) held at OS level (${osOccupied.join(', ')})` +
+          ` by another process or XDG instance — check listeners (ss -ltnp) or widen the range.`
+        : '';
     throw new Error(
       `No available ports in range ${rangeStart}-${rangeEnd}. ` +
-        `${usedPorts.size} ports in use. Use mc_cleanup to free ports from completed jobs.`,
+        `${usedPorts.size} ports in use.${osHint} Use mc_cleanup to free ports from completed jobs.`,
     );
   });
 }

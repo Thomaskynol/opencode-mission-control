@@ -43,6 +43,33 @@ function makeJob(overrides?: Partial<Job>): Job {
   } as Job;
 }
 
+/**
+ * Find `count` consecutive OS-free ports for the fixture range.
+ * Isolates these tests from foreign listeners on the host (e.g. other
+ * live serve processes on 1410x) — the allocator's bind-probe correctly
+ * skips those, so hardcoded expectations on 1410x are only valid when
+ * the OS range is actually free.
+ */
+function findFreeBase(count: number): number {
+  for (let base = 25000; base < 30000; base++) {
+    let ok = true;
+    for (let p = base; p < base + count; p++) {
+      try {
+        Bun.serve({
+          port: p,
+          hostname: '127.0.0.1',
+          fetch: () => new Response('probe'),
+        }).stop(true);
+      } catch {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return base;
+  }
+  throw new Error('no free port block found for test fixture');
+}
+
 describe('port-allocator', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -66,12 +93,14 @@ describe('port-allocator', () => {
     });
 
     it('should skip ports used by active jobs', async () => {
+      const base = findFreeBase(3);
       const jobs = [
-        makeJob({ port: 14100 }),
-        makeJob({ port: 14101 }),
+        makeJob({ port: base }),
+        makeJob({ port: base + 1 }),
       ];
-      const port = await allocatePort(makeConfig(), jobs);
-      expect(port).toBe(14102);
+      const config = makeConfig({ portRangeStart: base, portRangeEnd: base + 10 });
+      const port = await allocatePort(config, jobs);
+      expect(port).toBe(base + 2);
     });
 
     it('should skip ports in lock file from previous allocations', async () => {
@@ -97,11 +126,12 @@ describe('port-allocator', () => {
     });
 
     it('should consider both job ports and lock file ports', async () => {
-      const config = makeConfig({ portRangeStart: 14100, portRangeEnd: 14103 });
+      const base = findFreeBase(4);
+      const config = makeConfig({ portRangeStart: base, portRangeEnd: base + 3 });
       await allocatePort(config, []);
-      const jobs = [makeJob({ port: 14101 })];
+      const jobs = [makeJob({ port: base + 1 })];
       const port = await allocatePort(config, jobs);
-      expect(port).toBe(14102);
+      expect(port).toBe(base + 2);
     });
 
     it('should handle corrupted lock file gracefully', async () => {

@@ -199,6 +199,48 @@ export interface PlanJobView {
   /** Acceptance criteria (file refs must be covered by the touchSet). */
   acceptance?: string[];
   prompt?: string;
+  /** Persisted failure diagnostic (dispatch-infra attempts ride here). */
+  error?: string;
+}
+
+/**
+ * B2: ceiling for dispatch-infra re-eligibility. A `failed` job whose
+ * error is a dispatch-infra failure (worker never started: port/serve/
+ * claim) may be dispatched again, but never forever — the attempt count
+ * rides in the error text (`dispatch-infra (attempt N/M): …`).
+ */
+export const MAX_DISPATCH_ATTEMPTS = 3;
+
+const DISPATCH_INFRA_PATTERNS = [
+  /dispatch-infra/i,
+  /dispatch claim failed/i,
+  /did not become ready/i,
+  /no available ports/i,
+  /server on port/i,
+  /EADDRINUSE/i,
+];
+
+/** True when the failure means the worker never started (infra, retryable). */
+export function isDispatchInfraError(error?: string): boolean {
+  if (!error) return false;
+  return DISPATCH_INFRA_PATTERNS.some((re) => re.test(error));
+}
+
+/** Attempts already consumed (0 when no error). Unmarked infra errors count as 1. */
+export function parseDispatchAttempt(error?: string): number {
+  if (!error) return 0;
+  const marked = error.match(/attempt\s+(\d+)\s*\/\s*\d+/i) ?? error.match(/attempt\s+(\d+)/i);
+  if (marked) {
+    const n = Number.parseInt(marked[1]!, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  return isDispatchInfraError(error) ? 1 : 0;
+}
+
+/** Format a dispatch-infra diagnostic carrying the attempt budget (idempotent). */
+export function formatDispatchInfraError(cause: string, attempt: number, max: number = MAX_DISPATCH_ATTEMPTS): string {
+  const clean = cause.replace(/^dispatch-infra\s*\(attempt\s*\d+\s*\/\s*\d+\)\s*:\s*/i, '').trim();
+  return `dispatch-infra (attempt ${attempt}/${max}): ${clean}`;
 }
 
 function depsSatisfied(job: PlanJobView, merged: Set<string>): boolean {
@@ -209,6 +251,9 @@ function depsSatisfied(job: PlanJobView, merged: Set<string>): boolean {
  * Pick the next jobs to dispatch: queued/waiting_deps with satisfied
  * deps, ordered by mergeOrder then priority, bounded by
  * `maxParallel - runningCount`. Pure and mock-friendly.
+ * B2: `failed` jobs whose error is a dispatch-infra failure (worker never
+ * started) are re-eligible while attempts remain — functional failures
+ * (review/test/touchSet) never re-enter here.
  */
 export function decideNextJobs(
   jobs: PlanJobView[],
@@ -220,10 +265,15 @@ export function decideNextJobs(
   if (budget === 0) return [];
 
   const merged = new Set(jobs.filter((j) => j.status === 'merged').map((j) => j.name));
-  const eligible = jobs.filter(
-    (j) =>
-      (j.status === 'queued' || j.status === 'waiting_deps') && depsSatisfied(j, merged),
-  );
+  const eligible = jobs.filter((j) => {
+    if (!depsSatisfied(j, merged)) return false;
+    if (j.status === 'queued' || j.status === 'waiting_deps') return true;
+    // B2: infra failure with budget left re-enters the dispatch pool.
+    if (j.status === 'failed' && isDispatchInfraError(j.error) && parseDispatchAttempt(j.error) < MAX_DISPATCH_ATTEMPTS) {
+      return true;
+    }
+    return false;
+  });
   eligible.sort(
     (a, b) =>
       (a.mergeOrder ?? Number.MAX_SAFE_INTEGER) - (b.mergeOrder ?? Number.MAX_SAFE_INTEGER) ||
