@@ -24,6 +24,19 @@ function permissionHaystack(p: { action?: string; description: string; target?: 
 }
 
 /**
+ * Per-type timeout policy (G, explicit): publishing, network and unknown
+ * NEVER auto-approve — not immediately, not on timeout. They auto-deny on
+ * timeout (fail-closed, never authorized by silence) and every timer decision
+ * is logged to the audit trail. Ordinary file/shell escalations outside the
+ * worktree auto-approve on timeout so independent fronts keep moving.
+ */
+export function neverAutoApprovesOnTimeout(permission: Pick<PermissionRequest, 'type' | 'description' | 'action' | 'target' | 'path'>): boolean {
+  if (isPublishingPermissionText(permissionHaystack(permission as PermissionRequest))) return true;
+  const t = (permission as PermissionRequest).type;
+  return t === 'network' || t === 'other';
+}
+
+/**
  * A pending mcp_question from a serve-mode job's agent.
  * Keyed by `{jobId}:{partId}` for dedup.
  */
@@ -337,7 +350,10 @@ export function buildQuestionPrompt(context: QuestionContext): string {
   parts.push('  - Reply "yes" to approve');
   parts.push('  - Reply "no" to deny');
   parts.push('  - Reply with specific instructions');
-  parts.push('  - Let it decide: use its best judgment (auto-response after timeout)');
+  // G: per-type timeout explicit (implemented, not just advertised):
+  // ordinary file/shell escalations auto-approve after timeout;
+  // publishing/network/unknown NEVER auto-approve (auto-deny, explicit human required).
+  parts.push('  - Let it decide: use its best judgment (ordinary file/shell auto-approve after timeout; publishing/network/unknown auto-deny, explicit human required)');
 
   return parts.join('\n');
 }
@@ -381,8 +397,9 @@ export class QuestionRelay {
    * missed). Ask-user requests are now visible as pending questions
    * (memory + durable sidecar → `mc_overview`, dashboard `questions`,
    * TUI `questions`/`follow`) and keep the worker unblocked via the
-   * auto-response timeout. Publishing escalations auto-deny on timeout
-   * instead of approving, so a push can never be authorized by silence.
+   * auto-response timeout. Publishing/network/unknown escalations auto-deny
+   * on timeout instead of approving, so a push/fetch/publish can never be
+   * authorized by silence. Every timer decision is logged to the audit trail.
    */
   async handlePermissionRequest(
     job: Job,
@@ -411,7 +428,6 @@ export class QuestionRelay {
     // Escalation path: make it operator-visible (memory + sidecar) so
     // `mc_overview`/dashboard/`questions` show it. Best-effort persist:
     // unit callers without a mocked data dir still get the memory entry.
-    const publishing = isPublishingPermissionText(permissionHaystack(permission));
     const pending: PendingQuestion = {
       jobId: job.id,
       jobName: job.name,
@@ -439,7 +455,11 @@ export class QuestionRelay {
     }
 
     if (job.port && job.remoteSessionID) {
-      this.setupAutoResponse(job, permission.id, !publishing);
+      // G: per-type timeout explicit — publishing/network/unknown NEVER
+      // auto-approve (auto-deny on timeout). Ordinary file/shell outside
+      // escalations auto-approve so independent fronts keep moving.
+      const denyByTimeout = neverAutoApprovesOnTimeout(permission);
+      this.setupAutoResponse(job, permission, !denyByTimeout);
     } else {
       console.warn(`[QuestionRelay] Cannot escalate permission for job ${job.name}: missing serve port or remote session.`);
     }
@@ -463,19 +483,27 @@ export class QuestionRelay {
 
   /**
    * Set up automatic response after timeout.
-   * Publishing escalations auto-deny (never approve by silence); ordinary
-   * escalations approve with the default response so independent fronts
-   * keep moving.
+   * Per-type explicit (G): publishing/network/unknown auto-deny (never
+   * approve by silence); ordinary file/shell escalations approve with the
+   * default response so independent fronts keep moving. Every timer decision
+   * is logged to the audit trail (plan auditLog best-effort + console).
    */
-  private setupAutoResponse(job: Job, permissionId: string, autoApprove = true): void {
+  private setupAutoResponse(job: Job, permission: PermissionRequest | string, autoApprove = true): void {
+    const permissionId = typeof permission === 'string' ? permission : permission.id;
+    const permissionType = typeof permission === 'string' ? 'unknown' : (permission as PermissionRequest).type;
+    const permissionDesc = typeof permission === 'string' ? permissionId : (permission as PermissionRequest).description;
     // Clear any existing timeout for this permission
     const existingKey = `${job.id}:${permissionId}`;
     if (this.pendingResponses.has(existingKey)) {
       clearTimeout(this.pendingResponses.get(existingKey)!);
     }
 
-    // Set new timeout
+    // Set new timeout (per-type explicit: denyByTimeout already decided by caller)
     const timeoutId = setTimeout(async () => {
+      const decision = autoApprove ? 'approved' : 'denied';
+      const detail = autoApprove
+        ? this.config.defaultResponse
+        : `Denied by policy (${permissionType}): publishing/network/unknown require explicit human authorization`;
       try {
         if (job.port && job.remoteSessionID) {
           await this.replyToPermission(
@@ -483,10 +511,10 @@ export class QuestionRelay {
             job.remoteSessionID,
             permissionId,
             autoApprove,
-            autoApprove ? this.config.defaultResponse : 'Denied by policy: publishing requires explicit human authorization',
+            detail,
           );
         }
-        console.log(`[QuestionRelay] Auto-${autoApprove ? 'approved' : 'denied'} permission ${permissionId} for job ${job.id}`);
+        console.log(`[QuestionRelay] Auto-${decision} permission ${permissionId} for job ${job.id} [type=${permissionType}] — ${detail}`);
       } catch (error) {
         console.error(`[QuestionRelay] Failed to auto-respond for job ${job.id}:`, error);
       } finally {
@@ -495,6 +523,25 @@ export class QuestionRelay {
         try {
           const { dropPersistedQuestion } = await import('./durable-state.js');
           await dropPersistedQuestion(job.id, `perm:${permissionId}`);
+        } catch {}
+        // Audit trail: best-effort plan auditLog (same-process owner fast path
+        // allows the write; failures only console-log, never block).
+        try {
+          const planId = (job as { planId?: string }).planId;
+          if (planId) {
+            const { loadPlan, updatePlanFields } = await import('./plan-state.js');
+            const plan = await loadPlan().catch(() => null);
+            if (plan && plan.id === planId) {
+              const entry = {
+                action: `permission-timeout-${decision}`,
+                jobName: job.name,
+                at: new Date().toISOString(),
+                detail: `${permissionId} [${permissionType}] ${permissionDesc} — ${detail}`,
+              } as never;
+              const next = [...(plan.auditLog ?? []), entry];
+              await updatePlanFields(planId, { auditLog: next } as never).catch(() => {});
+            }
+          }
         } catch {}
       }
     }, this.config.autoResponseTimeoutMs);

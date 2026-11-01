@@ -122,29 +122,53 @@ export const mc_report_final: ToolDefinition = tool({
     const conflicts = plan.jobs
       .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
       .map((job) => job.name);
-    // Fail-closed, two distinct claims:
+    // Fail-closed, two distinct claims (unified strict rule — see verification.ts):
     // - integrated = merged into the integration branch (a merge happened).
-    // - verified = merged AND backed by conserved product test evidence.
-    // A merge alone does not prove functioning; without conserved evidence
-    // nothing is claimed verified. Merges are listed under Integration;
-    // unknown work stays under Gaps, never under Verified.
-    const evidenceRecs = Object.values(mergeEvidence as Record<string, { testStatus?: string; testCommand?: string; reviewedCommit?: string }>);
+    // - verified = merged AND backed by TASK-scoped passing product evidence
+    //   (scoped review run on the candidate with reviewedCommit, not
+    //   acceptance-less). Integration-only smoke never verifies; it renders
+    //   under Gaps. Unknown work stays under Gaps, never under Verified.
+    const evidenceRecs = Object.values(mergeEvidence as Record<string, { testStatus?: string; testCommand?: string; reviewedCommit?: string; scope?: string; acceptanceLess?: boolean }>);
+    const { isTaskVerified } = await import('../lib/verification.js');
     const verified = merged
-      .filter((name) => (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed')
+      .filter((name) => isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never))
       .map((name) => {
         const rec = (mergeEvidence as Record<string, { testCommand?: string; reviewedCommit?: string }>)[name];
-        return `${name} [merged]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+        return `${name} [merged, task-scoped]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
+      });
+    const integrationCovered = merged
+      .filter((name) => !isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never) && (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed')
+      .map((name) => {
+        const rec = (mergeEvidence as Record<string, { testCommand?: string }>)[name];
+        return `${name} [merged] — covered only by global integration smoke${rec?.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
       });
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
       .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
     // Anything not merged is unverified — including completed jobs: a worker
     // "completed" claim without a merge (no reviewer gate, no integration)
-    // is not evidence.
-    const unverified = plan.jobs
-      .filter((job) => job.status !== 'merged')
-      .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
-      .map((job) => `${job.name} [${job.status}] — outcome not verified`);
+    // is not evidence. Merged jobs with only integration smoke (no task
+    // evidence) also render here under Gaps, never under Verified.
+    // Pending human decisions always listed (parity with auto-report).
+    let pendingGaps: string[] = [];
+    try {
+      const persisted = (snap as { pendingQuestions?: Array<{ jobId: string; question: string }> } | null)?.pendingQuestions ?? [];
+      const qs = [
+        ...((intake as { questions?: string[] } | null)?.questions ?? []),
+        ...persisted.map((q) => `[${q.jobId}] ${q.question}`),
+      ];
+      pendingGaps = qs.map((q) => `pending human decision (blocks acceptance): ${q}`);
+    } catch {
+      pendingGaps = [];
+    }
+    const unverified = [
+      ...plan.jobs
+        .filter((job) => job.status !== 'merged')
+        .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
+        .map((job) => `${job.name} [${job.status}] — outcome not verified`),
+      ...integrationCovered.map((entry) => `${entry}`),
+      ...pendingGaps,
+    ];
     const notes = args.notes?.trim() ? [args.notes.trim()] : [];
     const files = [...new Set(evidenceRecs.flatMap((r) => (r as { changedFiles?: string[] }).changedFiles ?? []))];
     const installUsage = [...new Set(evidenceRecs.flatMap((r) => {

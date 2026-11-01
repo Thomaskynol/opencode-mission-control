@@ -1715,20 +1715,14 @@ export class Orchestrator {
         .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
         .map((job) => job.name);
       const evidenceList = Object.values(mergeEvidence);
-      // R05: Verified = merged AND backed by TASK-scoped passing product
-      // evidence (scoped review run on the candidate). Jobs covered only by
-      // the repo-wide integration smoke stay out of Verified — a shared
-      // integration run is one integration test, not per-task verification.
-      // Pins (reviewedCommit/reviewedBase/changedFiles) merge by field, never
-      // reset by the global write.
+      // R05/G (unified strict rule — see verification.ts): Verified = merged
+      // AND backed by TASK-scoped passing product evidence (scoped review run
+      // on the candidate). Jobs covered only by the repo-wide integration
+      // smoke stay out of Verified. Pins merge by field, never reset.
+      const { isTaskVerified } = await import('./verification.js');
       type EvidenceView = { testStatus?: string; scope?: string; testCommand?: string; reviewedCommit?: string; acceptanceLess?: boolean };
       const evOf = (name: string): EvidenceView => (mergeEvidence as Record<string, EvidenceView>)[name] ?? {};
-      const taskVerified = (name: string): boolean => {
-        const rec = evOf(name);
-        // Manual fallback (no acceptance criteria) never verifies: evidence
-        // allowed the merge, but there was no criterion to judge coverage.
-        return rec.testStatus === 'passed' && rec.scope === 'task' && Boolean(rec.reviewedCommit) && !rec.acceptanceLess;
-      };
+      const taskVerified = (name: string): boolean => isTaskVerified(evOf(name));
       const acceptanceLessEntries = merged
         .filter((name) => evOf(name).acceptanceLess)
         .map((name) => `${name} [merged] — no acceptance criteria defined, outcome not verified by criterion`);
