@@ -1,6 +1,6 @@
 import { getJobByName } from '../lib/job-state';
 import { loadConfig } from '../lib/config';
-import { assertRealEntryEnv } from '../lib/plan-state';
+import { assertHardenedRealEntry } from '../lib/monitor';
 import { createV2Client, v2Prompt } from '../lib/sdk-client';
 import { mc_kill } from '../tools/kill';
 import { pauseJob, livePauseOps, pauseTarget } from '../tools/job-pause';
@@ -53,14 +53,23 @@ export function createLiveControls(): HumanControls {
 }
 
 /**
- * R6 real-entry gate: driving verbs refuse a leaked generic test env
- * fail-closed (NODE_ENV=test/VITEST=true silently disables conductor
+ * R6b hardened real-entry gate: driving verbs refuse a leaked generic test
+ * env fail-closed (NODE_ENV=test/VITEST=true silently disables conductor
  * fencing and the external reviewer). Read-only verbs (follow, questions,
- * order, task, log, help, close) stay available. Explicitly-scoped runs
- * opt out with MC_ALLOW_TEST_ENV=1. Library call paths (dispatchArgv,
- * startAutonomous, resumeIntake) stay ungated so unit fakes keep working.
+ * order, task, log, help, close) stay available.
+ *
+ * Override is explicit + auditable only: `--allow-test-env` in this
+ * invocation argv (recorded to test-env-override-audit.jsonl + stderr).
+ * An inherited MC_ALLOW_TEST_ENV=1 alone is NOT enough (it leaks through
+ * the environment) and is refused with an actionable error naming the flag.
+ * Library call paths (dispatchArgv, startAutonomous, resumeIntake) stay
+ * ungated so unit fakes keep working.
  */
 const DRIVING_VERBS = new Set(['start', 'resume', 'approve']);
+
+function stripTestEnvFlag(argv: string[]): string[] {
+  return argv.filter((a) => a !== '--allow-test-env' && !a.startsWith('--allow-test-env='));
+}
 
 async function main(): Promise<void> {
   // Pass raw argv through: the shell already tokenized quotes, so a
@@ -69,10 +78,11 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const verb = (argv[0] ?? '').toLowerCase();
   if (DRIVING_VERBS.has(verb)) {
-    assertRealEntryEnv(`cli ${verb}`);
+    assertHardenedRealEntry(`cli ${verb}`, { argv });
   }
+  const filtered = stripTestEnvFlag(argv);
   try {
-    console.log(await dispatchArgv(argv, createLiveControls()));
+    console.log(await dispatchArgv(filtered, createLiveControls()));
   } catch (error) {
     console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);

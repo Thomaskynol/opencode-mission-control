@@ -23,7 +23,10 @@ import {
   v2ListForms,
   type V2Client,
 } from './sdk-client.js';
-import { loadPlan } from './plan-state.js';
+import { loadPlan, isTestEnvPresent } from './plan-state.js';
+import { getXdgDataDir } from './paths.js';
+import { join, dirname } from 'path';
+import { mkdirSync, appendFileSync } from 'node:fs';
 import { PermissionPolicy, type PermissionPolicyConfig } from './permission-policy.js';
 
 type JobEventType = 'complete' | 'failed' | 'blocked' | 'needs_review' | 'awaiting_input' | 'agent_report' | 'question';
@@ -55,6 +58,85 @@ const SSE_BACKOFF_FACTOR = 2;
 export interface JobMonitorOptions {
   pollInterval?: number;
   idleThreshold?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* R6b hardened real-entry contract (single source, no duplication).   */
+/* A generic test env (NODE_ENV=test/VITEST=true, which Bun sets under */
+/* `bun test`) silently disables production guarantees elsewhere       */
+/* (conductor fencing bypasses + external reviewer skipped via         */
+/* isTestScope in orchestrator.ts). Real entries must refuse           */
+/* fail-closed unless the operator passed an explicit, auditable       */
+/* signal on this invocation: `--allow-test-env` in argv. An inherited */
+/* MC_ALLOW_TEST_ENV=1 alone is NOT an explicit signal (it leaks       */
+/* through the environment) and is refused with an actionable error.   */
+/* Unit fakes (JobMonitor short pollInterval below, bun:test imports)   */
+/* keep using isTestEnvPresent() in-process and never drive guarantees */
+/* — the fast path below is test-only convenience, not a guarantee     */
+/* switch. CLI (orchestrator-cli/index.ts) and plugin (src/index.ts)   */
+/* both call assertHardenedRealEntry, so the rule lives here once.     */
+/* ------------------------------------------------------------------ */
+
+/** Explicit operator signal: `--allow-test-env` present in this invocation argv. */
+export function hasExplicitTestEnvFlag(argv?: string[]): boolean {
+  const args = argv ?? process.argv.slice(2);
+  return args.some((a) => a === '--allow-test-env' || a.startsWith('--allow-test-env='));
+}
+
+/** Global auditable override log (XDG-scoped, never per-run stdout only). */
+export function testEnvOverrideAuditPath(): string {
+  try {
+    return join(getXdgDataDir(), 'test-env-override-audit.jsonl');
+  } catch {
+    const base = process.env.MC_XDG_DATA_DIR?.trim();
+    if (base) return join(base, 'test-env-override-audit.jsonl');
+    return join(process.cwd(), 'test-env-override-audit.jsonl');
+  }
+}
+
+/** Best-effort durable audit for an explicitly allowed test-env run. Never throws. */
+export function auditTestEnvOverride(entry: string): void {
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    event: 'test-env-override',
+    entry,
+    pid: process.pid,
+    argv: process.argv.slice(2),
+    env: { NODE_ENV: process.env.NODE_ENV, VITEST: process.env.VITEST, MC_ALLOW_TEST_ENV: process.env.MC_ALLOW_TEST_ENV },
+    explicitFlag: '--allow-test-env',
+  });
+  try {
+    console.warn(`[MC] test-env override audited: ${entry} explicitly allowed via --allow-test-env (pid ${process.pid}).`);
+  } catch {}
+  try {
+    // Sync, durable, XDG-scoped: survives the one-shot CLI shutdown.
+    const file = testEnvOverrideAuditPath();
+    try { mkdirSync(dirname(file), { recursive: true }); } catch {}
+    appendFileSync(file, line + '\n');
+  } catch {}
+}
+
+/**
+ * Fail-closed gate for REAL entries (CLI main, plugin driving tools).
+ * - No generic test env => allow (normal).
+ * - Generic test env + explicit `--allow-test-env` in argv => allow + audit.
+ * - Generic test env without the flag => throw actionable (even when
+ *   MC_ALLOW_TEST_ENV=1 is inherited — env alone is not an operator signal).
+ * Never call from library call paths unit tests exercise directly.
+ */
+export function assertHardenedRealEntry(entry: string, opts?: { argv?: string[] }): void {
+  if (!isTestEnvPresent()) return;
+  const argv = opts?.argv ?? process.argv.slice(2);
+  if (hasExplicitTestEnvFlag(argv)) {
+    auditTestEnvOverride(entry);
+    return;
+  }
+  throw new Error(
+    `[MC] Refusing ${entry}: NODE_ENV=${process.env.NODE_ENV ?? ''}/VITEST=${process.env.VITEST ?? ''} disables production guarantees ` +
+      `(conductor fencing, external review). Unset the variable for real runs, or re-invoke with --allow-test-env ` +
+      `for an explicitly-scoped test run (override is audited). MC_ALLOW_TEST_ENV=1 alone no longer suffices ` +
+      `(inherited env is not an explicit operator signal).`,
+  );
 }
 
 function hashOutput(output: string): string {
@@ -119,8 +201,11 @@ export class JobMonitor extends EventEmitter {
     this.explicitIdleThreshold = options.idleThreshold !== undefined;
     this.questionRelay = new QuestionRelay();
 
-    const isTest = process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
-    if (this.pollInterval < 10000 && !isTest) {
+    // R6b: anchored to the shared explicit contract (isTestEnvPresent),
+    // not a private isTest copy. This fast path is unit-fake only and
+    // never disables guarantees: fencing + external review are gated at
+    // real entries (CLI/plugin assertHardenedRealEntry above), not here.
+    if (this.pollInterval < 10000 && !isTestEnvPresent()) {
       throw new Error('Poll interval must be at least 10000ms (10s)');
     }
   }

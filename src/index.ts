@@ -6,6 +6,7 @@ import { shouldShowAutoStatus, getAutoStatusMessage } from './hooks/auto-status'
 import { setupNotifications, hasAnnotation, resetSessionTitle, isTitleResetSuppressed, ensureMCPrefix } from './hooks/notifications';
 import { registerCommands, createCommandHandler } from './commands';
 import { isTmuxAvailable } from './lib/tmux';
+import { assertHardenedRealEntry } from './lib/monitor';
 import { loadPlan } from './lib/plan-state';
 import { Orchestrator } from './lib/orchestrator';
 import { loadConfig } from './lib/config';
@@ -122,6 +123,38 @@ function extractSessionIDFromListResult(listResult: unknown): string | undefined
 
 let tmuxAvailable = false;
 
+/* ------------------------------------------------------------------ */
+/* R6b hardened plugin entries (same rigor as CLI, single source).     */
+/* Autonomous missions must never lose fencing/external-review by      */
+/* inheriting NODE_ENV=test/VITEST=true from the host. Driving tools  */
+/* (mc_launch = start, mc_plan/mc_plan_approve = approve,              */
+/* mc_job_resume = resume) refuse fail-closed without the explicit,    */
+/* auditable `--allow-test-env` argv signal (inherited                 */
+/* MC_ALLOW_TEST_ENV=1 alone is refused). Read-only tools              */
+/* (mc_status/mc_jobs/mc_diff/mc_plan_status/mc_overview/...) stay     */
+/* available; other job controls go through conductor-lease checks     */
+/* that fail closed in prod (R2) and never consult the test env.       */
+/* Library call paths (direct tool imports in unit tests) stay ungated */
+/* — only the plugin-registered wrappers below refuse.                 */
+/* ------------------------------------------------------------------ */
+
+const DRIVING_PLUGIN_TOOLS = new Set(['mc_launch', 'mc_plan', 'mc_plan_approve', 'mc_plan_cancel', 'mc_job_resume']);
+
+function withHardenedTestEnvGate<T extends { execute: (...a: never[]) => Promise<unknown> }>(
+  name: string,
+  v1Tool: T,
+): T {
+  if (!DRIVING_PLUGIN_TOOLS.has(name)) return v1Tool;
+  const original = (v1Tool as { execute: (...a: never[]) => Promise<unknown> }).execute.bind(v1Tool);
+  return {
+    ...(v1Tool as Record<string, unknown>),
+    async execute(...args: never[]) {
+      assertHardenedRealEntry(`plugin ${name}`);
+      return await original(...args);
+    },
+  } as T;
+}
+
 export const MissionControl: Plugin = async ({ client }) => {
   const cwd = process.cwd();
   const worktreeInfo = await isInManagedWorktree(cwd);
@@ -216,6 +249,14 @@ export const MissionControl: Plugin = async ({ client }) => {
   if (!isJobAgent) {
     loadPlan().then(async (plan) => {
       if (plan && (plan.status === 'running' || plan.status === 'paused')) {
+        // R6b: auto-resume drives the conductor (fencing + reviewer).
+        // Refuse fail-closed on inherited test env; explicit flag allows + audits.
+        try {
+          assertHardenedRealEntry('plugin auto-resume');
+        } catch (error) {
+          console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+          return;
+        }
         const config = await loadConfig();
         const orchestrator = new Orchestrator(monitor, config, { notify: getSharedNotifyCallback() ?? undefined });
         setSharedOrchestrator(orchestrator);
@@ -271,7 +312,16 @@ export const MissionControl: Plugin = async ({ client }) => {
     },
     tool: isJobAgent 
       ? { mc_report, mc_status } as any
-      : { mc_launch, mc_jobs, mc_status, mc_diff, mc_pr, mc_merge, mc_sync, mc_cleanup, mc_kill, mc_attach, mc_capture, mc_plan, mc_plan_status, mc_plan_cancel, mc_plan_approve, mc_report, mc_report_final, mc_overview, mc_answer, mc_job_pause, mc_job_resume },
+      : {
+          mc_launch: withHardenedTestEnvGate('mc_launch', mc_launch as never) as never,
+          mc_jobs, mc_status, mc_diff, mc_pr, mc_merge, mc_sync, mc_cleanup, mc_kill, mc_attach, mc_capture,
+          mc_plan: withHardenedTestEnvGate('mc_plan', mc_plan as never) as never,
+          mc_plan_status,
+          mc_plan_cancel: withHardenedTestEnvGate('mc_plan_cancel', mc_plan_cancel as never) as never,
+          mc_plan_approve: withHardenedTestEnvGate('mc_plan_approve', mc_plan_approve as never) as never,
+          mc_report, mc_report_final, mc_overview, mc_answer, mc_job_pause,
+          mc_job_resume: withHardenedTestEnvGate('mc_job_resume', mc_job_resume as never) as never,
+        } as any,
     event: async ({ event }) => {
       const sessionID = extractSessionIDFromEvent(event);
       if (sessionID) {
