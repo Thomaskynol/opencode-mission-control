@@ -212,10 +212,16 @@ describe('m5/m7 wire: coordinateOnce inside reconcile', () => {
 
     // Crash recovery enqueues the stuck job exactly once; then it merges.
     expect(enqueued.filter((n) => n === 'stuck')).toHaveLength(1);
-    expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'stuck', {
+    // R2: the merged write threads fencing context (undefined = instance never claimed).
+    const mergedCalls = ((planStateMod.updatePlanJob as any).mock.calls as unknown[][]).filter(
+      (c) => c[0] === 'plan-1' && c[1] === 'stuck' && (c[2] as { status?: string })?.status === 'merged',
+    );
+    expect(mergedCalls).toHaveLength(1);
+    expect(mergedCalls[0]![2]).toEqual({
       status: 'merged',
       mergedAt: '2026-01-02T00:00:00.000Z',
     });
+    expect(mergedCalls[0]![3]).toEqual({ fencing: undefined });
   });
 });
 

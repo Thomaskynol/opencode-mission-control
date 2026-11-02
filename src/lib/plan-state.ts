@@ -1,4 +1,4 @@
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { z } from 'zod';
 import { getDataDir } from './paths';
 import { withFileLock, lockPathFor } from './file-lock';
@@ -14,6 +14,42 @@ export interface PlanFencing {
   token?: string;
   epoch?: number;
   pid?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* R6 real-entry test-env contract. A generic NODE_ENV=test/VITEST=true */
+/* inherited from the launcher shell silently disables production       */
+/* guarantees (conductor fencing bypasses, external reviewer skipped).  */
+/* Real entries (CLI start/resume/approve in orchestrator-cli/index.ts) */
+/* refuse fail-closed under that env; unit fakes keep using isTestScope */
+/* in-process. Escape hatch for explicitly-scoped runs only:            */
+/* MC_ALLOW_TEST_ENV=1 (non-generic, documented here and at the gates). */
+/* ------------------------------------------------------------------ */
+
+/** True when a generic test env var is present (Bun sets NODE_ENV=test under `bun test`). */
+export function isTestEnvPresent(): boolean {
+  return process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
+}
+
+/** Explicit non-generic override for deliberately test-scoped runs. */
+export function isTestEnvAllowed(): boolean {
+  return process.env.MC_ALLOW_TEST_ENV === '1';
+}
+
+/**
+ * Fail-closed gate for REAL entry points: throws when a generic test env
+ * is present without the explicit MC_ALLOW_TEST_ENV=1 override. Call at
+ * process boundaries (CLI main), never in library call paths unit tests
+ * exercise directly.
+ */
+export function assertRealEntryEnv(entry: string): void {
+  if (isTestEnvPresent() && !isTestEnvAllowed()) {
+    throw new Error(
+      `[MC] Refusing ${entry}: NODE_ENV=test/VITEST=true disables production guarantees ` +
+        `(conductor fencing, external review). Unset the variable for real runs, or set ` +
+        `MC_ALLOW_TEST_ENV=1 for an explicitly-scoped test run.`,
+    );
+  }
 }
 
 /**
@@ -467,7 +503,7 @@ export async function claimConductorLease(
       return;
     }
     if (current && current.planId === planId) {
-      const liveFresh = isPidAlive(current.pid) && !isStale(current);
+      const liveFresh = isConductorPidAlive(current.pid) && !isStale(current);
       if (liveFresh && !opts?.force) {
         if (opts?.expectedToken !== undefined && current.token && opts.expectedToken !== current.token) {
           throw new Error(`Conductor lease held by live pid ${current.pid} (epoch ${current.epoch}).`);
@@ -513,6 +549,23 @@ export async function claimConductorLease(
 export async function readConductorLease(repoRoot?: string): Promise<ConductorLease | null> {
   try {
     const filePath = await getConductorFilePath(repoRoot);
+    return await readConductorLeaseFile(filePath);
+  } catch {
+    return null;
+  }
+}
+
+/** Read a lease from an explicit data dir (merge-train derives its scope from the worktree path). */
+export async function readConductorLeaseFromDir(dataDir: string): Promise<ConductorLease | null> {
+  try {
+    return await readConductorLeaseFile(join(dataDir, CONDUCTOR_FILE));
+  } catch {
+    return null;
+  }
+}
+
+async function readConductorLeaseFile(filePath: string): Promise<ConductorLease | null> {
+  try {
     const file = Bun.file(filePath);
     if (!(await file.exists())) return null;
     const parsed = JSON.parse(await file.text()) as ConductorLease;
@@ -522,7 +575,16 @@ export async function readConductorLease(repoRoot?: string): Promise<ConductorLe
   }
 }
 
-function isPidAlive(pid: number): boolean {
+/**
+ * Liveness probe: true when signal 0 reaches the pid.
+ * LIMIT (pid reuse): the OS may recycle a dead holder's pid for an
+ * unrelated process, in which case signal 0 answers and the lease looks
+ * alive. Safe direction: a (possibly recycled) live pid is never reaped —
+ * the takeover path (epoch bump via claim) stays available, and verify
+ * paths additionally require token/epoch match, so a recycled pid alone
+ * never authenticates a stale holder.
+ */
+export function isConductorPidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -555,7 +617,7 @@ export async function verifyConductorLease(
   if (lease.planId !== planId || lease.pid !== pid) return false;
   if (effectiveOpts?.token !== undefined && lease.token && effectiveOpts.token !== lease.token) return false;
   if (effectiveOpts?.epoch !== undefined && effectiveOpts.epoch !== lease.epoch) return false;
-  if (!isPidAlive(pid)) return false;
+  if (!isConductorPidAlive(pid)) return false;
   if (isStale(lease, Date.now(), effectiveOpts)) return false;
   return true;
 }
@@ -666,6 +728,143 @@ export async function clearConductorLease(
       await release();
     }
   } catch {}
+}
+
+/* ------------------------------------------------------------------ */
+/* R2 point-of-effect fencing for merges. The merge train threads this    */
+/* identity to the git effect and re-reads the lease FRESH immediately    */
+/* before merge/commit/rollback — never trusting the reconcile-start      */
+/* check or the integration lock alone (a lock serializes writers but     */
+/* never proves the writer is still the conductor). A stale holder is     */
+/* refused with no git/state effect. Liveness staleness windows are NOT   */
+/* required here: the calling process is demonstrably alive while         */
+/* executing the merge; step-down on silence stays the reconciler's job.  */
+/* ------------------------------------------------------------------ */
+
+export interface MergeFencingIdentity {
+  planId: string;
+  /** Repo scope for the lease lookup (preferred when the caller knows it). */
+  repoRoot?: string;
+  /** Data-dir scope (merge-train derives it from the worktree path). */
+  dataDir?: string;
+  token?: string;
+  epoch?: number;
+  pid?: number;
+}
+
+export async function verifyMergeFencing(
+  fencing: MergeFencingIdentity,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const lease = fencing.dataDir !== undefined
+    ? await readConductorLeaseFromDir(fencing.dataDir)
+    : await readConductorLease(fencing.repoRoot);
+  if (!lease || lease.planId !== fencing.planId) return { ok: true };
+  const held = `held by pid ${lease.pid} (epoch ${lease.epoch})`;
+  if (fencing.token === undefined && fencing.epoch === undefined && fencing.pid === undefined) {
+    return {
+      ok: false,
+      reason: `Conductor lease fencing: anonymous merge for plan "${fencing.planId}" refused (${held}) — stale holder without fencing identity.`,
+    };
+  }
+  if (fencing.token !== undefined && lease.token && fencing.token !== lease.token) {
+    return {
+      ok: false,
+      reason: `Conductor lease fencing: stale token for plan "${fencing.planId}" (${held}) — merge refused.`,
+    };
+  }
+  if (fencing.epoch !== undefined && fencing.epoch !== lease.epoch) {
+    return {
+      ok: false,
+      reason: `Conductor lease fencing: stale epoch ${fencing.epoch} (current ${lease.epoch}) for plan "${fencing.planId}" — merge refused.`,
+    };
+  }
+  if (fencing.pid !== undefined && fencing.pid !== lease.pid) {
+    return {
+      ok: false,
+      reason: `Conductor lease fencing: pid ${fencing.pid} does not own plan "${fencing.planId}" (owner ${lease.pid}) — merge refused.`,
+    };
+  }
+  if (!isConductorPidAlive(lease.pid)) {
+    return {
+      ok: false,
+      reason: `Conductor lease fencing: owner pid ${lease.pid} of plan "${fencing.planId}" is dead — reap the lease before merging.`,
+    };
+  }
+  return { ok: true };
+}
+
+export interface ConductorReapResult {
+  reaped: boolean;
+  reason: string;
+  prev?: ConductorLease;
+  next?: ConductorLease | null;
+  auditLogged?: boolean;
+}
+
+/**
+ * R2 recovery without manual `rm`: atomically replace a dead holder's lease.
+ * Safe direction only — reaps when signal 0 proves the holder pid dead, bumps
+ * the epoch (stale holders stay fenced), rotates the token, and appends a
+ * `conductor-reaped` entry to conductor-audit.jsonl beside the lease. A live
+ * holder (or a recycled pid that answers signal 0) is NEVER reaped — see the
+ * isConductorPidAlive limit; use the takeover claim path for live holders.
+ */
+export async function reapConductorLeaseIfDead(
+  planId: string,
+  repoRoot?: string,
+  opts?: { pid?: number; owner?: string; command?: string },
+): Promise<ConductorReapResult> {
+  const filePath = await getConductorFilePath(repoRoot);
+  let result: ConductorReapResult = { reaped: false, reason: 'unknown' };
+  await withFileLock(lockPathFor(filePath), async () => {
+    const current = await readConductorLeaseFile(filePath);
+    if (!current) {
+      result = { reaped: false, reason: 'no-lease' };
+      return;
+    }
+    if (current.planId !== planId) {
+      result = { reaped: false, reason: 'plan-mismatch', prev: current };
+      return;
+    }
+    if (isConductorPidAlive(current.pid)) {
+      result = { reaped: false, reason: 'holder-alive', prev: current };
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const pid = opts?.pid ?? process.pid;
+    const next: ConductorLease = {
+      planId,
+      pid,
+      command: opts?.command ?? `reap dead pid ${current.pid}`,
+      owner: opts?.owner ?? `reap:${process.pid}`,
+      acquiredAt: nowIso,
+      epoch: current.epoch + 1,
+      token: newConductorToken(pid),
+      lastHeartbeat: nowIso,
+      lastProgress: nowIso,
+    };
+    await atomicWrite(filePath, JSON.stringify(next, null, 2));
+    let auditLogged = false;
+    try {
+      const fs = await import('fs');
+      const line = JSON.stringify({
+        ts: nowIso,
+        event: 'conductor-reaped',
+        planId,
+        prevPid: current.pid,
+        prevEpoch: current.epoch,
+        nextPid: next.pid,
+        nextEpoch: next.epoch,
+        byPid: process.pid,
+      }) + '\n';
+      fs.appendFileSync(join(dirname(filePath), 'conductor-audit.jsonl'), line);
+      auditLogged = true;
+    } catch (error) {
+      console.warn(`[MC] conductor reap audit append failed for plan "${planId}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+    result = { reaped: true, reason: 'reaped-dead-holder', prev: current, next, auditLogged };
+  });
+  return result;
 }
 
 /* ------------------------------------------------------------------ */

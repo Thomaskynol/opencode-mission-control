@@ -120,8 +120,14 @@ function conductorStaleOpts(): { maxHeartbeatMs: number; maxProgressMs: number }
   };
 }
 
-/** Unit scope (bun test) stays deterministic: the local heuristic decides alone. */
-function isTestScope(): boolean {
+/**
+ * Unit scope (bun test) stays deterministic: the local heuristic decides alone.
+ * R6: this is UNIT-FAKE scope only. Real entries refuse a generic test env at
+ * the process boundary (assertRealEntryEnv in orchestrator-cli/index.ts main),
+ * so any real mission runs with production scope and the external reviewer
+ * below stays required. Exported so clean-env proof tests can assert it.
+ */
+export function isTestScope(): boolean {
   return process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
 }
 
@@ -968,7 +974,9 @@ export class Orchestrator {
     const gradedRequirements = acceptanceLess ? [] : requirements;
     // Public path (reconcile/merge): a pass requires an external opencode
     // pass decision — the local heuristic never decides alone. Unit scope
-    // (bun test) stays deterministic and keeps the local check only.
+    // (bun test) stays deterministic and keeps the local check only. R6:
+    // real entries refuse generic test env at the CLI boundary, so a real
+    // mission always reaches here with production scope (external required).
     const requireExternal = !isTestScope() && gradedRequirements.length > 0;
     const touchSet = job.touchSet?.length ? [...job.touchSet] : undefined;
     const baseInput: ReviewInput = {
@@ -1642,6 +1650,16 @@ export class Orchestrator {
   }
 
   /**
+   * R2: fencing identity threaded to the merge train's point-of-effect
+   * checks. Always carries planId+repoRoot; token/epoch ride along once
+   * this instance claims (until then the train enforces plan-ownership
+   * strictly: anonymous while a lease exists is refused).
+   */
+  private mergeFencing(planId: string): { planId: string; repoRoot: string; token?: string; epoch?: number; pid?: number } {
+    return { planId, repoRoot: this.effectiveRepoRoot(), ...this.fencing() };
+  }
+
+  /**
    * Periodic liveness: verify ownership with token/epoch+frescor, then
    * heartbeat. Returns false when this instance no longer owns the plan
    * (takeover bumped the epoch, token rotated, or lease went stale) — the
@@ -2195,6 +2213,7 @@ export class Orchestrator {
       throw new Error(`Conductor lease fencing: failed to claim ownership for plan "${plan.id}" — start refused (no-lease start fails closed).`);
     }
     this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+    this.mergeTrain.setFencing(this.mergeFencing(plan.id));
     this.subscribeToMonitorEvents();
     this.ensureMonitorRunning();
     this.startReconciler();
@@ -2530,6 +2549,10 @@ export class Orchestrator {
         }
 
         this.mergeTrain ??= new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+        // R2: (re)thread identity every pass — a takeover that replaced this
+        // instance's claim must not ride a stale train identity. Fakes in
+        // unit tests lack setFencing and keep the legacy direct path.
+        (this.mergeTrain as MergeTrain).setFencing?.(this.mergeFencing(plan.id));
         // M5/M7: single queue with identifiers — enqueue is idempotent
         // (MergeTrain.enqueue dedupes) and a retry/crash that left a job in
         // 'merging' with an empty in-memory queue re-enqueues it (no lost merge,
@@ -2610,18 +2633,34 @@ export class Orchestrator {
               // Per-merge repo-wide runs would fail deterministically on
               // missing not-yet-merged siblings even with correct workers:
               // always skip here; the global gate runs once post-all-merged
-              // (final verification, fail-closed).
-              { skipTest: true },
+              // (final verification, fail-closed). R2: thread the current
+              // fencing identity — processNext re-reads the lease fresh at
+              // every git effect, so a post-review takeover cannot merge.
+              { skipTest: true, fencing: this.mergeFencing(plan.id) },
             )
           : await (this.mergeTrain as unknown as { processNext: () => Promise<{ success: boolean; mergedAt?: string; type?: string; files?: string[]; output?: string; testReport?: MergeTestReport }> }).processNext();
 
         const mergedCount = mergeOrder.filter(j => j.status === 'merged').length;
 
         if (mergeResult.success) {
-          await updatePlanJob(plan.id, nextJob.name, {
-            status: 'merged',
-            mergedAt: mergeResult.mergedAt,
-          });
+          // R2: the merge itself was fenced at the effect; the status write
+          // is fenced too. A takeover between commit and here refuses the
+          // write — step down instead of driving on a stale identity.
+          try {
+            await updatePlanJob(plan.id, nextJob.name, {
+              status: 'merged',
+              mergedAt: mergeResult.mergedAt,
+            }, { fencing: this.fencing() }, repoRoot);
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            if (/fencing|stale|owns/i.test(msg)) {
+              console.warn(`[MC] conductor fencing: merge of "${nextJob.name}" committed but the status write was refused (${msg}) — stepping down.`);
+              this.stopReconciler();
+              this.unsubscribeFromMonitorEvents();
+              return;
+            }
+            throw error;
+          }
           const current = byName.get(nextJob.name);
           if (current) {
             current.status = 'merged';
@@ -4772,6 +4811,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         this.planPlacement = plan.placement ?? null;
         this.planLaunchSessionID = plan.launchSessionID;
         this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+    this.mergeTrain.setFencing(this.mergeFencing(plan.id));
         return;
       } else if (plan.status === 'pending') {
         await updatePlanFields(plan.id, { status: 'running' }, repoRoot);
@@ -4798,6 +4838,7 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         throw new Error(`Conductor lease fencing: failed to claim ownership for plan "${plan.id}" — resume refused.`);
       }
       this.mergeTrain = new MergeTrain(plan.integrationWorktree!, this.getMergeTrainConfig());
+    this.mergeTrain.setFencing(this.mergeFencing(plan.id));
 
       const runningJobs = (await getRunningJobs()).filter((job) => job.planId === plan.id);
       let hasDeadRunningJob = false;

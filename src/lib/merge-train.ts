@@ -1,4 +1,4 @@
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { existsSync, lstatSync, rmSync } from 'fs';
 import type { JobSpec } from './plan-types';
 import { gitCommand } from './git';
@@ -6,6 +6,10 @@ import { getIntegrationWorktree, withIntegrationLock } from './integration';
 import { extractConflicts } from './utils';
 import { createV2Client, v2Prompt } from './sdk-client';
 import type { ReviewVerdict } from './reviewer';
+import {
+  verifyMergeFencing,
+  type MergeFencingIdentity,
+} from './plan-state';
 
 export type MergeResult
   = | { success: true; mergedAt: string; testReport: MergeTestReport }
@@ -81,6 +85,37 @@ export function matchesTouchPattern(pattern: string, file: string): boolean {
 const OVERLAP_GLOB_CHARS = /[*?{\[]/;
 
 /**
+ * R2 fencing identity for merges: the orchestrator threads its conductor
+ * token/epoch/pid here and processNext re-reads the lease FRESH immediately
+ * before every git effect (merge, commit, rollback). A stale holder is
+ * refused with no effect. Unmanaged use (no identity anywhere) is allowed
+ * only when no conductor lease governs the branch — production always wires
+ * identity via setFencing/forPlan/per-call opts.
+ */
+export type MergeFencing = MergeFencingIdentity;
+
+const INTEGRATION_WORKTREE_PREFIX = 'mc-integration-';
+
+/**
+ * Best-effort scope recovery for direct callers: a real integration
+ * worktree path embeds `<xdg>/<projectId>/mc-integration-<planId>`, so the
+ * governing lease (and its planId) are resolvable without the caller
+ * knowing the repo root. Returns null for unmanaged paths (unit tests,
+ * legacy callers) — those stay allowed unless a lease is found via an
+ * explicit identity.
+ */
+function derivePlanScopeFromWorktree(worktreePath: string): { planId: string; dataDir: string } | null {
+  const base = worktreePath.replace(/\/+$/, '').split('/').pop() ?? '';
+  if (!base.startsWith(INTEGRATION_WORKTREE_PREFIX) || base.length === INTEGRATION_WORKTREE_PREFIX.length) {
+    return null;
+  }
+  return {
+    planId: base.slice(INTEGRATION_WORKTREE_PREFIX.length),
+    dataDir: join(dirname(worktreePath), 'state'),
+  };
+}
+
+/**
  * Concrete witness for a touchSet pattern: every glob token replaced by a
  * fixed probe segment, so the OTHER pattern can be tested against it with
  * the canonical matchesTouchPattern. A witness matching the other pattern
@@ -95,6 +130,108 @@ function witnessForPattern(pattern: string): string {
     .replace(/\[[^\]]*\]/g, 'a')
     .replace(/\*/g, '__probe__')
     .replace(/\?/g, 'p');
+}
+
+/**
+ * R5 segment×segment intersection for the supported glob subset. Returns
+ * false ONLY for provably disjoint segments (literal mismatch, conflicting
+ * literal prefix/suffix, or disjoint fixed lengths). Anything uncertain
+ * (braces, classes, `*` with compatible anchors) returns true — the caller
+ * treats uncertainty as overlap (fail-closed: serialize with dependsOn).
+ */
+function globLengthRange(seg: string): [number, number] {
+  let min = 0;
+  let max = 0;
+  let i = 0;
+  while (i < seg.length) {
+    const c = seg[i]!;
+    if (c === '*') {
+      max = Number.POSITIVE_INFINITY;
+      i += 1;
+    } else if (c === '?') {
+      min += 1;
+      if (max !== Number.POSITIVE_INFINITY) max += 1;
+      i += 1;
+    } else if (c === '[') {
+      const close = seg.indexOf(']', i + 1);
+      min += 1;
+      if (max !== Number.POSITIVE_INFINITY) max += 1;
+      i = close === -1 ? seg.length : close + 1;
+    } else if (c === '{') {
+      // Brace alternatives: bound by the shortest/longest arm (best effort).
+      const close = seg.indexOf('}', i + 1);
+      const arms = close === -1 ? [''] : seg.slice(i + 1, close).split(',');
+      const lens = arms.map((arm) => arm.replace(/\*/g, '').length);
+      const armMin = Math.min(...lens);
+      const armMax = arms.some((arm) => arm.includes('*')) ? Number.POSITIVE_INFINITY : Math.max(...lens);
+      min += armMin;
+      if (max !== Number.POSITIVE_INFINITY) {
+        max = armMax === Number.POSITIVE_INFINITY ? armMax : max + armMax;
+      }
+      i = close === -1 ? seg.length : close + 1;
+    } else {
+      min += 1;
+      if (max !== Number.POSITIVE_INFINITY) max += 1;
+      i += 1;
+    }
+  }
+  return [min, max];
+}
+
+function literalPrefix(seg: string): string {
+  return seg.split(/[*?{\[]/)[0] ?? '';
+}
+
+function literalSuffix(seg: string): string {
+  const parts = seg.split(/[*?{\]}]/);
+  return parts[parts.length - 1] ?? '';
+}
+
+function segmentMayOverlap(a: string, b: string): boolean {
+  if (a === b || a === '**' || b === '**') return true;
+  const ga = OVERLAP_GLOB_CHARS.test(a);
+  const gb = OVERLAP_GLOB_CHARS.test(b);
+  if (!ga && !gb) return false;
+  const [minA, maxA] = globLengthRange(a);
+  const [minB, maxB] = globLengthRange(b);
+  if (maxA < minB || maxB < minA) return false;
+  const preA = literalPrefix(a);
+  const preB = literalPrefix(b);
+  if (preA && preB && !preA.startsWith(preB) && !preB.startsWith(preA)) return false;
+  const sufA = literalSuffix(a);
+  const sufB = literalSuffix(b);
+  if (sufA && sufB && !sufA.endsWith(sufB) && !sufB.endsWith(sufA)) return false;
+  return true;
+}
+
+function splitOverlapPattern(p: string): string[] {
+  return (p.endsWith('/') ? `${p}**` : p).split('/');
+}
+
+/**
+ * Pattern×pattern intersection over segment sequences (`**` spans segments).
+ * Exact for the supported subset; conservative (true) wherever the segment
+ * analysis cannot prove disjointness.
+ */
+function patternsMayOverlap(a: string, b: string): boolean {
+  const A = splitOverlapPattern(a);
+  const B = splitOverlapPattern(b);
+  const memo = new Map<string, boolean>();
+  const go = (i: number, j: number): boolean => {
+    const k = `${i},${j}`;
+    const hit = memo.get(k);
+    if (hit !== undefined) return hit;
+    let r = false;
+    if (i === A.length && j === B.length) r = true;
+    else if (i === A.length) r = B.slice(j).every((s) => s === '**');
+    else if (j === B.length) r = A.slice(i).every((s) => s === '**');
+    else if (A[i] === '**') r = go(i + 1, j) || go(i, j + 1);
+    else if (B[j] === '**') r = go(i, j + 1) || go(i + 1, j);
+    else r = segmentMayOverlap(A[i]!, B[j]!) && go(i + 1, j + 1);
+    memo.set(k, r);
+    return r;
+  };
+  return go(0, 0);
 }
 
 /**
@@ -118,7 +255,12 @@ export function touchPatternsOverlap(a: string, b: string): boolean {
   const sb = nb.endsWith('/') ? nb.slice(0, -1) : nb;
   if (!OVERLAP_GLOB_CHARS.test(na) && (sb === sa || sb.startsWith(sa + '/'))) return true;
   if (!OVERLAP_GLOB_CHARS.test(nb) && (sa === sb || sa.startsWith(sb + '/'))) return true;
-  return false;
+  // R5: single-witness probes miss real intersections (`src/a*.ts` ×
+  // `src/*b.ts` meet at `src/ab.ts`). The segment analysis above decides
+  // the supported subset exactly; whatever it cannot prove disjoint stays
+  // overlapping (fail-closed — callers demand dependsOn/widen/split).
+  if (!patternsMayOverlap(na, nb)) return false;
+  return true;
 }
 
 export async function validateTouchSet(
@@ -478,9 +620,44 @@ export class MergeTrain {
     private readonly config?: MergeTrainConfig,
   ) {}
 
-  static async forPlan(planId: string, config?: MergeTrainConfig): Promise<MergeTrain> {
+  static async forPlan(planId: string, config?: MergeTrainConfig, fencing?: Omit<MergeFencingIdentity, 'planId'>): Promise<MergeTrain> {
     const integrationWorktree = await getIntegrationWorktree(planId);
-    return new MergeTrain(integrationWorktree, config);
+    const train = new MergeTrain(integrationWorktree, config);
+    train.setFencing({ planId, ...fencing });
+    return train;
+  }
+
+  /**
+   * R2: thread the conductor identity to the point of effect. The
+   * orchestrator calls this after claiming (and the per-call opts of
+   * processNext override it when fresher). Without any identity the train
+   * is unmanaged: allowed only when no conductor lease governs the branch.
+   */
+  setFencing(fencing?: MergeFencingIdentity): void {
+    this.fencing = fencing;
+  }
+
+  private fencing?: MergeFencingIdentity;
+
+  /**
+   * R2 fresh gate: re-read the lease immediately before the effect. Runs
+   * before the queue shift (refusal keeps the job queued for the rightful
+   * owner), inside the integration lock before the merge, and again around
+   * long operations — so a takeover during review/wait/test invalidates the
+   * stale holder before any git or state effect.
+   */
+  private async checkFencingGate(fencing?: MergeFencingIdentity): Promise<MergeResult | null> {
+    const explicit = fencing ?? this.fencing;
+    const identity: MergeFencingIdentity | null = explicit ?? (() => {
+      const derived = derivePlanScopeFromWorktree(this.integrationWorktree);
+      return derived ? { planId: derived.planId, dataDir: derived.dataDir } : null;
+    })();
+    // No identity and no derivable scope: unmanaged/legacy use (unit tests,
+    // direct callers with no conductor) — nothing governs this branch.
+    if (!identity) return null;
+    const check = await verifyMergeFencing(identity);
+    if (check.ok) return null;
+    return { success: false, type: 'review_blocked', output: `Review blocked: ${check.reason}` };
   }
 
   enqueue(job: JobSpec): void {
@@ -505,7 +682,14 @@ export class MergeTrain {
     this.queue = [];
   }
 
-  async processNext(reviewVerdict?: ReviewVerdict | null, opts?: { skipTest?: boolean }): Promise<MergeResult> {
+  async processNext(reviewVerdict?: ReviewVerdict | null, opts?: { skipTest?: boolean; fencing?: MergeFencing }): Promise<MergeResult> {
+    // R2: fresh fencing BEFORE the queue shift — a refused stale holder
+    // leaves the job queued for the rightful owner (no silent dequeue).
+    const gate = await this.checkFencingGate(opts?.fencing);
+    if (gate) {
+      return gate;
+    }
+
     if (this.queue.length === 0) {
       throw new Error('No jobs in queue');
     }
@@ -526,8 +710,9 @@ export class MergeTrain {
     }
 
     // M5/M7: serialize writers per integration branch; rollback stays inside.
+    const fencing = opts?.fencing ?? this.fencing;
     return withIntegrationLock(this.integrationWorktree, () =>
-      this.processNextInner(job, reviewVerdict ?? null, opts),
+      this.processNextInner(job, reviewVerdict ?? null, { ...opts, fencing }),
     );
   }
 
@@ -659,6 +844,14 @@ export class MergeTrain {
 
   private async processNextInner(job: JobSpec, reviewVerdict: ReviewVerdict | null, opts?: { skipTest?: boolean }): Promise<MergeResult> {
 
+    // R2: re-read the lease inside the lock, immediately before the first
+    // git effect — a takeover during the lock wait or the long review that
+    // precedes processNext refuses here, before any merge/commit/rollback.
+    const preMerge = await this.checkFencingGate(opts?.fencing);
+    if (preMerge) {
+      return preMerge;
+    }
+
     // Save the HEAD before the merge so we can rollback if needed
     const headBeforeMerge = await gitCommand(['-C', this.integrationWorktree, 'rev-parse', 'HEAD']);
     const headBeforeStr = headBeforeMerge.stdout.trim();
@@ -698,6 +891,14 @@ export class MergeTrain {
       }
 
       // Commit the squashed changes
+      // R2: revalidate between staging and commit — a takeover during the
+      // merge or test setup aborts our own staging (lock held, HEAD is
+      // still ours) and refuses without committing.
+      const preCommit = await this.checkFencingGate(opts?.fencing);
+      if (preCommit) {
+        await rollbackMerge(this.integrationWorktree);
+        return preCommit;
+      }
       const commitResult = await gitCommand([
         '-C',
         this.integrationWorktree,
@@ -779,6 +980,14 @@ export class MergeTrain {
       }
 
       // Commit the squashed changes
+      // R2: revalidate between staging and commit — a takeover during the
+      // merge or test setup aborts our own staging (lock held, HEAD is
+      // still ours) and refuses without committing.
+      const preCommit = await this.checkFencingGate(opts?.fencing);
+      if (preCommit) {
+        await rollbackMerge(this.integrationWorktree);
+        return preCommit;
+      }
       const commitResult = await gitCommand([
         '-C',
         this.integrationWorktree,
@@ -1013,12 +1222,25 @@ export class MergeTrain {
         if (fixPrompted) {
           await this.sleep(fixTimeout);
 
+          // R2: the fix window is a long wait — a takeover during it refuses
+          // before the retest result is trusted (our own merge is rolled back).
+          const postFix = await this.checkFencingGate(opts?.fencing);
+          if (postFix) {
+            await rollbackMergeToHead(this.integrationWorktree, headBeforeStr);
+            return postFix;
+          }
+
           const retestResult = await runTestCommand(this.integrationWorktree, testCommand, timeoutMs);
 
           if (retestResult.success) {
             const regressionBlock = await this.runPostIntegrationRegression(timeoutMs, headBeforeStr);
             if (regressionBlock) {
               return regressionBlock;
+            }
+            // R2: same long-operation rule as the main path — no stale success claim.
+            const postRetest = await this.checkFencingGate(opts?.fencing);
+            if (postRetest) {
+              return postRetest;
             }
             return {
               success: true,
@@ -1059,6 +1281,15 @@ export class MergeTrain {
     const regressionBlock = await this.runPostIntegrationRegression(timeoutMs, headBeforeStr);
     if (regressionBlock) {
       return regressionBlock;
+    }
+
+    // R2: tests/regression are the long operation — a takeover during them
+    // must not be reported as our success. The commit was authorized when
+    // made (pre-commit gate passed under the lock); it stands for the new
+    // owner to reconcile (empty-diff no-op path), we just refuse to claim it.
+    const postTest = await this.checkFencingGate(opts?.fencing);
+    if (postTest) {
+      return postTest;
     }
 
     return {

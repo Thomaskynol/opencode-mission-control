@@ -254,10 +254,16 @@ describe('orchestrator', () => {
 
     expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'merge-me', { status: 'ready_to_merge' });
     expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'merge-me', { status: 'merging' });
-    expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'merge-me', {
+    // R2: the merged write threads fencing context (undefined = instance never claimed).
+    const mergedCalls = ((planStateMod.updatePlanJob as any).mock.calls as unknown[][]).filter(
+      (c) => c[0] === 'plan-1' && c[1] === 'merge-me' && (c[2] as { status?: string })?.status === 'merged',
+    );
+    expect(mergedCalls).toHaveLength(1);
+    expect(mergedCalls[0]![2]).toEqual({
       status: 'merged',
       mergedAt: '2026-01-02T00:00:00.000Z',
     });
+    expect(mergedCalls[0]![3]).toEqual({ fencing: undefined });
   });
 
   it('merge train integration enqueues ready jobs when prior jobs merged', async () => {
@@ -593,10 +599,16 @@ describe('orchestrator', () => {
     await (orchestrator as any).reconcile();
 
     expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'clean-merge', { status: 'merging' });
-    expect(planStateMod.updatePlanJob).toHaveBeenCalledWith('plan-1', 'clean-merge', {
+    // R2: the merged write threads fencing context (undefined = instance never claimed).
+    const mergedCalls = ((planStateMod.updatePlanJob as any).mock.calls as unknown[][]).filter(
+      (c) => c[0] === 'plan-1' && c[1] === 'clean-merge' && (c[2] as { status?: string })?.status === 'merged',
+    );
+    expect(mergedCalls).toHaveLength(1);
+    expect(mergedCalls[0]![2]).toEqual({
       status: 'merged',
       mergedAt: '2026-01-02T00:00:00.000Z',
     });
+    expect(mergedCalls[0]![3]).toEqual({ fencing: undefined });
   });
 
   it('resumePlan reconstructs state and marks dead running panes failed', async () => {
