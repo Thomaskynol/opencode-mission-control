@@ -28,7 +28,7 @@ export const HELP = [
   '  start <request> [--repo R] [--branch B] [--max-parallel N] [--allow-test-env] — capture NL-only intake, persist it, print the planner prompt (legacy two-step)',
   '  complement [--intake ID] <text> — extend the persisted request (same work continues). One-shot: returns after recording/revising; never starts a second driver',
   '  resume [--intake ID] [--allow-test-env] — retake without new JSON (no duplicated workers, no reintegration). Stays as coordinator while driving an active plan; returns immediately when paused (approve to continue)',
-  '  approve [--intake ID] [--retry <job> | --relaunch <job>] [--allow-test-env] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume. One-shot: applies the decision then returns (the live coordinator picks it up)',
+  '  approve [--intake ID] [--retry <job> | --relaunch <job>] [--takeover] [--allow-test-env] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume. One-shot: applies the decision then returns (the live coordinator picks it up). Without --takeover a live conductor lease blocks fail-closed; --takeover assumes ownership explicitly (epoch bump + audit, never manual rm)',
   '  auto-plan --intake ID --plan-file F — advanced diagnostic only, never required for start',
   '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues (close never stops work)',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
