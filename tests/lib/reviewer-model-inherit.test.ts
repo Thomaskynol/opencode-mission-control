@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'bun:test';
 import {
   reviewFunctionallyViaOpenCode,
   resolveReviewModel,
+  getDivergentReviewModelAudit,
 } from '../../src/lib/opencode-reviewer';
 
 const REQ = [{ id: 'REQ-inherit', description: 'inherit effective model', anchors: ['inherit'] }];
@@ -32,16 +33,29 @@ describe('reviewer model inheritance (effective → review)', () => {
     // Igual ao efetivo: aceito sem autorização extra.
     process.env.MC_REVIEW_MODEL = EFFECTIVE;
     expect(resolveReviewModel({}, EFFECTIVE)).toBe(EFFECTIVE);
-    // Divergente sem MC_REVIEW_MODEL_ALLOW_DIVERGENT: rejeitado, nunca silencioso.
+    // Divergente sem autorização explícita: rejeitado, nunca silencioso.
     process.env.MC_REVIEW_MODEL = 'env-model/env-id';
     expect(() => resolveReviewModel({}, EFFECTIVE)).toThrow(/diverg/i);
+    // R7: par de envs iguais NÃO autoriza (env sozinha nunca autoriza).
     process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = 'env-model/env-id';
-    expect(resolveReviewModel({}, EFFECTIVE)).toBe('env-model/env-id');
+    expect(() => resolveReviewModel({}, EFFECTIVE)).toThrow(/diverg/i);
     delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    // Decisão explícita da missão autoriza + audita.
+    const before = getDivergentReviewModelAudit().length;
+    expect(resolveReviewModel({ allowDivergentModel: 'env-model/env-id' }, EFFECTIVE)).toBe('env-model/env-id');
+    const audit = getDivergentReviewModelAudit();
+    expect(audit.length).toBe(before + 1);
+    expect(audit[audit.length - 1]).toMatchObject({ override: 'env-model/env-id', effective: EFFECTIVE });
     expect(() => resolveReviewModel({ model: 'args-model/args-id' }, EFFECTIVE)).toThrow(/diverg/i);
+    // R7: env com o valor do args também não autoriza.
     process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = 'args-model/args-id';
-    expect(resolveReviewModel({ model: 'args-model/args-id' }, EFFECTIVE)).toBe('args-model/args-id');
+    expect(() => resolveReviewModel({ model: 'args-model/args-id' }, EFFECTIVE)).toThrow(/diverg/i);
     delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    const before2 = getDivergentReviewModelAudit().length;
+    expect(
+      resolveReviewModel({ model: 'args-model/args-id', allowDivergentModel: 'args-model/args-id' }, EFFECTIVE),
+    ).toBe('args-model/args-id');
+    expect(getDivergentReviewModelAudit().length).toBe(before2 + 1);
     delete process.env.MC_REVIEW_MODEL;
   });
 

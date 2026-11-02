@@ -37,6 +37,13 @@ export interface FunctionalReviewArgs {
   /** Product-observed test output. */
   outputs?: string;
   model?: ReviewModelInput;
+  /**
+   * Explicit, auditable mission decision authorizing a divergent review
+   * model. Must equal the resolved override verbatim; env vars alone NEVER
+   * authorize divergence (R7). The public path never sets this, so any
+   * divergent override there stays fail-closed.
+   */
+  allowDivergentModel?: ReviewModelInput;
   timeoutMs?: number;
   /** Binary under test; defaults to $MC_OPENCODE_BIN, $OPENCODE_BIN, `opencode`. */
   bin?: string;
@@ -73,20 +80,39 @@ function normalizeReviewModelInput(input?: ReviewModelInput): string | undefined
  * Never falls back to a silent default: undefined means the caller must
  * report `review model unpinned` without invoking the binary.
  *
- * Single-effective-triple rule (achado D): an override (args.model or
- * MC_REVIEW_MODEL) that DIVERGES from the inherited effective triple is
- * rejected with an explicit error — the reviewer must never silently run a
- * different model than the mission. Unset the override to inherit, or set
- * MC_REVIEW_MODEL_ALLOW_DIVERGENT to the exact override value to authorize
- * that switch explicitly (recorded in the environment, auditable).
+ * Single-effective-triple rule (achado D, hardened R7): an override
+ * (args.model or MC_REVIEW_MODEL) that DIVERGES from the inherited effective
+ * triple is rejected with an explicit error — the reviewer must never
+ * silently run a different model than the mission. Env vars alone NEVER
+ * authorize divergence (MC_REVIEW_MODEL_ALLOW_DIVERGENT is ignored, never
+ * sufficient): only an explicit, auditable mission decision does, via
+ * `allowDivergentModel` set to the exact override value (recorded in the
+ * audit trail below). Unset the override to inherit, or pass the explicit
+ * authorization; otherwise the call refuses fail-closed.
  *
- * Integrator note: the public review path never sets args.model, so the
- * orchestrator's attachExternalSufficiency must pass the effective triple as
- * `effectiveModel` — `formatModelRefForArgv(ensureEffectiveModel())` — making
- * MC_REVIEW_MODEL an authorized-or-rejected override, not a silent switch.
+ * Integrator note: the public review path never sets args.model nor
+ * allowDivergentModel, so the orchestrator's attachExternalSufficiency must
+ * pass the effective triple as `effectiveModel` —
+ * `formatModelRefForArgv(ensureEffectiveModel())` — making MC_REVIEW_MODEL
+ * an inherit-or-refuse override, never a silent switch.
  */
+
+/** One explicitly authorized divergent review-model switch (audit trail). */
+export interface DivergentModelAuthorization {
+  override: string;
+  effective: string;
+  at: string;
+}
+
+const divergentModelAudit: DivergentModelAuthorization[] = [];
+
+/** Explicitly authorized divergent switches, oldest first (auditable). */
+export function getDivergentReviewModelAudit(): DivergentModelAuthorization[] {
+  return [...divergentModelAudit];
+}
+
 export function resolveReviewModel(
-  args: { model?: ReviewModelInput },
+  args: { model?: ReviewModelInput; allowDivergentModel?: ReviewModelInput },
   effectiveModel?: ReviewModelInput,
 ): string | undefined {
   const fromArgs = normalizeReviewModelInput(args?.model);
@@ -95,14 +121,22 @@ export function resolveReviewModel(
   const override = fromArgs ?? fromEnv;
   if (override) {
     if (effective && override !== effective) {
-      const acknowledged = process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT?.trim() || undefined;
-      if (acknowledged !== override) {
-        throw new Error(
-          `Review model override "${override}" diverges from the mission effective model "${effective}" — refusing silent switch. ` +
-            `Unset MC_REVIEW_MODEL (and the per-call model) to inherit "${effective}", or set ` +
-            `MC_REVIEW_MODEL_ALLOW_DIVERGENT="${override}" to authorize this exact override explicitly.`,
+      const explicit = normalizeReviewModelInput(args?.allowDivergentModel);
+      if (explicit !== undefined && explicit === override) {
+        divergentModelAudit.push({ override, effective, at: new Date().toISOString() });
+        console.warn(
+          `[MC] divergent review model explicitly authorized: "${override}" ` +
+            `(mission effective "${effective}") — recorded mission decision, not an env default`,
         );
+        return override;
       }
+      const legacy = process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT?.trim() || undefined;
+      throw new Error(
+        `Review model override "${override}" diverges from the mission effective model "${effective}" — refusing silent switch. ` +
+          `Env vars alone never authorize divergence${legacy ? ' (MC_REVIEW_MODEL_ALLOW_DIVERGENT is ignored)' : ''}. ` +
+          `Unset MC_REVIEW_MODEL (and the per-call model) to inherit "${effective}", or authorize this exact override ` +
+          `with an explicit, audited mission decision (allowDivergentModel: "${override}").`,
+      );
     }
     return override;
   }
@@ -339,11 +373,12 @@ function unwrapEnvelopeCandidates(raw: string): string[] {
  * Model pin (always `--model`, variant preserved as `#variant`): resolved via
  * {@link resolveReviewModel} — args.model → MC_REVIEW_MODEL → effectiveModel
  * (inherited triple from the integrator) → unpinned fail-closed without
- * invoking the binary. A divergent override without explicit authorization
- * (MC_REVIEW_MODEL_ALLOW_DIVERGENT) resolves to fail-closed verdicts here,
- * never to a silent run on another model. The orchestrator's attachExternalSufficiency should
+ * invoking the binary. A divergent override without an explicit, audited
+ * mission decision (allowDivergentModel) resolves to fail-closed verdicts
+ * here, never to a silent run on another model — env vars alone never
+ * authorize it. The orchestrator's attachExternalSufficiency should
  * pass `formatModelRefForArgv(ensureEffectiveModel())` as `effectiveModel`
- * so MC_REVIEW_MODEL stays an authorized-or-rejected override.
+ * so MC_REVIEW_MODEL stays an inherit-or-refuse override.
  */
 export async function reviewFunctionallyViaOpenCode(
   args: FunctionalReviewArgs,

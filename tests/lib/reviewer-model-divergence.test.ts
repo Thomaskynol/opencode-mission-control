@@ -6,6 +6,7 @@ import { describe, it, expect, afterEach } from 'bun:test';
 import {
   reviewFunctionallyViaOpenCode,
   resolveReviewModel,
+  getDivergentReviewModelAudit,
 } from '../../src/lib/opencode-reviewer';
 
 const REQ = [{ id: 'REQ-d', description: 'divergence guard', anchors: ['d'] }];
@@ -48,11 +49,20 @@ describe('D — override divergente do modelo do revisor (RED no HEAD)', () => {
     expect(() => resolveReviewModel({}, MISSION)).toThrow(/diverg/i);
   });
 
-  it('divergente autorizado: MC_REVIEW_MODEL_ALLOW_DIVERGENT com o valor exato libera', () => {
+  it('divergente autorizado: decisão explícita allowDivergentModel libera + audita (env sozinha nunca autoriza)', () => {
     clearEnv();
     process.env.MC_REVIEW_MODEL = DIVERGENT;
+    // R7: par de envs iguais NÃO autoriza divergência.
     process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = DIVERGENT;
-    expect(resolveReviewModel({}, MISSION)).toBe(DIVERGENT);
+    expect(() => resolveReviewModel({}, MISSION)).toThrow(/diverg/i);
+    delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    // Decisão explícita e auditável da missão autoriza.
+    const before = getDivergentReviewModelAudit().length;
+    expect(resolveReviewModel({ allowDivergentModel: DIVERGENT }, MISSION)).toBe(DIVERGENT);
+    const audit = getDivergentReviewModelAudit();
+    expect(audit.length).toBe(before + 1);
+    expect(audit[audit.length - 1]).toMatchObject({ override: DIVERGENT, effective: MISSION });
+    expect(typeof audit[audit.length - 1]!.at).toBe('string');
   });
 
   it('autorização de outro valor não libera a divergência', () => {
@@ -65,8 +75,16 @@ describe('D — override divergente do modelo do revisor (RED no HEAD)', () => {
   it('args.model divergente do efetivo também exige autorização', () => {
     clearEnv();
     expect(() => resolveReviewModel({ model: DIVERGENT }, MISSION)).toThrow(/diverg/i);
+    // R7: env sozinha nunca autoriza, mesmo com valor igual ao override.
     process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT = DIVERGENT;
-    expect(resolveReviewModel({ model: DIVERGENT }, MISSION)).toBe(DIVERGENT);
+    expect(() => resolveReviewModel({ model: DIVERGENT }, MISSION)).toThrow(/diverg/i);
+    delete process.env.MC_REVIEW_MODEL_ALLOW_DIVERGENT;
+    // Decisão explícita da missão autoriza + audita.
+    const before = getDivergentReviewModelAudit().length;
+    expect(resolveReviewModel({ model: DIVERGENT, allowDivergentModel: DIVERGENT }, MISSION)).toBe(DIVERGENT);
+    const audit = getDivergentReviewModelAudit();
+    expect(audit.length).toBe(before + 1);
+    expect(audit[audit.length - 1]).toMatchObject({ override: DIVERGENT, effective: MISSION });
   });
 
   it('caminho público: divergência vira fail-closed SEM invocar o binário', async () => {
