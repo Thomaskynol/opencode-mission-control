@@ -532,11 +532,14 @@ export class QuestionRelay {
             const { loadPlan, updatePlanFields } = await import('./plan-state.js');
             const plan = await loadPlan().catch(() => null);
             if (plan && plan.id === planId) {
+              // Schema-valid entry: plan reloads parse auditLog strictly, so
+              // timestamp/details must match AuditLogEntrySchema.
               const entry = {
+                timestamp: new Date().toISOString(),
                 action: 'permission-timeout-denied',
                 jobName: job.name,
-                at: new Date().toISOString(),
-                detail: `${permissionId} [${permissionType}] ${permissionDesc} — ${detail}`,
+                details: { permissionId, permissionType, description: permissionDesc, reason: detail },
+                userApproved: false,
               } as never;
               const next = [...(plan.auditLog ?? []), entry];
               await updatePlanFields(planId, { auditLog: next } as never).catch(() => {});

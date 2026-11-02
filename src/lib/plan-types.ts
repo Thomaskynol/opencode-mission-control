@@ -21,7 +21,7 @@ export interface CheckpointContext {
   touchSetPatterns?: string[];
 }
 
-export type AuditAction = 'skip_job' | 'add_job' | 'reorder_jobs' | 'fork_session' | 'relay_finding' | 'fix_prompted';
+export type AuditAction = 'skip_job' | 'add_job' | 'reorder_jobs' | 'fork_session' | 'relay_finding' | 'fix_prompted' | 'permission-timeout-denied';
 
 export interface AuditLogEntry {
   timestamp: string;

@@ -398,6 +398,27 @@ describe('plan-state', () => {
         failureKind: 'job_failed',
       });
     });
+
+    it('persists auditLog entries (timeout-denied trail is not silently dropped)', async () => {
+      vi.spyOn(
+        await import('../../src/lib/plan-state'),
+        'validateGhAuth',
+      ).mockResolvedValue(true);
+
+      await savePlan(makePlan({ status: 'running' }));
+
+      const entry = {
+        timestamp: new Date().toISOString(),
+        action: 'permission-timeout-denied',
+        jobName: 'task-a',
+        details: { permissionId: 'perm-1', reason: 'silence never approves' },
+        userApproved: false,
+      } as never;
+      await updatePlanFields('plan-1', { auditLog: [entry] } as never);
+
+      const loaded = await loadPlan();
+      expect(loaded!.auditLog).toEqual([entry]);
+    });
   });
 
   describe('clearPlan', () => {

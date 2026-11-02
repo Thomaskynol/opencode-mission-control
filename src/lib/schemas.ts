@@ -76,7 +76,7 @@ export const JobStatusSchema = z.enum([
   'canceled',
 ]);
 
-export const AuditActionSchema = z.enum(['skip_job', 'add_job', 'reorder_jobs', 'fork_session', 'relay_finding', 'fix_prompted']);
+export const AuditActionSchema = z.enum(['skip_job', 'add_job', 'reorder_jobs', 'fork_session', 'relay_finding', 'fix_prompted', 'permission-timeout-denied']);
 
 export const AuditLogEntrySchema = z.object({
   timestamp: z.string(),

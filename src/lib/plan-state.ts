@@ -290,6 +290,9 @@ export async function updatePlanFields(
     if (updates.prUrl !== undefined) {
       plan.prUrl = updates.prUrl;
     }
+    if (updates.auditLog !== undefined) {
+      plan.auditLog = updates.auditLog;
+    }
 
     const ghAuthenticated = await validateGhAuth();
     const planToSave = { ...plan, ghAuthenticated };

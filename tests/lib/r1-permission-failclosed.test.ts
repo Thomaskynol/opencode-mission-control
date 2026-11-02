@@ -215,8 +215,7 @@ describe('R1 timeout NEVER approves (all categories fail-closed)', () => {
     });
   }
 
-  it('neverAutoApprovesOnTimeout is true for EVERY category', () => {
-    const samples: Array<Parameters<typeof QR.neverAutoApprovesOnTimeout>[0]> = [
+  it('neverAutoApprovesOnTimeout is true for EVERY category', () => {    const samples: Array<Parameters<typeof QR.neverAutoApprovesOnTimeout>[0]> = [
       { type: 'file_operation', path: outside, description: 'edit' },
       { type: 'shell_command', path: outside, description: 'run' },
       { type: 'shell_command', path: wt, description: 'run inside' },
@@ -227,6 +226,32 @@ describe('R1 timeout NEVER approves (all categories fail-closed)', () => {
     ];
     for (const p of samples) {
       expect(QR.neverAutoApprovesOnTimeout(p)).toBe(true);
+    }
+  });
+
+  it('timeout denial is recorded in the plan auditLog (not only console)', async () => {
+    const { savePlan, loadPlan } = await import('../../src/lib/plan-state');
+    const now = new Date().toISOString();
+    await savePlan({
+      id: 'plan-r1-audit', name: 'r1 audit', mode: 'autopilot', status: 'running',
+      jobs: [], integrationBranch: 'main', baseCommit: 'abc', createdAt: now,
+    } as never);
+    const relay = new QR.QuestionRelay({ autoResponseTimeoutMs: 20 });
+    try {
+      const permId = 'perm-r1-audit-1';
+      const result = await relay.handlePermissionRequest(mkJob({ planId: 'plan-r1-audit' } as never), {
+        id: permId, type: 'shell_command', path: outside, description: 'run outside',
+      } as any);
+      expect(result.autoApproved).toBe(false);
+      // Real timer: wait past the 20ms auto-deny, then dispose (clears map only).
+      await new Promise((r) => setTimeout(r, 150));
+      const plan = await loadPlan();
+      expect(plan?.id).toBe('plan-r1-audit');
+      const denied = (plan?.auditLog ?? []).filter((e) => e.action === 'permission-timeout-denied');
+      expect(denied).toHaveLength(1);
+      expect(denied[0].jobName).toBe('r1-job');
+    } finally {
+      relay.dispose();
     }
   });
 });
