@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from 'fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { isAbsolute, join } from 'path';
+import type { EnvPreparation } from './test-env.js';
 
 /**
  * Candidate-input protection (§4 TOCTOU A→B→A).
@@ -333,6 +334,18 @@ export interface ImmutableSnapshotOptions {
   keepSnapshotDir?: boolean;
   /** Optional setup commands run INSIDE the snapshot copy (shared prepareTestEnv). */
   setupCommands?: string[];
+  /**
+   * Test-only seam: replaces the shared prepareTestEnv call so preparation
+   * outcomes that cannot occur naturally (e.g. prepare throwing) can be
+   * exercised. A throwing override fails closed exactly like a throwing
+   * prepare. Production callers omit it.
+   */
+  envPrepOverride?: (opts: {
+    snapshotDir: string;
+    sourceDir: string;
+    setupCommands?: string[];
+    timeoutMs?: number;
+  }) => Promise<EnvPreparation>;
 }
 
 export interface ImmutableSnapshotResult extends IdentityVerdict {
@@ -342,6 +355,12 @@ export interface ImmutableSnapshotResult extends IdentityVerdict {
   timedOut: boolean;
   snapshotDir: string;
   protectedPaths: string[];
+  /**
+   * Fingerprint of the executed dependency tree (snapshot node_modules
+   * content + manifest/lockfile hashes). Binds the verdict to what actually
+   * ran: adulterated deps at test time change the tree and refuse attribution.
+   */
+  depFingerprint: string;
 }
 
 interface StrictSnapshot {
@@ -427,6 +446,122 @@ async function resolveHead(dir: string, jobHead?: string): Promise<string | unde
   }
 }
 
+interface DepEntry {
+  kind: 'file' | 'link' | 'other';
+  hash: string;
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
+}
+
+/**
+ * Snapshot the dependency tree under dir/node_modules (rel path → entry).
+ * A content-identical restore still bumps ctime, so hash+mtime+ctime all
+ * participate in the after-compare. Missing node_modules → empty map.
+ */
+function snapshotDepTree(dir: string): Map<string, DepEntry> {
+  const out = new Map<string, DepEntry>();
+  const base = join(dir, 'node_modules');
+  try {
+    const st = lstatSync(base);
+    if (st.isSymbolicLink()) {
+      let target = '';
+      try {
+        target = readlinkSync(base);
+      } catch {}
+      out.set('.', {
+        kind: 'link',
+        hash: sha256Hex(Buffer.from(`symlink:${target}`)),
+        mtimeMs: st.mtimeMs,
+        ctimeMs: typeof st.ctimeMs === 'number' ? st.ctimeMs : -1,
+        size: st.size,
+      });
+      return out;
+    }
+    if (!st.isDirectory()) return out;
+  } catch {
+    return out;
+  }
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop() as string;
+    const full = rel === '' ? base : join(base, rel);
+    let dirents: Array<{ name: string }>;
+    try {
+      dirents = readdirSync(full, { withFileTypes: true }) as Array<{ name: string }>;
+    } catch {
+      continue;
+    }
+    for (const d of dirents) {
+      const r = rel === '' ? d.name : `${rel}/${d.name}`;
+      const f = join(base, r);
+      try {
+        const st = lstatSync(f);
+        const ctimeMs = typeof st.ctimeMs === 'number' ? st.ctimeMs : -1;
+        if (st.isSymbolicLink()) {
+          let target = '';
+          try {
+            target = readlinkSync(f);
+          } catch {}
+          out.set(r, { kind: 'link', hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+        } else if (st.isDirectory()) {
+          stack.push(r);
+        } else if (st.isFile()) {
+          out.set(r, { kind: 'file', hash: sha256Hex(readFileSync(f)), mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+        } else {
+          out.set(r, { kind: 'other', hash: '', mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+        }
+      } catch {
+        // Unreadable entry: skip (absence/change surfaces via the rest).
+      }
+    }
+  }
+  return out;
+}
+
+/** Compare two dep trees; returns changed rel paths (sorted, capped). */
+function compareDepTrees(before: Map<string, DepEntry>, after: Map<string, DepEntry>, cap = 8): string[] {
+  const hits: string[] = [];
+  const keys = new Set([...before.keys(), ...after.keys()]);
+  for (const key of keys) {
+    const b = before.get(key);
+    const a = after.get(key);
+    if (b === undefined || a === undefined) {
+      hits.push(key);
+      continue;
+    }
+    if (b.kind !== a.kind || b.hash !== a.hash || b.mtimeMs !== a.mtimeMs || b.ctimeMs !== a.ctimeMs || b.size !== a.size) {
+      hits.push(key);
+    }
+  }
+  hits.sort();
+  return hits.length > cap ? [...hits.slice(0, cap), `…+${hits.length - cap} more`] : hits;
+}
+
+/**
+ * Fingerprint of what the test executed: manifest+lockfile bytes plus the
+ * full snapshot node_modules tree (paths + content hashes + times). Recorded
+ * on every run so a pass is bound to the executed bytes, not just the commit.
+ */
+function fingerprintDeps(dir: string, tree: Map<string, DepEntry>): string {
+  const h = createHash('sha256');
+  for (const name of ['package.json', 'bun.lockb', 'bun.lock', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json', 'npm-shrinkwrap.json']) {
+    try {
+      h.update(`\0${name}\0`);
+      h.update(readFileSync(join(dir, name)));
+    } catch {
+      h.update(`\0${name}:absent\0`);
+    }
+  }
+  const keys = [...tree.keys()].sort();
+  h.update(`\0tree:${keys.length}\0`);
+  for (const k of keys) {
+    const e = tree.get(k) as DepEntry;
+    h.update(`\0${k}\0${e.kind}\0${e.hash}\0${e.mtimeMs}\0${e.ctimeMs}\0${e.size}\0`);
+  }
+  return h.digest('hex');
+}
+
 /**
  * Run testCommand in a tmp snapshot of the committed (or hash-verified
  * copied) inputs and refuse attribution when the original OR the executed
@@ -437,8 +572,12 @@ async function resolveHead(dir: string, jobHead?: string): Promise<string | unde
  * ctime even when hash+mtime are forged back, so it fails instead of
  * passing. Snapshot protected inputs are hardened read-only best-effort;
  * a chmod bypass still bumps ctime and fails. Untracked dist/build/coverage
- * outputs stay writable (not in protectedPaths). Missing node_modules in
- * the copy is a test failure (success false), never a PASS.
+ * outputs stay writable (not in protectedPaths). Deps are a PHYSICAL COPY
+ * (never a symlink to the origin); the executed tree is fingerprinted
+ * (depFingerprint) and any change during the run — or any write leaking
+ * into the ORIGINAL node_modules — refuses attribution. Inconclusive
+ * preparation (exception/failed/timeout/missing dep) never runs the test
+ * and yields success false + verdict fail with ENV-UNPREPARED.
  */
 export async function runTestsOnImmutableSnapshot(
   options: ImmutableSnapshotOptions,
@@ -460,6 +599,10 @@ export async function runTestsOnImmutableSnapshot(
 
   let test: { success: boolean; output: string; timedOut: boolean };
   let racedCopy: string | undefined;
+  let envBlock: string | undefined;
+  let originDepsBefore = new Map<string, DepEntry>();
+  let snapDepsBefore = new Map<string, DepEntry>();
+  let depFingerprint = '';
   const snapBefore = new Map<string, StrictSnapshot>();
   try {
     const head = await resolveHead(options.dir, options.jobHead);
@@ -503,27 +646,49 @@ export async function runTestsOnImmutableSnapshot(
       }
     }
     for (const rel of protectedPaths) snapBefore.set(rel, snapshotStrict(snapshotDir, rel));
-    // Shared env prep (F): deps symlinked/installed INTO the copy, never
-    // mutating the attributed original. Impossible prep → env-failure that
-    // fails closed (success false, ENV-UNPREPARED), never pass/skip.
-    // Never versions node_modules (symlink only, no git add).
-    let envPrep: { status: 'ready' | 'failed' | 'env-failure'; commands: string[]; output: string } | null = null;
+    // Shared env prep (F): deps COPIED/installed INTO the copy, never
+    // mutating the attributed original and never linked to it. Inconclusive
+    // preparation (exception, failed, timeout, missing dep with no install
+    // path) is an explicit env-failure: the test does NOT run, success is
+    // false, and the verdict is fail (R4 — never pass/skip).
+    // Never versions node_modules (copy only, no git add).
+    let envMarker = 'ENV-UNPREPARED';
+    let envPrep: EnvPreparation | null = null;
     try {
-      const { prepareTestEnv } = await import('./test-env.js');
-      envPrep = await prepareTestEnv({
+      const mod = await import('./test-env.js');
+      if (typeof mod.ENV_UNPREPARED === 'string' && (mod.ENV_UNPREPARED as string).length > 0) envMarker = mod.ENV_UNPREPARED;
+      const prepFn = options.envPrepOverride ?? mod.prepareTestEnv;
+      envPrep = await prepFn({
         snapshotDir,
         sourceDir: options.dir,
         ...(options.setupCommands ? { setupCommands: options.setupCommands } : {}),
         timeoutMs: options.timeoutMs ?? 120000,
       });
-    } catch {
-      envPrep = null;
+    } catch (err) {
+      // R4: a throwing prepare used to zero envPrep and STILL run the test,
+      // turning setup failure into PASS. Fail closed instead.
+      envPrep = {
+        status: 'env-failure',
+        commands: [],
+        output: `${envMarker}\nprepare threw: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
+    const prep = envPrep as EnvPreparation;
+    const blockedOutput = prep.output.includes('ENV-UNPREPARED') ? prep.output : `${envMarker}\n${prep.output}`;
+    // Fingerprint the ORIGINAL deps too: a test that escapes the snapshot
+    // (self-made symlink to the origin) and writes there must refuse
+    // attribution even when scope files look clean (R3).
+    originDepsBefore = snapshotDepTree(options.dir);
+    // What the test is about to execute: physical copy from prep (or a clean
+    // install). Recorded even when blocked so the fingerprint binds the run.
+    snapDepsBefore = racedCopy === undefined ? snapshotDepTree(snapshotDir) : new Map<string, DepEntry>();
+    depFingerprint = fingerprintDeps(snapshotDir, snapDepsBefore);
+    envBlock = prep.status !== 'ready' ? blockedOutput : undefined;
     test =
       racedCopy !== undefined
         ? { success: false, output: '', timedOut: false }
-        : envPrep !== null && (envPrep.status === 'env-failure' || envPrep.status === 'failed')
-          ? { success: false, output: envPrep.output, timedOut: false }
+        : envBlock !== undefined
+          ? { success: false, output: envBlock, timedOut: false }
           : await runShellCommand(snapshotDir, options.testCommand, options.timeoutMs ?? 120000);
     // F parity: undeclared missing dep (no manifest entry, no lockfile to
     // install from) surfaces as MODULE_NOT_FOUND after the run. Convert to
@@ -546,6 +711,17 @@ export async function runTestsOnImmutableSnapshot(
     cleanup();
     throw err;
   }
+
+  // Dep after-compare (R3): the test must not change what it executed
+  // (snapshot tree) nor leak a write into the original (origin tree). A
+  // content-identical restore still differs via ctime. Skipped only when no
+  // test ran (env-block/raced copy already fail). Limit: a legit suite that
+  // writes inside node_modules at test time (e.g. a test-runner cache) is
+  // indistinguishable from tamper and refuses attribution.
+  const snapDepsAfter = envBlock === undefined && racedCopy === undefined ? snapshotDepTree(snapshotDir) : new Map<string, DepEntry>();
+  const originDepsAfter = envBlock === undefined && racedCopy === undefined ? snapshotDepTree(options.dir) : new Map<string, DepEntry>();
+  const snapDepHits = envBlock === undefined && racedCopy === undefined ? compareDepTrees(snapDepsBefore, snapDepsAfter) : [];
+  const originDepHits = envBlock === undefined && racedCopy === undefined ? compareDepTrees(originDepsBefore, originDepsAfter) : [];
 
   const beforeIds: Record<string, FileIdentity> = {};
   const afterIds: Record<string, FileIdentity> = {};
@@ -616,6 +792,22 @@ export async function runTestsOnImmutableSnapshot(
       verdict: 'fail',
       reason: `identity refused: snapshot copy raced a concurrent mutation (${racedCopy}) — executed bytes may differ from snapshotted bytes`,
     };
+  } else if (envBlock !== undefined) {
+    // R4: preparation never completed, so there is nothing to attribute.
+    decided = {
+      verdict: 'fail',
+      reason: `identity refused: test environment not prepared, test did not run (${envBlock.split('\n', 1)[0]}) — not attributable to the reviewed commit`,
+    };
+  } else if (originDepHits.length > 0) {
+    decided = {
+      verdict: 'fail',
+      reason: `identity refused: original dependencies mutated during run (${originDepHits.join(', ')}) — pass not attributable to the reviewed commit; depFingerprint ${depFingerprint}`,
+    };
+  } else if (snapDepHits.length > 0) {
+    decided = {
+      verdict: 'fail',
+      reason: `identity refused: executed dependencies changed during run (${snapDepHits.join(', ')}) — pass not attributable to the reviewed commit; depFingerprint ${depFingerprint}`,
+    };
   } else {
     const snapDecided = decideWithCtime(snapBeforeIds, snapAfterIds, snapCtimeHits, 'snapshot');
     if (snapDecided.verdict === 'fail') {
@@ -632,5 +824,6 @@ export async function runTestsOnImmutableSnapshot(
     timedOut: test.timedOut,
     snapshotDir,
     protectedPaths,
+    depFingerprint,
   };
 }
