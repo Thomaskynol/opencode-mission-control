@@ -28,6 +28,10 @@ import {
   readConductorLease,
   verifyConductorLease,
   recordHeartbeat,
+  isConductorPidAlive,
+  reapConductorLeaseIfDead,
+  takeoverConductorLease,
+  type PlanFencing,
   DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS,
   DEFAULT_CONDUCTOR_MAX_PROGRESS_MS,
 } from '../lib/plan-state';
@@ -621,6 +625,61 @@ export function isConductorAlive(pid: number): boolean {
 }
 
 /**
+ * G2 legitimate takeover for approve: never `rm` the lease manually.
+ * - No lease (or foreign plan): no fencing needed → undefined.
+ * - Same pid: already the owner → explicit fencing for the write.
+ * - Dead holder: auto-reap (safe direction only, audited) → fencing.
+ * - Live holder: requires explicit `takeover: true` (i.e. `--takeover`);
+ *   without it this throws fail-closed with an actionable message naming
+ *   the flag. With it, epoch bump + rotation + `conductor-takeover` audit.
+ */
+export async function ensureApproveFencing(
+  planId: string,
+  repoRoot: string,
+  opts?: { takeover?: boolean; command?: string },
+): Promise<PlanFencing | undefined> {
+  const lease = await readConductorLease(repoRoot).catch(() => null);
+  if (!lease || lease.planId !== planId) return undefined;
+  if (lease.pid === process.pid) {
+    return { token: lease.token, epoch: lease.epoch, pid: process.pid };
+  }
+  if (!isConductorPidAlive(lease.pid)) {
+    const reaped = await reapConductorLeaseIfDead(planId, repoRoot, {
+      pid: process.pid,
+      command: opts?.command ?? 'approve (auto-reap dead holder)',
+      owner: 'approve:auto-reap',
+    }).catch(() => null);
+    if (reaped?.reaped && reaped.next) {
+      return { token: reaped.next.token, epoch: reaped.next.epoch, pid: process.pid };
+    }
+    // Race: holder came alive or no lease — re-read once; a live holder
+    // still needs the explicit flag below.
+    const fresh = await readConductorLease(repoRoot).catch(() => null);
+    if (!fresh || fresh.planId !== planId) return undefined;
+    if (fresh.pid === process.pid) return { token: fresh.token, epoch: fresh.epoch, pid: process.pid };
+    if (!isConductorPidAlive(fresh.pid)) return undefined;
+    if (!opts?.takeover) {
+      throw new Error(
+        `Conductor lease held by live pid ${fresh.pid} (epoch ${fresh.epoch}, owner ${fresh.owner}). ` +
+          `Refusing approve without explicit takeover — retry with --takeover to assume ownership ` +
+          `(epoch bump + audit, stale holder fenced). Without --takeover this stays fail-closed; never rm the lease manually.`,
+      );
+    }
+    const take = await takeoverConductorLease(planId, process.pid, opts.command ?? 'approve --takeover', 'approve:takeover', repoRoot, 'approve --takeover (explicit operator intent)');
+    return { token: take.lease.token, epoch: take.lease.epoch, pid: process.pid };
+  }
+  if (!opts?.takeover) {
+    throw new Error(
+      `Conductor lease held by live pid ${lease.pid} (epoch ${lease.epoch}, owner ${lease.owner}). ` +
+        `Refusing approve without explicit takeover — retry with --takeover to assume ownership ` +
+        `(epoch bump + audit, stale holder fenced). Without --takeover this stays fail-closed; never rm the lease manually.`,
+    );
+  }
+  const take = await takeoverConductorLease(planId, process.pid, opts.command ?? 'approve --takeover', 'approve:takeover', repoRoot, 'approve --takeover (explicit operator intent)');
+  return { token: take.lease.token, epoch: take.lease.epoch, pid: process.pid };
+}
+
+/**
  * Conductor freshness budgets (configurable via env, else plan-state
  * defaults). Handoff verification rejects stale holders — pid-alive alone
  * never suffices, and an old leader with a smaller epoch never passes.
@@ -652,17 +711,45 @@ export async function spawnPersistentConductor(
 ): Promise<PersistentConductor> {
   const { spawn } = await import('node:child_process');
   const command = `resume --intake ${intakeId}`;
+  // G3: silent death is forbidden. The detached driver logs stdout/stderr to
+  // a persistent file (never stdio:ignore), so a crash leaves the reason on
+  // disk; the handoff still fails closed when the lease never appears, but
+  // the log explains WHY instead of dying mute. Masked spawn exceptions are
+  // re-thrown with the log path attached — never swallowed.
+  let logPath = '';
+  let outFd: number | undefined;
+  let errFd: number | undefined;
+  try {
+    const fs = await import('fs');
+    const pathMod = await import('path');
+    const dataDir = await getDataDir(repoRoot).catch(() => null);
+    const dir = dataDir ?? repoRoot;
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    logPath = pathMod.join(dir, `conductor-${intakeId}.log`);
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] spawn ${command} (by pid ${process.pid})\n`);
+    outFd = fs.openSync(logPath, 'a');
+    errFd = fs.openSync(logPath, 'a');
+  } catch (error) {
+    try { if (outFd !== undefined) (await import('fs')).closeSync(outFd); } catch {}
+    try { if (errFd !== undefined && errFd !== outFd) (await import('fs')).closeSync(errFd); } catch {}
+    throw new Error(
+      `persistent conductor for intake ${intakeId} did not start: cannot open conductor log (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
   let child: ReturnType<typeof spawn>;
   try {
     child = spawn(process.execPath, [cliPath(), 'resume', '--intake', intakeId], {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', outFd, errFd],
       cwd: repoRoot,
       env: { ...process.env },
     });
   } catch (error) {
+    try { (await import('fs')).appendFileSync(logPath, `[${new Date().toISOString()}] spawn failed: ${error instanceof Error ? error.message : String(error)}\n`); } catch {}
+    try { if (outFd !== undefined) (await import('fs')).closeSync(outFd); } catch {}
+    try { if (errFd !== undefined && errFd !== outFd) (await import('fs')).closeSync(errFd); } catch {}
     throw new Error(
-      `persistent conductor for intake ${intakeId} did not start: ${error instanceof Error ? error.message : String(error)}`,
+      `persistent conductor for intake ${intakeId} did not start: ${error instanceof Error ? error.message : String(error)} (log: ${logPath})`,
     );
   }
   try {
@@ -671,10 +758,15 @@ export async function spawnPersistentConductor(
     // Best-effort: detachment already requested; an unref failure must not
     // mask a live pid.
   }
+  // Parent no longer needs the fds; the child keeps its own copies.
+  try { (await import('fs')).closeSync(outFd!); } catch {}
+  try { if (errFd !== outFd) (await import('fs')).closeSync(errFd!); } catch {}
+  try { (await import('fs')).appendFileSync(logPath, `[${new Date().toISOString()}] spawned pid ${child.pid}\n`); } catch {}
   const pid = child.pid;
   if (!pid || !isConductorAlive(pid)) {
+    try { (await import('fs')).appendFileSync(logPath, `[${new Date().toISOString()}] no live pid after spawn\n`); } catch {}
     throw new Error(
-      `persistent conductor for intake ${intakeId} did not start (no live pid).`,
+      `persistent conductor for intake ${intakeId} did not start (no live pid; log: ${logPath}).`,
     );
   }
   // Provisional possession: the new driver claims the lease itself on boot
@@ -692,8 +784,11 @@ export async function spawnPersistentConductor(
         }
       } catch {}
       return { pid, command, token: lease.token, epoch: lease.epoch };
-    } catch {
-      // Best-effort provisional claim: verification below reports absence.
+    } catch (error) {
+      // G3: never mask — record why the provisional claim failed; the
+      // handoff verification below still reports absence fail-closed, but
+      // the reason is now visible instead of swallowed.
+      console.warn(`[MC] provisional conductor claim failed for plan ${planId} pid ${pid}: ${error instanceof Error ? error.message : String(error)} (log: ${logPath})`);
     }
   }
   return { pid, command };
@@ -876,7 +971,7 @@ async function recordConductorHandoff(
 }
 
 /**
- * `approve [--intake ID] [--retry <job> | --relaunch <job>] [--checkpoint <type>]`
+ * `approve [--intake ID] [--retry <job> | --relaunch <job>] [--checkpoint <type>] [--takeover]`
  * Public CLI equivalent of `mc_plan_approve` (which is MCP-only): clears an
  * `on_error` (or supervisor) pause so `resume --intake` can proceed, or
  * approves a retry/relaunch after a manual/agent fix. Same validation and
@@ -885,12 +980,19 @@ async function recordConductorHandoff(
  * restricted to touchSet failures, and manual-fix retries re-validate the
  * touchSet before proceeding. Fail-closed: unknown intake, missing plan,
  * or a non-paused plan throws explicitly — never a silent success.
+ *
+ * G2: when a conductor lease is held by another live pid, approve without
+ * `--takeover` is rejected fail-closed (never `rm` the lease manually);
+ * `approve --takeover` explicitly assumes ownership (epoch bump + rotation
+ * + `conductor-takeover` audit) and then proceeds. A dead holder is
+ * auto-reaped (safe direction, audited) without requiring the flag.
  */
 export async function approveIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { flags } = parseFlags(args);
   const retry = flags.get('retry');
   const relaunch = flags.get('relaunch');
   const checkpointFlag = flags.get('checkpoint');
+  const wantTakeover = flags.has('takeover');
   if (retry !== undefined && retry !== '' && relaunch !== undefined && relaunch !== '') {
     throw new Error('Cannot specify both "retry" and "relaunch". Use "retry" for manual fixes (re-validates) or "relaunch" to spawn an agent to fix violations.');
   }
@@ -995,6 +1097,19 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     if (plan.status === 'paused' && plan.checkpoint) {
       const checkpoint = (checkpointFlag || plan.checkpoint) as 'pre_merge' | 'on_error' | 'pre_pr';
       const config = await loadConfig();
+      // G2: legitimate fencing for the approve write. Live holder without
+      // --takeover throws here fail-closed (never manual rm); dead holder is
+      // auto-reaped; --takeover bumps the epoch with audit.
+      const approveFencing = await ensureApproveFencing(plan.id, repoRoot, {
+        ...(wantTakeover ? { takeover: true as const } : {}),
+        command: `approve${wantTakeover ? ' --takeover' : ''}${retry ? ` --retry ${retry}` : ''}${relaunch ? ` --relaunch ${relaunch}` : ''}`,
+      });
+      if (wantTakeover && approveFencing) {
+        try {
+          const held = await readConductorLease(repoRoot).catch(() => null);
+          await appendAutoDecision(record.id, `conductor takeover: approve --takeover assumed plan ${plan.id} (epoch ${held?.epoch ?? '?'}, pid ${process.pid})`).catch(() => {});
+        } catch {}
+      }
 
       if (relaunch !== undefined && relaunch !== '') {
         const ctx = plan.checkpointContext;
@@ -1007,7 +1122,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         plan.status = 'running';
         plan.checkpoint = null;
         plan.checkpointContext = null;
-        await savePlan(plan, repoRoot);
+        await savePlan(plan, repoRoot, approveFencing);
         const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
           import('../lib/orchestrator'),
           import('../lib/monitor'),
@@ -1067,7 +1182,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         plan.status = 'running';
         plan.checkpoint = null;
         plan.checkpointContext = null;
-        await savePlan(plan, repoRoot);
+        await savePlan(plan, repoRoot, approveFencing);
         const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
           import('../lib/orchestrator'),
           import('../lib/monitor'),
@@ -1113,7 +1228,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       plan.status = 'running';
       plan.checkpoint = null;
       plan.checkpointContext = null;
-      await savePlan(plan, repoRoot);
+      await savePlan(plan, repoRoot, approveFencing);
       const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
         import('../lib/orchestrator'),
         import('../lib/monitor'),
@@ -1166,7 +1281,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     plan.integrationBranch = integration.branch;
     plan.integrationWorktree = integration.worktreePath;
     plan.status = 'running';
-    await savePlan(plan, repoRoot);
+    // G2: pending start also respects an existing lease (stale holder fenced).
+    const startFencing = await ensureApproveFencing(plan.id, repoRoot, {
+      ...(wantTakeover ? { takeover: true as const } : {}),
+      command: `approve${wantTakeover ? ' --takeover' : ''} --start`,
+    });
+    await savePlan(plan, repoRoot, startFencing);
     const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
       import('../lib/orchestrator'),
       import('../lib/monitor'),

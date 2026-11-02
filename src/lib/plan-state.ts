@@ -870,6 +870,64 @@ export async function reapConductorLeaseIfDead(
   return result;
 }
 
+export interface ConductorTakeoverResult {
+  lease: ConductorLease;
+  prev: ConductorLease | null;
+  auditLogged: boolean;
+}
+
+/**
+ * G2 legitimate takeover: an explicit operator intent (e.g. `approve
+ * --takeover`) atomically replaces the holder — live or dead — with an
+ * epoch bump + token rotation, and appends a `conductor-takeover` audit
+ * line beside the lease. Never a silent `rm`: the previous owner stays
+ * fenced (stale token/epoch rejected) and the switch is auditable.
+ * Fails closed when no plan or no lease exists.
+ */
+export async function takeoverConductorLease(
+  planId: string,
+  pid: number,
+  command: string,
+  owner: string,
+  repoRoot?: string,
+  reason?: string,
+): Promise<ConductorTakeoverResult> {
+  const plan = await loadPlan(repoRoot);
+  if (!plan) throw new Error(`Cannot takeover conductor for plan "${planId}": no active plan.`);
+  if (plan.id !== planId) {
+    throw new Error(`Cannot takeover conductor: plan ID mismatch (expected ${planId}, got ${plan.id}).`);
+  }
+  if (!Number.isFinite(pid) || pid <= 0) {
+    throw new Error(`Cannot takeover conductor for plan "${planId}": invalid pid ${pid}.`);
+  }
+  const prev = await readConductorLease(repoRoot).catch(() => null);
+  if (!prev || prev.planId !== planId) {
+    throw new Error(`Cannot takeover conductor for plan "${planId}": no lease to take over.`);
+  }
+  const lease = await claimConductorLease(planId, pid, command, owner, repoRoot, { force: true });
+  let auditLogged = false;
+  try {
+    const filePath = await getConductorFilePath(repoRoot);
+    const fs = await import('fs');
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      event: 'conductor-takeover',
+      planId,
+      reason: reason ?? command,
+      prevPid: prev.pid,
+      prevEpoch: prev.epoch,
+      nextPid: lease.pid,
+      nextEpoch: lease.epoch,
+      byPid: pid,
+    }) + '\n';
+    fs.appendFileSync(join(dirname(filePath), 'conductor-audit.jsonl'), line);
+    auditLogged = true;
+  } catch (error) {
+    console.warn(`[MC] conductor takeover audit append failed for plan "${planId}": ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { lease, prev, auditLogged };
+}
+
 /* ------------------------------------------------------------------ */
 /* Atomic job dispatch claim (sonda 15). Two coordinators racing on    */
 /* the same queued job must not both dispatch: only queued→running     */

@@ -125,6 +125,50 @@ export interface ReviewVerdict {
   jobName: string;
   reviewedCommit: string;
   reviewedBase: string;
+  /**
+   * G4 audit trail: non-blocking notes (e.g. a discounted command-scope
+   * complaint from the external reviewer). Never decides pass/fail alone —
+   * it records WHY a non-functional external veto was set aside while the
+   * deterministic product checks + local functional coverage passed.
+   */
+  audit?: string[];
+}
+
+/**
+ * G4: True when an external reviewer reason is ONLY about command shape
+ * (isolated vs global run, file counts, command spelling) — never about
+ * whether tests call the implementation and assert the result. Such
+ * complaints are out of scope for the external judge: the product verifies
+ * execution deterministically (command + exit 0 + output + commit), and a
+ * global `bun test` run that includes the task's tests passing satisfies
+ * execution even when the requirement text names a per-file command.
+ * Functional complaints (no call, no assertion, wrong result, vacuous impl)
+ * are NEVER command-scope, even when they mention files.
+ */
+export function isCommandScopeComplaint(reason: string): boolean {
+  if (!reason || reason.trim().length === 0) return false;
+  const r = reason.toLowerCase();
+  const commandScopePattern =
+    /across\s+\d+\s+files?|\bisolated\b|single-file|command-specific|anchored command|in 1 file|observed output shows|no direct evidence.*command/;
+  const functionalPattern =
+    /no test (calls|asserts)|no assertion|does not define|ignores its inputs|only .*(length|size|count)|trivial.*assert|no bound|does not demonstrate.*(call|assert)|no test calls/;
+  if (!commandScopePattern.test(r)) return false;
+  if (functionalPattern.test(r)) return false;
+  return true;
+}
+
+/** Split external reasons into out-of-scope command-shape vs functional. */
+export function partitionExternalReasons(reasons: string[]): {
+  commandScope: string[];
+  functional: string[];
+} {
+  const commandScope: string[] = [];
+  const functional: string[] = [];
+  for (const reason of reasons) {
+    if (isCommandScopeComplaint(reason)) commandScope.push(reason);
+    else functional.push(reason);
+  }
+  return { commandScope, functional };
 }
 
 /**
@@ -326,7 +370,17 @@ function isPathLikeAnchor(anchor: string): boolean {
 
 /** Numbers, quoted literals and booleans the criterion pins down. */
 function extractRequiredLiterals(text: string): string[] {
-  const nums = text.match(/\b\d+(?:\.\d+)?\b/g) ?? [];
+  // G4b: prose test-counts ("at least 3 cases", "4 tests", "3 test cases")
+  // are suite shape, never values to assert. Strip them before extracting
+  // numbers so a correct delivery with N passing tests is not forced to
+  // assert the literal N. Genuine values (`total([1,2])===3`, quoted
+  // literals, booleans) are unaffected — they never sit in a cases/tests
+  // phrase.
+  const withoutCounts = text
+    .replace(/\b\d+\s+(test\s+)?cases?\b/gi, ' ')
+    .replace(/\b\d+\s+tests?\b/gi, ' ')
+    .replace(/\b(at least|at most|minimum|maximum|exactly)\s+\d+\b/gi, (m) => m.replace(/\d+/g, ' '));
+  const nums = withoutCounts.match(/\b\d+(?:\.\d+)?\b/g) ?? [];
   const bools = (text.match(/\b(true|false|null|undefined)\b/gi) ?? []).map((s) => s.toLowerCase());
   const quoted: string[] = [];
   const qre = /'([^']+)'|"([^"]+)"|`([^`]+)`/g;
@@ -1189,12 +1243,36 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
   // External revisor (opencode) is enforced when present, and mandatory
   // under requireExternalSufficiency. Either way the local functional check
   // below still runs: pass needs both, fail needs only one (fail-closed).
+  // G4 (L4): command-shape complaints from the external judge ("across N
+  // files", "isolated", "command-specific", "anchored command") are OUT OF
+  // SCOPE — execution is verified deterministically by the product (command
+  // + exit 0 + output + commit), and a global suite run that includes the
+  // task's tests satisfies it. Such complaints are discounted with an audit
+  // note when the local functional coverage passes; functional complaints
+  // (no call, no assertion, wrong result) still block. This separates what
+  // is verifiable by rule from LLM judgment, so the final verdict is
+  // auditable instead of depending on reviewer mood.
   const suf = input.sufficiency ?? null;
+  let discountedCommandScope: string[] = [];
   if (suf && suf.reviewer === 'opencode') {
     if (suf.decision !== 'pass') {
-      reasons.push(
-        `external functional review (opencode) did not pass: ${(suf.reasons ?? []).join('; ') || 'no reason recorded'} — fail-closed`,
-      );
+      const { commandScope, functional } = partitionExternalReasons(suf.reasons ?? []);
+      if (functional.length > 0) {
+        reasons.push(
+          `external functional review (opencode) did not pass: ${functional.join('; ') || 'no reason recorded'} — fail-closed`,
+        );
+        // Command-shape extras are context, not an independent veto.
+        if (commandScope.length > 0) {
+          discountedCommandScope = commandScope;
+        }
+      } else if (commandScope.length > 0) {
+        // Defer: only a functional local pass can discount this.
+        discountedCommandScope = commandScope;
+      } else {
+        reasons.push(
+          `external functional review (opencode) did not pass: ${(suf.reasons ?? []).join('; ') || 'no reason recorded'} — fail-closed`,
+        );
+      }
     }
   } else if (input.requireExternalSufficiency) {
     reasons.push(
@@ -1229,8 +1307,18 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
     }
   }
 
-  if (reasons.length > 0) return fail({ ...base, reasons });
-  return { ...base, verdict: 'pass', blocking: false, reasons: [] };
+  const audit =
+    discountedCommandScope.length > 0
+      ? [
+          `external command-scope complaint discounted (out of scope for external reviewer; execution verified deterministically by product): ${discountedCommandScope.join('; ').slice(0, 500)}`,
+        ]
+      : undefined;
+  if (reasons.length > 0) {
+    const failed = fail({ ...base, reasons });
+    return audit ? { ...failed, audit } : failed;
+  }
+  const passed: ReviewVerdict = { ...base, verdict: 'pass', blocking: false, reasons: [] };
+  return audit ? { ...passed, audit } : passed;
 }
 
 /**

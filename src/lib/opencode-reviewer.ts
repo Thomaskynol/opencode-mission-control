@@ -194,13 +194,23 @@ export async function isOpenCodeReviewerAvailable(bin?: string): Promise<boolean
   }
 }
 
-function buildPrompt(args: FunctionalReviewArgs): string {
+export function buildPrompt(args: FunctionalReviewArgs): string {
   const lines: string[] = [
     'You are a strict functional code reviewer. Decide ONLY from the evidence below.',
     'For EACH requirement, answer whether the TESTS demonstrate the IMPLEMENTATION',
     'satisfies it: the tests must call the implemented function with a',
     'distinguishing (non-trivial, non-empty) input and assert the required result.',
     'An empty-input-only test NEVER demonstrates a general requirement.',
+    '## Scope rule (product-enforced — do NOT re-judge it)',
+    'Execution is verified separately by the product (command run, exit 0,',
+    'observed output, tested commit). A global suite run (e.g. `bun test`)',
+    'that includes the task tests passing SATISFIES execution, even when the',
+    'requirement text names a per-file command like `bun test tests/x.test.ts`.',
+    'Do NOT fail for command spelling, file counts ("across N files"),',
+    'isolated vs global runs, or output shape. Judge ONLY whether test code',
+    'calls the implementation with a distinguishing input and asserts the',
+    'required result. A reason that is only about command shape is out of',
+    'scope and will be discounted on audit — give a functional reason instead.',
     'Reply with STRICT JSON only: an array of',
     '{"id": "<requirement id>", "demonstrated": true|false, "missing": ["..."], "verdict": "pass"|"fail", "reason": "..."}.',
     'No prose outside the JSON array. When in doubt, verdict "fail".',
