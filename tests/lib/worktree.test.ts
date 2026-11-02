@@ -15,8 +15,11 @@ import {
 import type { WorktreeInfo } from '../../src/lib/providers/worktree-provider';
 
 const TEST_TMP_DIR = realpathSync(tmpdir());
-const TEST_REPO_DIR = join(TEST_TMP_DIR, '.tmp-test-repo');
-const TEST_WORKTREE_DIR = join(TEST_TMP_DIR, '.tmp-test-worktrees');
+// Unique per process: concurrent `bun test` runs (parallel lanes share /tmp)
+// would otherwise rmSync/chdir the same fixed dirs mid-test ("getcwd: cannot
+// access parent directories"). Same pattern as ownedName() in helpers/test-env.
+const TEST_REPO_DIR = join(TEST_TMP_DIR, `.tmp-test-repo-${process.pid}`);
+const TEST_WORKTREE_DIR = join(TEST_TMP_DIR, `.tmp-test-worktrees-${process.pid}`);
 
 async function exec(
   args: string[],

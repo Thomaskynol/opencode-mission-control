@@ -329,13 +329,24 @@ describe('orchestration integration', () => {
     activeOrchestrators = [];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     process.chdir(originalCwd);
     for (const orchestrator of activeOrchestrators) {
       const stopReconciler = (orchestrator as any).stopReconciler;
       if (typeof stopReconciler === 'function') {
         stopReconciler.call(orchestrator);
       }
+    }
+    // Drain in-flight reconcile/dispatch passes while spies and state are
+    // still alive: an un-drained pass resumes after mock.restore()/cleanup,
+    // throws against torn-down state, and bun attributes the unhandled
+    // rejection to whichever test runs next (shared-run-only failure).
+    // Condition-based wait, never a fixed sleep.
+    const drainStart = Date.now();
+    for (;;) {
+      const busy = activeOrchestrators.some((o) => (o as any).isReconciling);
+      if (!busy || Date.now() - drainStart > 15000) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     mock.restore();
     if (activeRepo) {
