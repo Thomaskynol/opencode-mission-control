@@ -7,6 +7,10 @@ import * as paths from '../../src/lib/paths';
 const { allocatePort, releasePort } = await import('../../src/lib/port-allocator');
 
 let testDataDir: string;
+// Isolated OS-free range for this test (set fresh in beforeEach).
+// Never hardcode 1410x: foreign `opencode serve` processes on this machine
+// hold 14100/14102/14103/14109 and the allocator correctly skips them.
+let testBase: number;
 
 function makeConfig(overrides?: Partial<MCConfig>): MCConfig {
   return {
@@ -15,8 +19,8 @@ function makeConfig(overrides?: Partial<MCConfig>): MCConfig {
     idleThreshold: 300000,
     worktreeBasePath: '/tmp/mc-worktrees',
     useServeMode: true,
-    portRangeStart: 14100,
-    portRangeEnd: 14110,
+    portRangeStart: testBase,
+    portRangeEnd: testBase + 15,
     omo: { enabled: false, defaultMode: 'vanilla' },
     ...overrides,
   } as MCConfig;
@@ -73,6 +77,8 @@ describe('port-allocator', () => {
     // Scoped spy (no vi.mock): the real module stays intact for every other
     // file in the shared bun test process; restoreAllMocks reverts to real.
     vi.spyOn(paths, 'getDataDir').mockResolvedValue(testDataDir);
+    // Fresh OS-free block per test: 16 consecutive ports, no foreign listener.
+    testBase = findFreeBase(16);
   });
 
   afterEach(async () => {
@@ -86,72 +92,70 @@ describe('port-allocator', () => {
   describe('allocatePort', () => {
     it('should allocate first port in range when no active jobs', async () => {
       const port = await allocatePort(makeConfig(), []);
-      expect(port).toBe(14100);
+      expect(port).toBe(testBase);
     });
 
     it('should skip ports used by active jobs', async () => {
-      const base = findFreeBase(3);
       const jobs = [
-        makeJob({ port: base }),
-        makeJob({ port: base + 1 }),
+        makeJob({ port: testBase }),
+        makeJob({ port: testBase + 1 }),
       ];
-      const config = makeConfig({ portRangeStart: base, portRangeEnd: base + 10 });
-      const port = await allocatePort(config, jobs);
-      expect(port).toBe(base + 2);
+      const port = await allocatePort(makeConfig(), jobs);
+      expect(port).toBe(testBase + 2);
     });
 
     it('should skip ports in lock file from previous allocations', async () => {
       await allocatePort(makeConfig(), []);
       const secondPort = await allocatePort(makeConfig(), []);
-      expect(secondPort).toBe(14101);
+      expect(secondPort).toBe(testBase + 1);
     });
 
     it('should use custom port range from config', async () => {
-      const config = makeConfig({ portRangeStart: 15000, portRangeEnd: 15010 });
+      const config = makeConfig({ portRangeStart: testBase + 5, portRangeEnd: testBase + 10 });
       const port = await allocatePort(config, []);
-      expect(port).toBe(15000);
+      expect(port).toBe(testBase + 5);
     });
 
     it('should throw when all ports in range are exhausted', async () => {
-      const config = makeConfig({ portRangeStart: 14100, portRangeEnd: 14101 });
+      const config = makeConfig({ portRangeStart: testBase, portRangeEnd: testBase + 1 });
       await allocatePort(config, []);
       await allocatePort(config, []);
 
       await expect(allocatePort(config, [])).rejects.toThrow(
-        'No available ports in range 14100-14101',
+        `No available ports in range ${testBase}-${testBase + 1}`,
       );
     });
 
     it('should consider both job ports and lock file ports', async () => {
-      const base = findFreeBase(4);
-      const config = makeConfig({ portRangeStart: base, portRangeEnd: base + 3 });
+      const config = makeConfig({ portRangeStart: testBase, portRangeEnd: testBase + 3 });
       await allocatePort(config, []);
-      const jobs = [makeJob({ port: base + 1 })];
+      const jobs = [makeJob({ port: testBase + 1 })];
       const port = await allocatePort(config, jobs);
-      expect(port).toBe(base + 2);
+      expect(port).toBe(testBase + 2);
     });
 
     it('should handle corrupted lock file gracefully', async () => {
       const fs = await import('fs');
       fs.writeFileSync(join(testDataDir, 'port.lock'), 'invalid json{{{');
       const port = await allocatePort(makeConfig(), []);
-      expect(port).toBe(14100);
+      expect(port).toBe(testBase);
     });
 
     it('should handle jobs without ports', async () => {
       const jobs = [makeJob({ port: undefined })];
       const port = await allocatePort(makeConfig(), jobs);
-      expect(port).toBe(14100);
+      expect(port).toBe(testBase);
     });
   });
 
   describe('releasePort', () => {
     it('should remove port from lock file', async () => {
       const config = makeConfig();
-      await allocatePort(config, []);
-      await releasePort(14100);
+      const first = await allocatePort(config, []);
+      expect(first).toBe(testBase);
+      await releasePort(first);
       const port = await allocatePort(config, []);
-      expect(port).toBe(14100);
+      expect(port).toBe(testBase);
     });
 
     it('should be idempotent for unknown ports', async () => {
@@ -160,17 +164,19 @@ describe('port-allocator', () => {
 
     it('should only remove the specified port', async () => {
       const config = makeConfig();
-      await allocatePort(config, []);
-      await allocatePort(config, []);
+      const first = await allocatePort(config, []);
+      const second = await allocatePort(config, []);
+      expect(first).toBe(testBase);
+      expect(second).toBe(testBase + 1);
 
-      await releasePort(14100);
+      await releasePort(first);
 
       const port = await allocatePort(config, []);
-      expect(port).toBe(14100);
+      expect(port).toBe(testBase);
     });
 
     it('should handle missing lock file gracefully', async () => {
-      await expect(releasePort(14100)).resolves.toBeUndefined();
+      await expect(releasePort(testBase)).resolves.toBeUndefined();
     });
   });
 });
