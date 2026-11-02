@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
 import type { PlanSpec } from '../../src/lib/plan-types';
 import * as paths from '../../src/lib/paths';
+
+/** R8: implementation under test resolved from THIS file's directory —
+// portable across worktrees/machines, never a hardcoded absolute path. */
+const planStateUnderTest = fileURLToPath(new URL('../../src/lib/plan-state.ts', import.meta.url));
 
 /** E fencing: stale token/epoch rejected, no-lease start fails closed, takeover inverts. */
 describe('conductor fencing (E)', () => {
@@ -104,6 +109,17 @@ describe('conductor fencing (E)', () => {
     const xdg = join(testBaseDir, 'xdg2p');
     fs.mkdirSync(xdg, { recursive: true });
     const env = { ...process.env, MC_XDG_DATA_DIR: xdg };
+    // R8: the exercised code must be the tree under test — the resolved file
+    // must live inside the same tree as this test file (no .git of others
+    // involved, no hardcoded worktree path). Children echo the specifier
+    // they imported plus a content fingerprint; both must match.
+    const treeRoot = fileURLToPath(new URL('../..', import.meta.url));
+    expect(planStateUnderTest.startsWith(treeRoot)).toBe(true);
+    const selfText = await Bun.file(planStateUnderTest).text();
+    expect(selfText).toMatch(/claimConductorLease/);
+    expect(selfText).toMatch(/assertPlanFencing/);
+    const fingerprint = `${selfText.length}:${selfText.includes('claimJobForDispatch')}`;
+    const echoSrc = `const __src = await Bun.file(${JSON.stringify(planStateUnderTest)}).text(); console.log('IMPORTED ' + ${JSON.stringify(planStateUnderTest)} + ' CODE ' + __src.length + ':' + __src.includes('claimJobForDispatch'));`;
     const run = async (script: string): Promise<{ exit: number; out: string }> => {
       const proc = Bun.spawn(['bun', '-e', script], { cwd: '/tmp', env: env as any, stdout: 'pipe', stderr: 'pipe' });
       const out = await new Response(proc.stdout).text().catch(() => '');
@@ -112,7 +128,8 @@ describe('conductor fencing (E)', () => {
       return { exit, out: out + err };
     };
     const setupScript = `
-      const m = await import(${JSON.stringify('/tmp/opencode/lane-efgfix/wt/src/lib/plan-state.ts')});
+      const m = await import(${JSON.stringify(planStateUnderTest)});
+      ${echoSrc}
       const plan = { id: 'e-2p', name: 'e-2p', mode: 'autopilot', status: 'running', jobs: [{ id: 'j1', name: 'job-a', status: 'queued', prompt: 'do' }], integrationBranch: 'mc/e', baseCommit: 'HEAD', createdAt: new Date().toISOString() };
       await m.savePlan(plan, ${JSON.stringify(repoRoot)});
       const a = await m.claimConductorLease('e-2p', 10001, 'A', 'A', ${JSON.stringify(repoRoot)});
@@ -121,18 +138,24 @@ describe('conductor fencing (E)', () => {
     `;
     const s1 = await run(setupScript);
     expect(s1.exit).toBe(0);
+    expect(s1.out).toContain(`IMPORTED ${planStateUnderTest}`);
+    expect(s1.out).toContain(`CODE ${fingerprint}`);
     const leaseA = JSON.parse(await Bun.file(join(testBaseDir, 'leaseA.json')).text());
     // B takeover in another process (different pid)
     const takeoverScript = `
-      const m = await import(${JSON.stringify('/tmp/opencode/lane-efgfix/wt/src/lib/plan-state.ts')});
+      const m = await import(${JSON.stringify(planStateUnderTest)});
+      ${echoSrc}
       await m.claimConductorLease('e-2p', 10002, 'B', 'B', ${JSON.stringify(repoRoot)}, { force: true });
       console.log('takeover ok');
     `;
     const s2 = await run(takeoverScript);
     expect(s2.exit).toBe(0);
+    expect(s2.out).toContain(`IMPORTED ${planStateUnderTest}`);
+    expect(s2.out).toContain(`CODE ${fingerprint}`);
     // Stale A write from a third process must be rejected (exit != 0)
     const staleScript = `
-      const m = await import(${JSON.stringify('/tmp/opencode/lane-efgfix/wt/src/lib/plan-state.ts')});
+      const m = await import(${JSON.stringify(planStateUnderTest)});
+      ${echoSrc}
       try {
         await m.updatePlanJob('e-2p', 'job-a', { status: 'running' }, { fencing: { token: ${JSON.stringify(leaseA.token)}, epoch: ${leaseA.epoch}, pid: 10001 } }, ${JSON.stringify(repoRoot)});
         console.log('STALE-WRITE-SUCCEEDED (gap)');
@@ -145,6 +168,8 @@ describe('conductor fencing (E)', () => {
     const s3 = await run(staleScript);
     expect(s3.exit).toBe(1);
     expect(s3.out).toMatch(/fencing/i);
+    expect(s3.out).toContain(`IMPORTED ${planStateUnderTest}`);
+    expect(s3.out).toContain(`CODE ${fingerprint}`);
     // re-mock for other tests
     const spy = spyOn(paths, 'getDataDir').mockResolvedValue(testStateDir);
     restoreDataDir = () => spy.mockRestore();
