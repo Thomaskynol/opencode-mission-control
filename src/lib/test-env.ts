@@ -19,13 +19,15 @@ export const ENV_UNPREPARED =
 /**
  * True when test output shows a missing BARE (non-relative, non-absolute)
  * module specifier — i.e. an undeclared/external dependency, not a code bug.
- * Node prints `Cannot find module '<spec>'`; relative (`./x`, `../x`) and
- * absolute (`/x`) specifiers are genuine code defects and must stay test
- * failures. When no specifier is extractable, returns true (fail-closed:
- * preserve the previous conversion behavior).
+ * Node prints `Cannot find module '<spec>'`; Bun prints
+ * `Cannot find package '<spec>'` for bare specifiers (and `Cannot find
+ * module` for relative ones, sometimes prefixed with `error:`).
+ * Relative (`./x`, `../x`) and absolute (`/x`) specifiers are genuine code
+ * defects and must stay test failures. When no specifier is extractable,
+ * returns true (fail-closed: preserve the previous conversion behavior).
  */
 export function isExternalMissingModule(output: string): boolean {
-  const m = /Cannot find module '([^']+)'/.exec(output) ?? /Cannot find module "([^"]+)"/.exec(output);
+  const m = /Cannot find (?:module|package) '([^']+)'/.exec(output) ?? /Cannot find (?:module|package) "([^"]+)"/.exec(output);
   if (!m) return true;
   const spec = m[1];
   if (spec.startsWith('.') || spec.startsWith('/')) return false;

@@ -1186,7 +1186,7 @@ export class MergeTrain {
       // env-failure (never pass/skip), preserving toctou-style tests.
       // Only bare (external) specifiers convert: relative/absolute requires
       // are genuine code bugs and stay test failures.
-      if (!testResult.timedOut && /Cannot find module|MODULE_NOT_FOUND/i.test(testResult.output)) {
+      if (!testResult.timedOut && /Cannot find (?:module|package)|MODULE_NOT_FOUND/i.test(testResult.output)) {
         try {
           const { ENV_UNPREPARED, isExternalMissingModule } = await import('./test-env.js');
           if (!isExternalMissingModule(testResult.output)) {

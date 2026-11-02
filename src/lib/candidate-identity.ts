@@ -697,7 +697,7 @@ export async function runTestsOnImmutableSnapshot(
     // Only bare (external) specifiers convert: relative/absolute requires are
     // genuine code bugs and stay test failures.
     if (test.success === false && test.timedOut === false && test.output) {
-      const missingDep = /Cannot find module|MODULE_NOT_FOUND/i.test(test.output);
+      const missingDep = /Cannot find (?:module|package)|MODULE_NOT_FOUND/i.test(test.output);
       if (missingDep) {
         try {
           const { ENV_UNPREPARED, isExternalMissingModule } = await import('./test-env.js');
