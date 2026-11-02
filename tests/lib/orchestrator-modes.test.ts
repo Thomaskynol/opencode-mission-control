@@ -439,8 +439,23 @@ describe('orchestrator modes', () => {
       expect(orchestrator.getCheckpoint()).toBeNull();
       expect(planState?.status).toBe('running');
 
-      // Wait for the auto-reconcile triggered by clearCheckpoint/startReconciler
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Wait (condition-based, never a fixed sleep) for the auto-reconcile
+      // triggered by clearCheckpoint/startReconciler to merge the job.
+      const waitStart = Date.now();
+      while (planState?.jobs.find((j) => j.name === 'merge-me')?.status !== 'merged') {
+        if (Date.now() - waitStart > 5000) {
+          throw new Error('auto-reconcile did not merge merge-me within 5000ms');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      // Shut the loop down: a leaked interval would outlive the test and its
+      // later ticks would hit restored mocks, logging 'reconcile error' noise.
+      (orchestrator as unknown as { stopReconciler?: () => void }).stopReconciler?.();
+      const drainStart = Date.now();
+      while ((orchestrator as unknown as { isReconciling?: boolean }).isReconciling && Date.now() - drainStart < 10000) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect((orchestrator as unknown as { isRunning?: boolean }).isRunning).toBe(false);
 
       // Job should have moved to merging (enqueued in merge train) and then merged
       expect(orchestrator.getCheckpoint()).not.toBe('pre_merge');

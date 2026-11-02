@@ -665,5 +665,15 @@ describe('monitor-autocomplete: resume without duplicating or reintegrating', ()
     await (orchestrator as any)._doReconcile();
 
     expect(enqueued).not.toContain('old');
+
+    // Hygiene: resumePlan starts the real background loop — shut it down so
+    // its ticks cannot outlive the test and log 'reconcile error' noise once
+    // mocks are restored. Condition-based drain, never a fixed sleep.
+    (orchestrator as unknown as { stopReconciler?: () => void }).stopReconciler?.();
+    const drainStart = Date.now();
+    while ((orchestrator as unknown as { isReconciling?: boolean }).isReconciling && Date.now() - drainStart < 10000) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect((orchestrator as unknown as { isRunning?: boolean }).isRunning).toBe(false);
   });
 });

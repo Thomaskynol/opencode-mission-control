@@ -34,6 +34,35 @@ function validDraft(extra?: Record<string, unknown>) {
   };
 }
 
+/**
+ * Reconciler hygiene for tests that drive public paths (complement/resume)
+ * which start the real background loop: stop the interval and wait for the
+ * in-flight pass to finish while mocks/dirs are still alive. Without this,
+ * the pass completes after teardown, hits the restored (undefined) getDataDir
+ * mock and logs 'Orchestrator reconcile error' noise into later files.
+ * Condition-based wait (never a fixed sleep).
+ */
+async function stopAndDrainReconciler(orch: unknown, timeoutMs = 10000): Promise<void> {
+  const o = orch as { stopReconciler?: () => void; isReconciling?: boolean };
+  try { o.stopReconciler?.(); } catch {}
+  const start = Date.now();
+  while ((o.isReconciling ?? false) && Date.now() - start < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/** Records 'reconcile error' console noise during a test (regression guard). */
+function watchReconcileErrors(): { errors: string[]; restore: () => void } {
+  const errors: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => {
+    const text = args.map((a) => String(a)).join(' ');
+    if (/reconcile error/i.test(text)) errors.push(text.slice(0, 300));
+    (orig as (...a: unknown[]) => void)(...args);
+  };
+  return { errors, restore: () => { console.error = orig; } };
+}
+
 describe('F05 permission decision fail-closed (public path)', () => {
   const realFetch = globalThis.fetch;
   let f05StateDir = '';
@@ -271,16 +300,26 @@ describe('F03 complement triggers real plan revision (public path)', () => {
       questions: [],
       nextSteps: [],
     });
-    await withRepoRoot(repo, async () => {
-      await (orch as unknown as { complementAutonomousRequest: (id: string, t: string, g: unknown) => Promise<unknown> }).complementAutonomousRequest(intakeId, 'Also handle timeouts', gen2);
-    });
-    const after = await loadPlan(repo);
-    const names = after!.jobs.map((j) => j.name);
-    // Resultado funcional: nova task criada OU pergunta humana registrada (nunca só Follow-up/decisão-log).
-    const intake = await withRepoRoot(repo, async () => loadAutoIntake(intakeId));
-    const functional = names.includes('task-b') || intake!.questions.some((q) => /timeout/i.test(q));
-    expect(functional).toBe(true);
-    expect(intake!.request).toMatch(/Follow-up/);
+    // Guard: any 'reconcile error' noise from the background loop fails here.
+    const watch = watchReconcileErrors();
+    try {
+      await withRepoRoot(repo, async () => {
+        await (orch as unknown as { complementAutonomousRequest: (id: string, t: string, g: unknown) => Promise<unknown> }).complementAutonomousRequest(intakeId, 'Also handle timeouts', gen2);
+      });
+      const after = await loadPlan(repo);
+      const names = after!.jobs.map((j) => j.name);
+      // Resultado funcional: nova task criada OU pergunta humana registrada (nunca só Follow-up/decisão-log).
+      const intake = await withRepoRoot(repo, async () => loadAutoIntake(intakeId));
+      const functional = names.includes('task-b') || intake!.questions.some((q) => /timeout/i.test(q));
+      expect(functional).toBe(true);
+      expect(intake!.request).toMatch(/Follow-up/);
+      // Hygiene: drain the background loop started by complement while mocks
+      // are alive, then assert it stayed silent (no post-teardown noise).
+      await stopAndDrainReconciler(orch);
+      expect(watch.errors).toEqual([]);
+    } finally {
+      watch.restore();
+    }
   });
 });
 
@@ -344,12 +383,22 @@ describe('F07 resume recovers interrupted planning and merging (public path)', (
     (orch as unknown as { launchJob: unknown }).launchJob = async () => {};
     (orch as unknown as { repoRoot: string }).repoRoot = repo;
     const gen = async () => JSON.stringify(validDraft());
-    const out = await withRepoRoot(repo, async () =>
-      (orch as unknown as { resumeAutonomousIntake: (id: string, g?: unknown) => Promise<string> }).resumeAutonomousIntake(intakeId, gen),
-    );
-    const plan = await loadPlan(repo);
-    expect(plan).not.toBeNull();
-    expect(out).not.toMatch(/no active plan/i);
+    // Guard: any 'reconcile error' noise from the background loop fails here.
+    const watch = watchReconcileErrors();
+    try {
+      const out = await withRepoRoot(repo, async () =>
+        (orch as unknown as { resumeAutonomousIntake: (id: string, g?: unknown) => Promise<string> }).resumeAutonomousIntake(intakeId, gen),
+      );
+      const plan = await loadPlan(repo);
+      expect(plan).not.toBeNull();
+      expect(out).not.toMatch(/no active plan/i);
+      // Hygiene: drain the background loop started by resume while mocks
+      // are alive, then assert it stayed silent (no post-teardown noise).
+      await stopAndDrainReconciler(orch);
+      expect(watch.errors).toEqual([]);
+    } finally {
+      watch.restore();
+    }
   });
 
   it('queda em merging reativa sem sucesso vazio (kill -9 simulado reconcilia)', async () => {
@@ -381,14 +430,24 @@ describe('F07 resume recovers interrupted planning and merging (public path)', (
     orchs.push(orch2 as unknown as { stopReconciler?: () => void });
     (orch2 as unknown as { launchJob: unknown }).launchJob = async () => {};
     (orch2 as unknown as { repoRoot: string }).repoRoot = repo;
-    const out = await withRepoRoot(repo, async () =>
-      (orch2 as unknown as { resumeAutonomousIntake: (id: string) => Promise<string> }).resumeAutonomousIntake(intakeId),
-    );
-    expect(out.trim().length).toBeGreaterThan('Resumed'.length);
-    expect(out).not.toMatch(/^Resumed\s*$/);
-    // Reativação real: merging não fica preso — volta a running (reconciliador reativa) e relata.
-    const after = await loadPlan(repo);
-    expect(after!.status).toBe('running');
-    expect(out).toMatch(/reativ|resum/i);
+    // Guard: any 'reconcile error' noise from the background loop fails here.
+    const watch2 = watchReconcileErrors();
+    try {
+      const out = await withRepoRoot(repo, async () =>
+        (orch2 as unknown as { resumeAutonomousIntake: (id: string) => Promise<string> }).resumeAutonomousIntake(intakeId),
+      );
+      expect(out.trim().length).toBeGreaterThan('Resumed'.length);
+      expect(out).not.toMatch(/^Resumed\s*$/);
+      // Reativação real: merging não fica preso — volta a running (reconciliador reativa) e relata.
+      const after = await loadPlan(repo);
+      expect(after!.status).toBe('running');
+      expect(out).toMatch(/reativ|resum/i);
+      // Hygiene: drain the background loop started by resume while mocks
+      // are alive, then assert it stayed silent (no post-teardown noise).
+      await stopAndDrainReconciler(orch2);
+      expect(watch2.errors).toEqual([]);
+    } finally {
+      watch2.restore();
+    }
   });
 });
