@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   setupNotifications,
   annotateSessionTitle,
@@ -9,10 +9,7 @@ import {
   _getMCPrefixedSessionsForTesting,
 } from '../../src/hooks/notifications';
 import type { Job } from '../../src/lib/job-state';
-
-vi.mock('../../src/lib/reports', () => ({
-  readReport: vi.fn().mockResolvedValue(null),
-}));
+import * as reports from '../../src/lib/reports';
 
 describe('notifications hook', () => {
   let mockMonitor: {
@@ -32,6 +29,9 @@ describe('notifications hook', () => {
   beforeEach(() => {
     _getTitleStateForTesting().clear();
     _getMCPrefixedSessionsForTesting().clear();
+    // Scoped spy (no vi.mock): the real module stays intact for every other
+    // file in the shared bun test process; restored in afterEach.
+    vi.spyOn(reports, 'readReport').mockResolvedValue(null);
 
     mockMonitor = {
       handlers: new Map(),
@@ -53,6 +53,10 @@ describe('notifications hook', () => {
 
     mockGetActiveSessionID = vi.fn().mockResolvedValue('session-123');
     mockIsSubagent = vi.fn().mockResolvedValue(false);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('should set up notification handlers for all events', () => {

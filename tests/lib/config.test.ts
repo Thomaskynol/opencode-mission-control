@@ -4,12 +4,7 @@ import { homedir } from 'os';
 import { tmpdir } from 'os';
 import type { MCConfig } from '../../src/lib/config';
 import { PermissionPolicy } from '../../src/lib/permission-policy';
-
-vi.mock('../../src/lib/paths', () => ({
-  getDataDir: vi.fn(),
-}));
-
-const paths = await import('../../src/lib/paths');
+import * as paths from '../../src/lib/paths';
 const { loadConfig, saveConfig, getConfigPath } = await import('../../src/lib/config');
 
 let testConfigDir: string;
@@ -27,7 +22,9 @@ describe('config', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     testConfigDir = await createTempDir();
-    (paths.getDataDir as any).mockResolvedValue(testConfigDir);
+    // Scoped spy (no vi.mock): the real module stays intact for every other
+    // file in the shared bun test process; restoreAllMocks reverts to real.
+    vi.spyOn(paths, 'getDataDir').mockResolvedValue(testConfigDir);
   });
 
   afterEach(async () => {

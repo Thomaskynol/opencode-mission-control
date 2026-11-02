@@ -1,4 +1,9 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as sdk from '@opencode-ai/sdk';
+
+// Scoped spy (no vi.mock): the shared registry keeps the real SDK module for
+// every other file; only createOpencodeClient is stubbed here and restored
+// after each test. Semantics identical (same mockClient).
 
 const mockSessionList = vi.fn();
 const mockSessionCreate = vi.fn();
@@ -14,16 +19,16 @@ const mockClient = {
   },
 };
 
-vi.mock('@opencode-ai/sdk', () => ({
-  createOpencodeClient: vi.fn(() => mockClient),
-}));
-
-const sdk = await import('@opencode-ai/sdk');
 const { createJobClient, waitForServer, sendPrompt, createSessionAndPrompt, forkJobSession } = await import('../../src/lib/sdk-client');
 
 describe('sdk-client', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(sdk, 'createOpencodeClient').mockImplementation((() => mockClient) as any);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   describe('createJobClient', () => {

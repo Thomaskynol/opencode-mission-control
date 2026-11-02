@@ -3,12 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import type { Job } from '../../src/lib/job-state';
 import type { MCConfig } from '../../src/lib/config';
-
-vi.mock('../../src/lib/paths', () => ({
-  getDataDir: vi.fn(),
-}));
-
-const paths = await import('../../src/lib/paths');
+import * as paths from '../../src/lib/paths';
 const { allocatePort, releasePort } = await import('../../src/lib/port-allocator');
 
 let testDataDir: string;
@@ -75,7 +70,9 @@ describe('port-allocator', () => {
     vi.clearAllMocks();
     const fs = await import('fs');
     testDataDir = fs.mkdtempSync(join(tmpdir(), 'mc-port-test-'));
-    (paths.getDataDir as ReturnType<typeof vi.fn>).mockResolvedValue(testDataDir);
+    // Scoped spy (no vi.mock): the real module stays intact for every other
+    // file in the shared bun test process; restoreAllMocks reverts to real.
+    vi.spyOn(paths, 'getDataDir').mockResolvedValue(testDataDir);
   });
 
   afterEach(async () => {

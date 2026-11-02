@@ -2,12 +2,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { PlanSpec, JobSpec } from '../../src/lib/plan-types';
-
-vi.mock('../../src/lib/paths', () => ({
-  getDataDir: vi.fn(),
-}));
-
-const paths = await import('../../src/lib/paths');
+import * as paths from '../../src/lib/paths';
 const {
   loadPlan,
   savePlan,
@@ -57,7 +52,9 @@ describe('plan-state', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     testStateDir = await createTempDir();
-    (paths.getDataDir as any).mockResolvedValue(testStateDir);
+    // Scoped spy (no vi.mock): the real module stays intact for every other
+    // file in the shared bun test process; restoreAllMocks reverts to real.
+    vi.spyOn(paths, 'getDataDir').mockResolvedValue(testStateDir);
   });
 
   afterEach(async () => {

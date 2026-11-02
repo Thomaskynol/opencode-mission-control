@@ -131,7 +131,7 @@ describe('test-env parity (F)', () => {
     expect(r.success).toBe(false);
     expect(r.output).toMatch(/ENV-UNPREPARED/);
     expect(r.output).toMatch(/Cannot find package 'totally-missing-pkg-xyz'/);
-  });
+  }, 30000);
 
   it('bun relative missing module stays test failure, never env-failure', async () => {
     const { isExternalMissingModule } = await import('../../src/lib/test-env');

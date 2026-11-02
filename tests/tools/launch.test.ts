@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Job } from '../../src/lib/job-state';
+import * as crypto from 'crypto';
 import * as jobState from '../../src/lib/job-state';
 import * as worktree from '../../src/lib/worktree';
 import * as tmux from '../../src/lib/tmux';
@@ -12,9 +13,10 @@ import * as modelTracker from '../../src/lib/model-tracker';
 import * as portAllocator from '../../src/lib/port-allocator';
 import * as sdkClient from '../../src/lib/sdk-client';
 
-vi.mock('crypto', () => ({
-  randomUUID: vi.fn(() => 'test-uuid-1234'),
-}));
+// Scoped spy (no vi.mock): the shared registry keeps the real module for
+// every other file; only randomUUID is stubbed here and restored after each
+// test. A partial vi.mock factory would poison the registry for files
+// importing other 'crypto' exports (createHash, randomBytes).
 
 const { mc_launch } = await import('../../src/tools/launch');
 
@@ -86,6 +88,7 @@ function setupDefaultMocks() {
 describe('mc_launch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('test-uuid-1234' as any);
     mockGetJobByName = vi.spyOn(jobState, 'getJobByName').mockImplementation(() => undefined as any);
     mockAddJob = vi.spyOn(jobState, 'addJob').mockImplementation(() => undefined as any);
     mockCreateWorktree = vi.spyOn(worktree, 'createWorktree').mockImplementation(() => undefined as any);
@@ -117,6 +120,10 @@ describe('mc_launch', () => {
     vi.spyOn(tmux, 'killSession').mockImplementation(() => Promise.resolve(undefined) as any);
     vi.spyOn(tmux, 'killWindow').mockImplementation(() => Promise.resolve(undefined) as any);
     setupDefaultMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   describe('tool definition', () => {
