@@ -5,8 +5,10 @@ import { join } from 'path';
  * Shared test-env preparation (F): one helper used by review-snapshot
  * materialization AND merge-train ensureTestDependencies.
  *
- * Deps are installed/symlinked into a copy, never mutating the attributed
- * original (symlink FROM source TO snapshot; installs run INSIDE the copy).
+ * Deps are PHYSICALLY COPIED into the snapshot (never a symlink
+ * snapshot→source: a link lets the test write through into the original and
+ * green-pass on adulterated bytes — R3). Installs run INSIDE the copy, never
+ * mutating the attributed original.
  * Impossible preparation returns status 'env-failure' with the fixed
  * ENV-UNPREPARED diagnostic that fails closed in both paths (never pass/skip).
  * Never versions node_modules (untracked, gitignored); env errors never pass.
@@ -61,6 +63,10 @@ function isSameDir(a: string, b: string): boolean {
   }
 }
 
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 async function runShell(cwd: string, command: string, timeoutMs: number): Promise<{ success: boolean; output: string; timedOut: boolean }> {
   const proc = Bun.spawn(['sh', '-c', command], { cwd, stdout: 'pipe', stderr: 'pipe' });
   const outP = new Response(proc.stdout).text();
@@ -94,7 +100,10 @@ async function detectInstall(snapshotDir: string): Promise<string | null> {
 
 /**
  * Prepare deps for running tests in snapshotDir, sourced from sourceDir.
- * Never mutates sourceDir (symlink FROM source, installs INSIDE snapshot).
+ * Never mutates sourceDir. The snapshot gets a PHYSICAL COPY of
+ * sourceDir/node_modules (no symlink snapshot→source, ever): the test can
+ * neither green-pass on adulterated bytes attributed to the commit nor leak a
+ * write into the original. Copy failure falls through to the install path.
  * Returns ready when snapshot can run (has node_modules or install ok),
  * else env-failure with ENV-UNPREPARED (fail-closed, never pass/skip).
  */
@@ -125,24 +134,33 @@ export async function prepareTestEnv(opts: {
   if (hasNodeModules(snapshotDir)) {
     return { status: 'ready', commands: [], output: '' };
   }
-  // Symlink untracked deps FROM the original INTO the copy (never the reverse).
-  // Never versions node_modules: symlink only, no git add, no copy of tracked bytes.
+  // Physical copy of untracked deps FROM the original INTO the snapshot copy.
+  // Never a symlink: a link would let the test write through into the
+  // original and green-pass on adulterated bytes (R3). Never versions
+  // node_modules: copy only, no git add, no copy of tracked bytes.
   if (!isSameDir(snapshotDir, sourceDir) && hasNodeModules(sourceDir)) {
     try {
       const src = join(sourceDir, 'node_modules');
       const dst = join(snapshotDir, 'node_modules');
-      // Dangling link cleanup (defense: stale link from prior prep).
+      // Dangling link/dir cleanup (defense: stale link from prior prep).
       try {
-        const st = lstatSync(dst);
-        if (st.isSymbolicLink()) rmSync(dst, { force: true });
+        rmSync(dst, { recursive: true, force: true });
       } catch {}
-      const { symlinkSync } = await import('fs');
-      symlinkSync(src, dst, 'dir');
+      const cp = await runShell(snapshotDir, `cp -a ${shQuote(src)} ${shQuote(dst)}`, timeoutMs);
+      if (!cp.success) throw new Error(cp.output || 'dep copy failed');
+      // Prove no link remains: the executed tree must be real bytes.
+      const st = lstatSync(dst);
+      if (st.isSymbolicLink()) {
+        try {
+          rmSync(dst, { recursive: true, force: true });
+        } catch {}
+        throw new Error('refused to link snapshot deps to origin');
+      }
       if (hasNodeModules(snapshotDir)) {
         return { status: 'ready', commands: [], output: '' };
       }
     } catch {
-      // Fall through to install path; symlink failure is not a pass.
+      // Fall through to install path; copy failure is not a pass.
     }
   }
   const install = await detectInstall(snapshotDir);
