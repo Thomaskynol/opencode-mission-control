@@ -1,4 +1,5 @@
-import { resolve } from 'path';
+import { resolve, dirname, relative, join } from 'path';
+import { realpathSync, lstatSync } from 'fs';
 import type { V2PermissionRule } from './sdk-client.js';
 
 export type PermissionPolicyDecision = 'auto-approve' | 'deny' | 'ask-user';
@@ -52,19 +53,78 @@ export type PermissionPolicySources = {
 };
 
 function normalizePathForComparison(path: string): string {
-  return resolve(path).replace(/\\/g, '/');
+  return resolve(path.replace(/\\/g, '/')).replace(/\\/g, '/');
 }
 
-function isInsideWorktree(path: string, worktreePath: string): boolean {
-  const normalizedPath = normalizePathForComparison(path);
-  const normalizedWorktree = normalizePathForComparison(worktreePath);
-
+function lexicallyInsideWorktree(normalizedPath: string, normalizedWorktree: string): boolean {
   if (normalizedPath === normalizedWorktree) {
     return true;
   }
 
   const suffix = normalizedWorktree.endsWith('/') ? '' : '/';
   return normalizedPath.startsWith(`${normalizedWorktree}${suffix}`);
+}
+
+/**
+ * Resolve the longest existing prefix (a symlink itself counts as existing
+ * via lstat) through realpath, then re-append the not-yet-existing remainder
+ * lexically. Returns null when nothing resolves — broken symlinks,
+ * unreadable components and dead roots are unresolvable (fail-closed).
+ */
+function resolveThroughExistingPrefix(absolutePath: string): string | null {
+  let cur = absolutePath;
+  while (true) {
+    try {
+      lstatSync(cur);
+      break;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return null;
+      cur = parent;
+    }
+  }
+  let real: string;
+  try {
+    real = realpathSync(cur);
+  } catch {
+    return null;
+  }
+  const rest = relative(cur, absolutePath);
+  return rest ? join(real, rest) : real;
+}
+
+/**
+ * Real worktree containment shared by the policy and the relay.
+ * Lexical normalization (`..`, `.`, separators, separator boundary) gates
+ * first, then the longest existing prefix is resolved through realpath so a
+ * symlink escaping the worktree is detected. Brand-new paths inside an
+ * existing worktree resolve through their nearest existing ancestor and
+ * stay inside (pre-authorized allowlist keeps working without asking);
+ * unresolvable paths (broken symlinks, dead roots) return false.
+ */
+export function isPathContainedIn(path: string, worktreePath: string): boolean {
+  if (typeof path !== 'string' || typeof worktreePath !== 'string') return false;
+  if (!path || !worktreePath) return false;
+  let normalizedPath: string;
+  let normalizedWorktree: string;
+  try {
+    normalizedPath = normalizePathForComparison(path);
+    normalizedWorktree = normalizePathForComparison(worktreePath);
+  } catch {
+    return false;
+  }
+  if (!lexicallyInsideWorktree(normalizedPath, normalizedWorktree)) return false;
+  const realPath = resolveThroughExistingPrefix(normalizedPath);
+  const realWorktree = resolveThroughExistingPrefix(normalizedWorktree);
+  if (!realPath || !realWorktree) return false;
+  return lexicallyInsideWorktree(
+    realPath.replace(/\\/g, '/'),
+    realWorktree.replace(/\\/g, '/'),
+  );
+}
+
+function isInsideWorktree(path: string, worktreePath: string): boolean {
+  return isPathContainedIn(path, worktreePath);
 }
 
 function looksLikePackageInstall(input?: string): boolean {

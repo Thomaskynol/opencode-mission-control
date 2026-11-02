@@ -212,7 +212,7 @@ describe('buildQuestionPrompt', () => {
     expect(prompt).toContain('Edit system config');
   });
 
-  it('should include all options', () => {
+  it('should include timeout-deny notice (silence never approves)', () => {
     const context = {
       jobName: 'fix-auth',
       taskSummary: 'Fix the authentication bug',
@@ -222,7 +222,7 @@ describe('buildQuestionPrompt', () => {
 
     expect(prompt).toContain('yes');
     expect(prompt).toContain('no');
-    expect(prompt).toContain('best judgment');
+    expect(prompt).toContain('DENIED on timeout');
   });
 });
 
@@ -410,7 +410,7 @@ describe('QuestionRelay', () => {
       removePendingQuestion('job-vis', 'perm:per-vis-1');
     });
 
-    it('auto-denies publishing escalations on timeout, auto-approves ordinary ones', async () => {
+    it('auto-denies ALL escalations on timeout (R1 fail-closed: silence never approves)', async () => {
       const seen: Array<{ url: string; body: unknown }> = [];
       globalThis.fetch = (async (url: unknown, init?: unknown) => {
         seen.push({ url: String(url), body: (init as { body?: unknown })?.body });
@@ -456,7 +456,8 @@ describe('QuestionRelay', () => {
       await new Promise((r) => setTimeout(r, 60));
       const plainCall = seen.find((s) => s.url.includes('per-plain-1'));
       expect(plainCall).toBeDefined();
-      expect(JSON.stringify(plainCall!.body)).toMatch(/once/);
+      expect(JSON.stringify(plainCall!.body)).toMatch(/reject/);
+      expect(JSON.stringify(plainCall!.body)).not.toMatch(/once/);
       plainRelay.dispose();
     });
   });

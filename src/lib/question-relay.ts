@@ -1,6 +1,6 @@
 import type { Job } from './job-state.js';
 import { createV2Client, v2Prompt, v2ReplyPermission, type V2Client } from './sdk-client.js';
-import { isGitPushText } from './permission-policy.js';
+import { isGitPushText, isPathContainedIn } from './permission-policy.js';
 
 /**
  * Publishing-like permission (push/PR/publish/deploy): must never
@@ -19,21 +19,22 @@ function isPublishingPermissionText(haystack: string): boolean {
   );
 }
 
-function permissionHaystack(p: { action?: string; description: string; target?: string; path?: string }): string {
-  return [p.action, p.description, p.target, p.path].filter((x): x is string => typeof x === 'string').join('\n');
+function permissionHaystack(
+  p: { action?: string; description: string; target?: string; path?: string },
+): string {
+  const parts = [p.action, p.description, p.target, p.path];
+  return parts.filter((x): x is string => typeof x === 'string').join('\n');
 }
 
 /**
- * Per-type timeout policy (G, explicit): publishing, network and unknown
- * NEVER auto-approve — not immediately, not on timeout. They auto-deny on
- * timeout (fail-closed, never authorized by silence) and every timer decision
- * is logged to the audit trail. Ordinary file/shell escalations outside the
- * worktree auto-approve on timeout so independent fronts keep moving.
+ * Fail-closed timeout policy (R1): an escalated ask-user permission NEVER
+ * auto-approves — not immediately, not on timeout, for ANY category. A timer
+ * without a human answer denies, and the decision is logged to the audit
+ * trail. The request stays visible as pending until a human answers; without
+ * an answer it is denied.
  */
-export function neverAutoApprovesOnTimeout(permission: Pick<PermissionRequest, 'type' | 'description' | 'action' | 'target' | 'path'>): boolean {
-  if (isPublishingPermissionText(permissionHaystack(permission as PermissionRequest))) return true;
-  const t = (permission as PermissionRequest).type;
-  return t === 'network' || t === 'other';
+export function neverAutoApprovesOnTimeout(_permission: Pick<PermissionRequest, 'type' | 'description' | 'action' | 'target' | 'path'>): boolean {
+  return true;
 }
 
 /**
@@ -236,12 +237,12 @@ export function buildTaskSummary(prompt: string): string {
 }
 
 /**
- * Check if a path is inside the worktree
+ * Check if a path is inside the worktree (real containment, not a textual
+ * prefix: separator boundary, `..`-safe, symlink-aware, fail-closed when
+ * unresolvable). Shared with the permission policy so both agree.
  */
 export function isPathInsideWorktree(path: string, worktreePath: string): boolean {
-  const normalizedPath = path.replace(/\\/g, '/');
-  const normalizedWorktree = worktreePath.replace(/\\/g, '/');
-  return normalizedPath.startsWith(normalizedWorktree);
+  return isPathContainedIn(path, worktreePath);
 }
 
 /**
@@ -254,7 +255,13 @@ export function shouldAutoApprove(
   // Publishing actions never auto-approve, even inside the worktree.
   // Without this, a policy `ask-user` for `git push` inside the worktree
   // would be re-approved here and push without the operator.
-  if (isPublishingPermissionText(permissionHaystack(permission))) {
+  // Mirrors `requiresHumanAuth` exactly: file_operation is never a
+  // publishing action, so editing e.g. `deploy.sh` (or a deploy-flavored
+  // description) inside the worktree stays auto-approved.
+  if (
+    permission.type !== 'file_operation' &&
+    isPublishingPermissionText(permissionHaystack(permission))
+  ) {
     return {
       approved: false,
       autoApproved: false,
@@ -350,10 +357,9 @@ export function buildQuestionPrompt(context: QuestionContext): string {
   parts.push('  - Reply "yes" to approve');
   parts.push('  - Reply "no" to deny');
   parts.push('  - Reply with specific instructions');
-  // G: per-type timeout explicit (implemented, not just advertised):
-  // ordinary file/shell escalations auto-approve after timeout;
-  // publishing/network/unknown NEVER auto-approve (auto-deny, explicit human required).
-  parts.push('  - Let it decide: use its best judgment (ordinary file/shell auto-approve after timeout; publishing/network/unknown auto-deny, explicit human required)');
+  // R1 fail-closed: silence never approves. The request stays visible as
+  // pending until a human answers; without an answer it is DENIED on timeout.
+  parts.push('  - If you do not answer, the request is DENIED on timeout (silence never approves)');
 
   return parts.join('\n');
 }
@@ -397,9 +403,9 @@ export class QuestionRelay {
    * missed). Ask-user requests are now visible as pending questions
    * (memory + durable sidecar → `mc_overview`, dashboard `questions`,
    * TUI `questions`/`follow`) and keep the worker unblocked via the
-   * auto-response timeout. Publishing/network/unknown escalations auto-deny
-   * on timeout instead of approving, so a push/fetch/publish can never be
-   * authorized by silence. Every timer decision is logged to the audit trail.
+   * auto-response timeout. R1 fail-closed: the timeout DENIES for every
+   * category — silence can never authorize a push, a file write, or anything
+   * else. Every timer decision is logged to the audit trail.
    */
   async handlePermissionRequest(
     job: Job,
@@ -455,11 +461,9 @@ export class QuestionRelay {
     }
 
     if (job.port && job.remoteSessionID) {
-      // G: per-type timeout explicit — publishing/network/unknown NEVER
-      // auto-approve (auto-deny on timeout). Ordinary file/shell outside
-      // escalations auto-approve so independent fronts keep moving.
-      const denyByTimeout = neverAutoApprovesOnTimeout(permission);
-      this.setupAutoResponse(job, permission, !denyByTimeout);
+      // R1 fail-closed: the timeout DENIES for every category. The request
+      // stays visible as pending until a human answers; denial is explicit.
+      this.setupAutoResponse(job, permission);
     } else {
       console.warn(`[QuestionRelay] Cannot escalate permission for job ${job.name}: missing serve port or remote session.`);
     }
@@ -482,13 +486,12 @@ export class QuestionRelay {
   }
 
   /**
-   * Set up automatic response after timeout.
-   * Per-type explicit (G): publishing/network/unknown auto-deny (never
-   * approve by silence); ordinary file/shell escalations approve with the
-   * default response so independent fronts keep moving. Every timer decision
-   * is logged to the audit trail (plan auditLog best-effort + console).
+   * Set up automatic denial on timeout (R1 fail-closed).
+   * Silence NEVER approves: without a human answer the timer replies
+   * `reject`, removes the pending question (memory + sidecar) and logs the
+   * decision to the audit trail (plan auditLog best-effort + console).
    */
-  private setupAutoResponse(job: Job, permission: PermissionRequest | string, autoApprove = true): void {
+  private setupAutoResponse(job: Job, permission: PermissionRequest | string): void {
     const permissionId = typeof permission === 'string' ? permission : permission.id;
     const permissionType = typeof permission === 'string' ? 'unknown' : (permission as PermissionRequest).type;
     const permissionDesc = typeof permission === 'string' ? permissionId : (permission as PermissionRequest).description;
@@ -498,23 +501,20 @@ export class QuestionRelay {
       clearTimeout(this.pendingResponses.get(existingKey)!);
     }
 
-    // Set new timeout (per-type explicit: denyByTimeout already decided by caller)
+    // Set new timeout (R1: deny unconditionally — never approve by silence)
     const timeoutId = setTimeout(async () => {
-      const decision = autoApprove ? 'approved' : 'denied';
-      const detail = autoApprove
-        ? this.config.defaultResponse
-        : `Denied by policy (${permissionType}): publishing/network/unknown require explicit human authorization`;
+      const detail = `Denied by policy (${permissionType}): escalated permissions require explicit human authorization — silence never approves`;
       try {
         if (job.port && job.remoteSessionID) {
           await this.replyToPermission(
             this.getClient(job.port),
             job.remoteSessionID,
             permissionId,
-            autoApprove,
+            false,
             detail,
           );
         }
-        console.log(`[QuestionRelay] Auto-${decision} permission ${permissionId} for job ${job.id} [type=${permissionType}] — ${detail}`);
+        console.log(`[QuestionRelay] Auto-denied permission ${permissionId} for job ${job.id} [type=${permissionType}] — ${detail}`);
       } catch (error) {
         console.error(`[QuestionRelay] Failed to auto-respond for job ${job.id}:`, error);
       } finally {
@@ -533,7 +533,7 @@ export class QuestionRelay {
             const plan = await loadPlan().catch(() => null);
             if (plan && plan.id === planId) {
               const entry = {
-                action: `permission-timeout-${decision}`,
+                action: 'permission-timeout-denied',
                 jobName: job.name,
                 at: new Date().toISOString(),
                 detail: `${permissionId} [${permissionType}] ${permissionDesc} — ${detail}`,
