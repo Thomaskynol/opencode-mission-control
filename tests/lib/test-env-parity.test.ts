@@ -102,4 +102,42 @@ describe('test-env parity (F)', () => {
     expect(isExternalMissingModule(`Error: Cannot find module 'fake-dep-xyz'`)).toBe(true);
     expect(ENV_UNPREPARED).toMatch(/ENV-UNPREPARED/);
   });
+
+  it('bun bare missing package is env-failure (Cannot find package)', async () => {
+    const { isExternalMissingModule } = await import('../../src/lib/test-env');
+    // Exact Bun v1.3 output captured with real bun (bare specifier, import/require/bun test):
+    //   error: Cannot find package 'totally-missing-pkg-xyz' from '/tmp/.../t-bare.ts'
+    expect(isExternalMissingModule(`error: Cannot find package 'totally-missing-pkg-xyz' from '/tmp/x/t-bare.ts'`)).toBe(true);
+    expect(isExternalMissingModule(`Cannot find package 'totally-missing-pkg-xyz' from '/tmp/x/t-bare.ts'`)).toBe(true);
+    expect(isExternalMissingModule(`error: Cannot find package "totally-missing-pkg-xyz" from '/tmp/x/t-bare.ts'`)).toBe(true);
+  });
+
+  it('bun bare missing package converts to env-failure (both call sites gate on it)', async () => {
+    const fs = require('fs') as typeof import('fs');
+    const dir = join(base, `f-bun-bare-${Math.random().toString(36).slice(2, 7)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    // No lockfile, no declared deps, no node_modules: the undeclared bare dep
+    // surfaces AFTER the run in Bun's own wording (captured with real bun):
+    //   error: Cannot find package 'totally-missing-pkg-xyz' from '.../t-bare.ts'
+    fs.writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'f-bun-bare' }, null, 2));
+    fs.writeFileSync(join(dir, 't-bare.ts'), `import 'totally-missing-pkg-xyz';\nconsole.log('unreached');\n`);
+    fs.writeFileSync(join(dir, '.gitignore'), `node_modules/\n`);
+    execSync(`git init -q . && git config user.email t@t.t && git config user.name t && git add package.json t-bare.ts .gitignore && git commit -qm fixture`, { cwd: dir });
+    const head = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
+    const { runTestsOnImmutableSnapshot } = await import('../../src/lib/candidate-identity');
+    const ls = await Bun.$`git -C ${dir} ls-files`.text();
+    const tracked = new Set(ls.split('\n').map((s: string) => s.trim()).filter(Boolean));
+    const r = await runTestsOnImmutableSnapshot({ dir, scopePaths: ['package.json', 't-bare.ts'], testCommand: 'bun t-bare.ts', timeoutMs: 60000, jobHead: head, isTracked: (rel: string) => tracked.has(rel) });
+    expect(r.success).toBe(false);
+    expect(r.output).toMatch(/ENV-UNPREPARED/);
+    expect(r.output).toMatch(/Cannot find package 'totally-missing-pkg-xyz'/);
+  });
+
+  it('bun relative missing module stays test failure, never env-failure', async () => {
+    const { isExternalMissingModule } = await import('../../src/lib/test-env');
+    // Exact Bun v1.3 output captured with real bun (relative specifier):
+    //   error: Cannot find module './missing-relative-file' from '/tmp/.../t-rel.ts'
+    expect(isExternalMissingModule(`error: Cannot find module './missing-relative-file' from '/tmp/x/t-rel.ts'`)).toBe(false);
+    expect(isExternalMissingModule(`error: Cannot find module '../missing-relative-file' from '/tmp/x/t-rel.ts'`)).toBe(false);
+  });
 });
