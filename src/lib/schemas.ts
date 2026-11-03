@@ -133,6 +133,16 @@ export const JobSpecSchema = z.object({
   // Never logged or embedded in prompts.
   serverPassword: z.string().optional(),
   permissionPolicy: PermissionPolicySchema.optional(),
+  // Lane docs2: version-bound operator accept (see plan-types JobSpec.reviewApproval).
+  reviewApproval: z
+    .object({
+      reviewedCommit: z.string(),
+      reviewedBase: z.string(),
+      reason: z.string(),
+      at: z.string(),
+      kind: z.enum(['accept']),
+    })
+    .optional(),
 });
 
 export const FailureKindSchema = z.enum(['touchset', 'merge_conflict', 'test_failure', 'job_failed']);

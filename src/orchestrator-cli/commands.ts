@@ -5,7 +5,7 @@ import { formatReportLine } from '../lib/reports';
 import { mc_attach } from '../tools/attach';
 import { getDashboard, queryTask, readLatestReport } from './coordinator-client';
 import { listPersistedQuestions, renderQuestionForm } from './forms';
-import { applyModelPlan, approveIntake, closeFollow, complementIntake, resumeIntake, splitCommandArgs, startIntake, type AutoCommandDeps } from './auto-commands';
+import { applyModelPlan, approveIntake, closeFollow, complementIntake, resumeIntake, splitCommandArgs, startIntake, touchsetIntake, type AutoCommandDeps } from './auto-commands';
 
 /**
  * M6 human lane: conversational dispatcher for the separate human TUI.
@@ -28,7 +28,8 @@ export const HELP = [
   '  start <request> [--repo R] [--branch B] [--max-parallel N] [--allow-test-env] — capture NL-only intake, persist it, print the planner prompt (legacy two-step)',
   '  complement [--intake ID] <text> — extend the persisted request (same work continues). One-shot: returns after recording/revising; never starts a second driver',
   '  resume [--intake ID] [--allow-test-env] — retake without new JSON (no duplicated workers, no reintegration). Stays as coordinator while driving an active plan; returns immediately when paused (approve to continue)',
-  '  approve [--intake ID] [--retry <job> | --relaunch <job>] [--takeover] [--allow-test-env] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume. One-shot: applies the decision then returns (the live coordinator picks it up). Without --takeover a live conductor lease blocks fail-closed; --takeover assumes ownership explicitly (epoch bump + audit, never manual rm)',
+  '  approve [--intake ID] [--retry <job> | --relaunch <job>] [--takeover] [--allow-test-env] — clear an on_error/supervisor pause (same validation as mc_plan_approve), then resume. A plain accept of a review block is pinned to the reviewed version (job commit + base) and honored once while the pins match. One-shot: applies the decision then returns (the live coordinator picks it up). Without --takeover a live conductor lease blocks fail-closed; --takeover assumes ownership explicitly (epoch bump + audit, never manual rm)',
+  '  touchset [--intake ID] [--takeover] <job> <pattern...> — edit a job scope (widen/narrow) on the public path; pause/checkpoint preserved, then approve --retry/--relaunch. Refuses overlap without dependsOn, incoherence with acceptance refs, and frozen (merging/merged) jobs',
   '  auto-plan --intake ID --plan-file F — advanced diagnostic only, never required for start',
   '  close                 — detach this view; coordinator/reconciler/monitor keep conducting, recording continues (close never stops work)',
   '  send <request>        — wrap a large request with coordinator guards, ready to dispatch',
@@ -211,6 +212,10 @@ async function dispatchTokens(
 
     case 'approve': {
       return approveIntake(rest, autoDeps);
+    }
+
+    case 'touchset': {
+      return touchsetIntake(rest);
     }
 
     case 'cancel': {

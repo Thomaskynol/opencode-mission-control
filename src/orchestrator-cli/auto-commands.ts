@@ -1165,7 +1165,10 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         const ctx = plan.checkpointContext;
         if (ctx?.failureKind === 'touchset' && ctx.jobName === retry) {
           if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
-            const validation = await validateTouchSet(job.branch, plan.integrationBranch, job.touchSet);
+            // Lane docs2: validate in the intake's repo — the process cwd is the
+            // launcher directory, not the mission repo, so omitting cwd diffs
+            // the wrong tree (fail-closed the wrong way: unknown branches).
+            const validation = await validateTouchSet(job.branch, plan.integrationBranch, job.touchSet, { cwd: repoRoot });
             if (!validation.valid && validation.violations) {
               throw new Error(
                 `Job "${retry}" still has touchSet violations after manual fix:\n` +
@@ -1225,10 +1228,38 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
           job.error = undefined;
         }
       }
+      // Lane docs2: explicit accept of a review (test_failure) checkpoint is
+      // recorded as a VERSION-BOUND approval (job commit + integration base),
+      // persisted in the plan so it survives resume. The review gate honors
+      // it once while the pins match; any new commit or base move re-reviews
+      // (never a blanket authorization). Jobs without a branch keep the
+      // legacy behavior (pause cleared, no approval bound).
+      let acceptRecorded: { job: string; commit: string; base: string } | null = null;
+      if (ctx?.failureKind === 'test_failure' && ctx.jobName) {
+        const job = plan.jobs.find((j) => j.name === ctx.jobName);
+        if (job && job.status === 'failed' && job.branch) {
+          const approval = await bindReviewApproval(
+            job.branch,
+            plan.integrationBranch,
+            repoRoot,
+            `operator accept of on_error checkpoint for "${job.name}"`,
+          );
+          job.reviewApproval = approval;
+          job.status = 'ready_to_merge';
+          job.error = undefined;
+          acceptRecorded = { job: job.name, commit: approval.reviewedCommit, base: approval.reviewedBase };
+        }
+      }
       plan.status = 'running';
       plan.checkpoint = null;
       plan.checkpointContext = null;
       await savePlan(plan, repoRoot, approveFencing);
+      if (acceptRecorded) {
+        await appendAutoDecision(
+          record.id,
+          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — re-review honored while pins match, any new commit/base re-reviews`,
+        ).catch(() => {});
+      }
       const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
         import('../lib/orchestrator'),
         import('../lib/monitor'),
@@ -1319,6 +1350,129 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       `  Jobs: ${plan.jobs.length}`,
       '',
       'Use follow to monitor progress.',
+    ].join('\n');
+  });
+}
+
+/**
+ * Lane docs2: pin an operator accept to the exact reviewed version.
+ * Resolves the job branch HEAD and the integration base HEAD in the mission
+ * repo — never the launcher cwd. Fail-closed: an unresolvable ref refuses
+ * the accept explicitly instead of recording a dangling approval.
+ */
+export async function bindReviewApproval(
+  jobBranch: string,
+  integrationBranch: string,
+  repoRoot: string,
+  reason: string,
+): Promise<{ reviewedCommit: string; reviewedBase: string; reason: string; at: string; kind: 'accept' }> {
+  const { gitCommand } = await import('../lib/git');
+  const jobHead = await gitCommand(['rev-parse', jobBranch], { cwd: repoRoot });
+  if (jobHead.exitCode !== 0 || !jobHead.stdout.trim()) {
+    throw new Error(
+      `Cannot bind accept: cannot resolve job branch "${jobBranch}" in ${repoRoot} (${(jobHead.stderr || 'unknown').slice(0, 200)}) — fix the branch and retry`,
+    );
+  }
+  const baseHead = await gitCommand(['rev-parse', integrationBranch], { cwd: repoRoot });
+  if (baseHead.exitCode !== 0 || !baseHead.stdout.trim()) {
+    throw new Error(
+      `Cannot bind accept: cannot resolve integration branch "${integrationBranch}" in ${repoRoot} (${(baseHead.stderr || 'unknown').slice(0, 200)}) — fix the branch and retry`,
+    );
+  }
+  return {
+    reviewedCommit: jobHead.stdout.trim(),
+    reviewedBase: baseHead.stdout.trim(),
+    reason,
+    at: new Date().toISOString(),
+    kind: 'accept',
+  };
+}
+
+/**
+ * `touchset [--intake ID] [--takeover] <job> <pattern...>` — edit a job's
+ * writable scope on the public path (the missing "amplie o touchSet" from the
+ * docs-deadlock diagnosis: complement refuses on a paused plan and no other
+ * verb edits touchSet). Pause/checkpoint are preserved: after widening, the
+ * operator retries via `approve --retry <job>` (re-validated) or
+ * `approve --relaunch <job>`. Fail-closed: unknown job, frozen
+ * (merging/merged) job, empty/absolute/escaping patterns, sibling overlap
+ * without a dependsOn link, or narrowing below the acceptance file refs all
+ * refuse explicitly. Audited via intake decisions.
+ */
+export async function touchsetIntake(args: string[]): Promise<string> {
+  const { positional, flags } = parseFlags(args);
+  const record = await resolveIntake(flags);
+  const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
+  return await withRepoRoot(repoRoot, async () => {
+    const [{ loadPlan, savePlan }, { touchPatternsOverlap }, { validateTaskCoherence }] =
+      await Promise.all([import('../lib/plan-state'), import('../lib/merge-train'), import('../lib/auto-plan')]);
+    const plan = await loadPlan(repoRoot);
+    if (!plan) {
+      throw new Error('No active plan to edit');
+    }
+    const [jobName, ...patterns] = positional;
+    if (!jobName) {
+      throw new Error('Usage: touchset [--intake <id>] [--takeover] <job> <pattern...>');
+    }
+    if (patterns.length === 0) {
+      throw new Error(`Usage: touchset [--intake <id>] [--takeover] ${jobName} <pattern...> (at least one scope pattern)`);
+    }
+    const job = plan.jobs.find((j) => j.name === jobName);
+    if (!job) {
+      throw new Error(`Job "${jobName}" not found in plan`);
+    }
+    if (job.status === 'merging' || job.status === 'merged') {
+      throw new Error(`Job "${jobName}" is ${job.status} — scope is frozen once merging started`);
+    }
+    for (const p of patterns) {
+      const t = p.trim();
+      if (!t) throw new Error('Empty touchSet pattern refused — declare an explicit scope');
+      if (t.startsWith('/') || t.includes('..')) {
+        throw new Error(`Refusing unsafe touchSet pattern "${p}" (absolute or escaping)`);
+      }
+    }
+    // Sibling isolation (same rule as the planner): overlap without a
+    // dependsOn link in either direction refuses — widen with a dependency,
+    // split the scope, or narrow the patterns.
+    for (const other of plan.jobs) {
+      if (other.name === jobName || !other.touchSet?.length) continue;
+      const overlap = patterns.some((p) => other.touchSet!.some((q) => touchPatternsOverlap(p, q)));
+      if (!overlap) continue;
+      const linked =
+        (job.dependsOn ?? []).includes(other.name) || (other.dependsOn ?? []).includes(jobName);
+      if (!linked) {
+        throw new Error(
+          `touchSet overlap refused: [${patterns.join(', ')}] overlaps sibling "${other.name}" [${other.touchSet!.join(', ')}] with no dependsOn link — link via dependsOn, split the scope, or narrow the patterns`,
+        );
+      }
+    }
+    // Coherence: acceptance file refs must stay writable by this job —
+    // narrowing below them would make the plan incoherent (planning rejects
+    // the same shape via validateTaskCoherence).
+    const acceptanceLines = (job.prompt ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => /^-\s*\[\s*\]\s+/.test(l))
+      .map((l) => l.replace(/^-\s*\[\s*\]\s+/, '').trim())
+      .filter((l) => l.length > 0);
+    try {
+      validateTaskCoherence({ name: jobName, acceptance: acceptanceLines, touchSet: patterns });
+    } catch (error) {
+      throw new Error(`Incoherent touchSet: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const fencing = await ensureApproveFencing(plan.id, repoRoot, {
+      ...(flags.has('takeover') ? { takeover: true as const } : {}),
+      command: `touchset ${jobName} ${patterns.join(' ')}`,
+    });
+    job.touchSet = [...patterns];
+    await savePlan(plan, repoRoot, fencing);
+    await appendAutoDecision(
+      record.id,
+      `touchset: "${jobName}" scope now [${patterns.join(', ')}] (edited via public path, pause/checkpoint preserved)`,
+    ).catch(() => {});
+    return [
+      `touchSet of job "${jobName}" updated to [${patterns.join(', ')}] (plan "${plan.name}", pause/checkpoint preserved).`,
+      `Next: approve --retry ${jobName} (re-validates scope) or approve --relaunch ${jobName} (agent fixes within the new scope).`,
     ].join('\n');
   });
 }

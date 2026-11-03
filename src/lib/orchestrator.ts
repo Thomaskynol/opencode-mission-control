@@ -6,7 +6,8 @@ import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit, matchesTouchPattern } from './merge-train';
-import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
+import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, needsReReview, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
+import { isDocsOnlyChange, assessDocsCoverage } from './docs-review';
 import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
 import { runTestsOnImmutableSnapshot } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
@@ -907,6 +908,95 @@ export class Orchestrator {
   }
 
   /**
+   * Lane docs2: docs-only per-task gate. Reached only when every changed file
+   * is documentation (isDocsOnlyChange) — the functional classifier is never
+   * consulted here and its semantics are untouched. Judges each acceptance
+   * criterion against the examined docs content at the job commit
+   * (product-read via `git show`, never worker claims): real content,
+   * required literals, topic keywords and resolvable relative links.
+   * Fail-closed: unreadable content or no acceptance criteria reject without
+   * auto-fix relaunch (a functional correction prompt would be contradictory
+   * for docs) — the operator fixes the docs or adjusts criteria via the
+   * public touchset/approve paths and retries.
+   */
+  private async reviewDocsOnly(
+    job: JobSpec,
+    plan: PlanSpec,
+    pins: { baseHead: string; jobHead: string; changedFiles: string[] },
+  ): Promise<ReviewVerdict> {
+    const fail = (reasons: string[]): ReviewVerdict => ({
+      verdict: 'fail',
+      blocking: true,
+      reasons,
+      jobName: job.name,
+      reviewedCommit: pins.jobHead,
+      reviewedBase: pins.baseHead,
+    });
+    const requirements = requirementsFromAcceptance(job.name, job.prompt ?? '');
+    if (!hasAcceptanceCriteria(job.prompt ?? '')) {
+      return fail([
+        `docs-only task "${job.name}" carries no acceptance criteria — nothing checkable to judge coverage against (add criteria or accept explicitly via approve)`,
+      ]);
+    }
+    const repoRoot = this.effectiveRepoRoot();
+    const contents: Record<string, string> = {};
+    for (const rel of pins.changedFiles.slice(0, 24)) {
+      const safe = rel.replace(/^\/+/, '');
+      if (safe === '' || safe.includes('..')) continue;
+      const shown = await gitCommand(['show', `${pins.jobHead}:${safe}`], { cwd: repoRoot });
+      if (shown.exitCode !== 0) {
+        return fail([
+          `docs-only task "${job.name}": cannot examine "${safe}" at ${pins.jobHead.slice(0, 8)} (${(shown.stderr || 'unreadable').slice(0, 200)}) — fail-closed, never verified by claim`,
+        ]);
+      }
+      contents[rel] = shown.stdout.slice(0, 20000);
+    }
+    const tree = await gitCommand(['ls-tree', '-r', '--name-only', pins.jobHead], { cwd: repoRoot });
+    const existingPaths = tree.exitCode === 0
+      ? tree.stdout.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+      : Object.keys(contents);
+    const reasons: string[] = [];
+    for (const req of requirements) {
+      const assessment = assessDocsCoverage(req, contents, { existingPaths });
+      if (!assessment.covered) reasons.push(assessment.reason);
+    }
+    if (reasons.length > 0) {
+      return fail([
+        ...reasons,
+        'docs-only task: no automatic correction dispatched (a functional fix prompt does not apply to docs) — fix the docs content, adjust criteria, or accept explicitly, then retry',
+      ]);
+    }
+    try {
+      await saveMergeEvidence({
+        jobName: job.name,
+        mergedAt: new Date().toISOString(),
+        reviewedCommit: pins.jobHead,
+        reviewedBase: pins.baseHead,
+        changedFiles: pins.changedFiles,
+        testStatus: 'passed',
+        testOutput: `docs-only verification (no function test demanded): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`,
+        scope: 'task',
+      }).catch(() => {});
+    } catch {}
+    try {
+      const snap = await loadRuntimeSnapshot().catch(() => null);
+      const intakeId = snap?.autoIntake?.id;
+      if (intakeId) {
+        await appendAutoDecision(intakeId, `review ${job.name}: pass (docs-only, criteria verified in docs @ ${pins.jobHead.slice(0, 8)}, no external reviewer demanded)`).catch(() => {});
+      }
+    } catch {}
+    return {
+      verdict: 'pass',
+      blocking: false,
+      reasons: [],
+      jobName: job.name,
+      reviewedCommit: pins.jobHead,
+      reviewedBase: pins.baseHead,
+      audit: ['docs-only task: judged by docs criteria (content, literals, links); functional classifier not applicable'],
+    };
+  }
+
+  /**
    * R01: per-task functional gate on the real approval path. NEVER passes on
    * diff alone: derives requirements from the task's acceptance criteria,
    * inspects implementation + tests, runs task-scoped verification (the test
@@ -959,6 +1049,56 @@ export class Orchestrator {
         reviewedCommit: pins.jobHead,
         reviewedBase: pins.baseHead,
       };
+    }
+    // Lane docs2: explicit operator accept bound to the reviewed version.
+    // Honored WITHOUT re-review while the pins match (same job commit, same
+    // base) — this breaks the accept→re-review→fail loop. Any new commit or
+    // base move invalidates it (fail-closed back to normal review). The touchSet
+    // is still validated below: an accept never authorizes out-of-scope files.
+    const approval = job.reviewApproval;
+    if (approval?.reviewedCommit && approval?.reviewedBase) {
+      if (!needsReReview(approval.reviewedCommit, pins.jobHead) && !needsReReview(approval.reviewedBase, pins.baseHead)) {
+        try {
+          const touchValidation = await validateTouchSet(job.branch ?? '', plan.integrationBranch, job.touchSet ?? [], { cwd: this.effectiveRepoRoot() });
+          if (touchValidation.valid) {
+            try {
+              const snap = await loadRuntimeSnapshot().catch(() => null);
+              const intakeId = snap?.autoIntake?.id;
+              if (intakeId) {
+                await appendAutoDecision(intakeId, `review ${job.name}: pass (operator accept honored for ${pins.jobHead.slice(0, 8)} on base ${pins.baseHead.slice(0, 8)} — version-bound, no re-review)`).catch(() => {});
+              }
+            } catch {}
+            return {
+              verdict: 'pass',
+              blocking: false,
+              reasons: [],
+              jobName: job.name,
+              reviewedCommit: pins.jobHead,
+              reviewedBase: pins.baseHead,
+              audit: [`operator accept honored (${approval.kind} at ${approval.at}: ${approval.reason}) — pins match, touchSet valid`],
+            };
+          }
+        } catch {}
+        // TouchSet invalid under the accept: ignore the approval, normal review decides.
+      } else {
+        // Stale accept (content or base moved): clear it best-effort so the
+        // next pass re-reviews from scratch instead of riding an old decision.
+        try {
+          await updatePlanJob(plan.id, job.name, { reviewApproval: undefined });
+          job.reviewApproval = undefined;
+        } catch {}
+      }
+    }
+    // Lane docs2: docs-only diffs with acceptance criteria are judged by docs
+    // criteria, never by the functional classifier (which demands asserted
+    // implementation calls and rejects `.md` work permanently). Consumes the
+    // functional verdict path without changing its semantics: mixed diffs
+    // still go through it. WITHOUT acceptance criteria the documented
+    // manual-plan fallback below applies instead (scoped test evidence, never
+    // diff alone) — fail-closed here would silently revoke that contract.
+    const acceptanceLessDocs = !hasAcceptanceCriteria(job.prompt ?? '');
+    if (!acceptanceLessDocs && isDocsOnlyChange(pins.changedFiles)) {
+      return this.reviewDocsOnly(job, plan, pins);
     }
     const requirements = requirementsFromAcceptance(job.name, job.prompt ?? '');
     // Manual-plan fallback (documented rule): a prompt WITHOUT `- [ ]`
