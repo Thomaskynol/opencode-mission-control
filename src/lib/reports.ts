@@ -229,6 +229,14 @@ export interface FinalReportProblem {
   solution: string;
 }
 
+/**
+ * Execution environment: USED vs DETECTED (Achado 4 M4). Each line records
+ * what the run effectively used (per-job mode, server-observed model pin,
+ * agent when set) and what was merely detected in config (OMO presence,
+ * default mode) — detection is never presented as use.
+ */
+export type FinalReportEnvironmentLine = string;
+
 export interface FinalReportAttachment {
   name: string;
   content: string;
@@ -264,6 +272,7 @@ export interface FinalReportInput {
   verified?: string[];
   unmet?: string[];
   unverified?: string[];
+  environment?: FinalReportEnvironmentLine[];
   limitations?: string[];
   nextSteps?: string[];
   preservation?: FinalReportPreservation;
@@ -404,6 +413,10 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
       [...(input.unverified ?? []), ...missingGapEntries].map((item) => `Unverified: ${item}`),
       'No unverified items reported',
     ),
+    '',
+    '## Environment (Used vs Detected)',
+    '',
+    ...finalReportLines(input.environment, 'No environment info reported'),
     '',
     '## Limitations & Next Steps',
     '',

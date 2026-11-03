@@ -64,8 +64,11 @@ export function renderQuestionForm(q: PendingQuestion): string {
   }
   if (isPermission) {
     lines.push(
-      `Reply with "approve"/"1" or "deny"/"2".`,
-      `No reply within ${QUESTION_AUTO_RESPONSE_MS / 1000}s → publishing denied by policy, others "${QUESTION_DEFAULT_RESPONSE}".`,
+      `Reply with "approve"/"1" (once) or "deny"/"2" (reject).`,
+      // Fail-closed: the relay timeout DENIES every permission category —
+      // silence never approves. The question-tool path (non-permissions)
+      // is the only one that auto-resolves with best judgment.
+      `No reply within ${QUESTION_AUTO_RESPONSE_MS / 1000}s → DENIED by policy (silence never approves).`,
       `Other jobs keep running meanwhile. Answer via: answer ${q.jobName} <approve|deny>`,
     );
   } else {

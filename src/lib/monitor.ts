@@ -21,7 +21,9 @@ import {
   v2GetForm,
   v2GetSession,
   v2ListForms,
+  v2ListPermissions,
   type V2Client,
+  type V2PermissionRequest,
 } from './sdk-client.js';
 import { loadPlan, isTestEnvPresent } from './plan-state.js';
 import { getXdgDataDir } from './paths.js';
@@ -366,7 +368,12 @@ export class JobMonitor extends EventEmitter {
   /**
    * Backfill from the authoritative v2 surface: pending session forms are
    * questions the agent is waiting on right now (covers restarts where the
-   * `form.created` event fired while we were disconnected).
+   * `form.created` event fired while we were disconnected), and pending
+   * session permissions are escalations the worker is blocked on (covers a
+   * missed `permission.asked` — the SSE stream is volatile by contract, so
+   * without this a blocked worker stays invisible while `questions`/`follow`
+   * show none). Each recovered permission flows through the SAME policy
+   * path as the live event (allowlist auto-approves, the rest escalates).
    */
   private async backfillPendingQuestions(job: Job, client: V2Client): Promise<void> {
     if (!job.remoteSessionID) return;
@@ -379,6 +386,33 @@ export class JobMonitor extends EventEmitter {
     } catch {
       // Non-fatal: backfill failure shouldn't block SSE subscription
     }
+
+    try {
+      const pending = await v2ListPermissions(client, job.remoteSessionID);
+      for (const req of pending) {
+        await this.backfillPermissionRequest(job, req);
+      }
+    } catch {
+      // Non-fatal: live events stay authoritative after this point.
+    }
+  }
+
+  /**
+   * Route one backfilled pending permission through the live-event policy
+   * flow. Dedup is natural: `addPendingQuestion` ignores an already-known
+   * `perm:<id>`, and the sidecar persist is idempotent by `{jobId,partId}`.
+   */
+  private async backfillPermissionRequest(job: Job, req: V2PermissionRequest): Promise<void> {
+    if (!req || typeof req.id !== 'string' || req.id.length === 0) return;
+    await this.handlePermissionUpdate(job, {
+      properties: {
+        id: req.id,
+        type: req.action,
+        path: Array.isArray(req.resources) ? req.resources[0] : undefined,
+        description: req.message ?? req.action,
+        title: req.action,
+      },
+    });
   }
 
   /**
@@ -845,9 +879,15 @@ export class JobMonitor extends EventEmitter {
   }
 
   private async handlePermissionUpdate(job: Job, event: any): Promise<void> {
+    // Fail-closed: the permission is built BEFORE policy resolution so a
+    // policy/load failure below can still escalate it (never silently drop
+    // a worker blocked on approval).
+    let permission: PermissionRequest | undefined;
+    let currentFile: string | undefined;
     try {
-      const permission = this.buildPermissionRequest(event);
+      permission = this.buildPermissionRequest(event);
       const accumulator = this.getOrCreateEventAccumulator(job.id);
+      currentFile = accumulator.currentFile;
       const policy = await this.resolvePolicyForJob(job);
       const decision = policy.evaluate(permission, { worktreePath: job.worktreePath });
       const decisionLog = policy.getDecisionLog();
@@ -865,8 +905,18 @@ export class JobMonitor extends EventEmitter {
         return;
       }
 
-      await this.questionRelay.handlePermissionRequest(job, permission, accumulator.currentFile, decision);
+      await this.questionRelay.handlePermissionRequest(job, permission, currentFile, decision);
     } catch (error) {
+      if (permission) {
+        // Policy/load/reply failure: escalate as ask-user (ceiling — never
+        // auto-approve) so the blocked worker stays operator-visible
+        // instead of vanishing from `questions`/`follow`.
+        try {
+          await this.questionRelay.handlePermissionRequest(job, permission, currentFile, 'ask-user');
+        } catch (inner) {
+          console.error(`[Monitor] Failed to escalate permission for job ${job.name}:`, inner);
+        }
+      }
       console.error(`[Monitor] Failed to process permission update for job ${job.name}:`, error);
     }
   }

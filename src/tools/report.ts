@@ -169,7 +169,9 @@ export const mc_report_final: ToolDefinition = tool({
       ...integrationCovered.map((entry) => `${entry}`),
       ...pendingGaps,
     ];
-    const notes = args.notes?.trim() ? [args.notes.trim()] : [];
+    // Operator notes are labeled as such under Real Evidence — they are
+    // human claims, never automatic product evidence.
+    const notes = args.notes?.trim() ? [`Operator note: ${args.notes.trim()}`] : [];
     const files = [...new Set(evidenceRecs.flatMap((r) => (r as { changedFiles?: string[] }).changedFiles ?? []))];
     const installUsage = [...new Set(evidenceRecs.flatMap((r) => {
       const rec = r as { setupCommands?: string[]; testCommand?: string };
@@ -188,12 +190,36 @@ export const mc_report_final: ToolDefinition = tool({
     // already names merged jobs without mc_report under Per-Instance
     // Contributions and Gaps.
     let omoLine = 'Limitation: OMO status unknown — vanilla execution only.';
+    let omoEnv = 'OMO status unknown — vanilla execution only (detection is not use).';
     try {
       const omo = await detectOMO().catch(() => null);
-      if (omo) omoLine = describeOmoLimitation(omo.detected, omo.configSource ?? undefined);
+      if (omo) {
+        omoLine = describeOmoLimitation(omo.detected, omo.configSource ?? undefined);
+        const modesUsed = [...new Set(state.jobs.map((j) => j.mode))];
+        omoEnv = omo.detected
+          ? `OMO detected (${omo.configSource ?? 'unknown'} config) — NOT used: effective modes this run: ${modesUsed.join(', ') || 'none'}; detection is not use.`
+          : `OMO not detected — vanilla execution only (effective modes: ${modesUsed.join(', ') || 'none'}).`;
+      }
     } catch {
       // Best-effort: the unknown-status line above already fails closed.
     }
+
+    // Used vs detected, from the records the run wrote (jobs.json pins are
+    // server-observed, never config claims): per-job effective mode, agent
+    // when set, and requested/observed model triple (variant preserved).
+    const environment: string[] = [
+      ...state.jobs.map((job) => {
+        const agent = (job as { agent?: string }).agent;
+        const req = job.modelRequested
+          ? `${job.modelRequested.providerID}/${job.modelRequested.id}${job.modelRequested.variant ? `#${job.modelRequested.variant}` : ''}`
+          : 'none';
+        const obs = job.modelObserved
+          ? `${job.modelObserved.providerID}/${job.modelObserved.id}${job.modelObserved.variant ? `#${job.modelObserved.variant}` : ''} (server-observed, used)`
+          : 'none (unpinned/TUI path)';
+        return `${job.name} [mode ${job.mode}, agent ${agent ?? 'unset'}] requested ${req} / observed ${obs}${job.remoteSessionID ? ` session ${job.remoteSessionID}` : ''}`;
+      }),
+      omoEnv,
+    ];
 
     const markdown = buildFinalReportMarkdown({
       title: plan.name,
@@ -232,6 +258,7 @@ export const mc_report_final: ToolDefinition = tool({
       verified,
       unmet,
       unverified,
+      environment,
       limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine],
       nextSteps: unverified.length > 0 || unmet.length > 0
         ? ['Resolve the Gaps above, then re-run this report']
