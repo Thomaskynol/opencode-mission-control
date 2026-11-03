@@ -889,20 +889,16 @@ Usually no. Put it in `opencode.json` and let OpenCode handle plugin installatio
 
 ## Release & npm Deploy
 
-This repo uses semantic versioning with **semantic-release** for automated npm releases.
+Automatic publishing is **disabled in this fork**: the `Publish to npm`
+workflow (`.github/workflows/publish.yml`) was removed, so pushes to `main`
+only run build + tests (CI) and never publish to npm or create releases.
 
-How it works:
+If a release is ever needed, it is a deliberate manual action
+(`bunx semantic-release` with an explicit `NPM_TOKEN`), never an automatic
+side effect of merging. No publish token is configured in this fork.
 
-1. Merge a Conventional Commit into `main` (for example: `feat:`, `fix:`, or `BREAKING CHANGE:`).
-2. GitHub Actions runs build + tests.
-3. `semantic-release` calculates the next version, publishes to npm, creates a GitHub Release, and tags automatically.
-
-Expected repository secrets:
-
-- `NPM_TOKEN` — npm publish token with package publish rights.
-- `GITHUB_TOKEN` — provided automatically by GitHub Actions.
-
-If your commit messages are vague, semantic-release gets moody.
+The upstream project this fork derives from uses semantic-release for
+automated npm releases; that behavior intentionally does not apply here.
 
 ---
 

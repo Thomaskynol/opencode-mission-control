@@ -49,7 +49,9 @@ If tests fail, identify whether failures are pre-existing vs introduced by your 
 - **CI** (`.github/workflows/ci.yml`) — Runs `bun run build` and `bun test` on PRs and pushes to `main`.
 - **Conventional Commits** (`.github/workflows/conventional-commits.yml`) — Validates PR titles follow the convention.
 - **CodeQL** (`.github/workflows/codeql.yml`) — Static analysis for TypeScript; runs on PRs, pushes to `main`, and weekly.
-- **Publish** (`.github/workflows/publish.yml`) — semantic-release to npm on `main`.
+- **Publish** — removed in this fork. There is no `.github/workflows/publish.yml`;
+  pushes to `main` run only CI (build + tests) and never publish to npm.
+  A release, if ever needed, is a deliberate manual action, not automation.
 - **Renovate** (`renovate.json`) — Automated dependency updates via the Renovate GitHub App. Groups non-major npm updates, creates separate PRs for majors, and auto-merges minor/patch. Uses `chore(deps):` and `ci(deps):` commit prefixes.
 
 ## Branch & Merge Rules
@@ -62,8 +64,9 @@ If tests fail, identify whether failures are pre-existing vs introduced by your 
 ## Release Notes for Agents
 
 - npm package output is `dist/` only (`package.json -> files`).
-- Automated release path is semantic-release via `.github/workflows/publish.yml` on `main`.
-- Required secret for release workflow: `NPM_TOKEN`.
+- Automated release path: none in this fork (publish workflow removed; manual
+  `bunx semantic-release` only, with an explicit token, if a release is ever needed).
+- No publish token is configured; do not add one without the user's explicit instruction.
 - Use Conventional Commits (`feat:`, `fix:`, `perf:`, `chore:`) so semantic versioning can compute releases.
 
 ## Collaboration Norms
