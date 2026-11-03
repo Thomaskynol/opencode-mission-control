@@ -40,6 +40,7 @@ export const HELP = [
   '  cancel <name>         — stop the process, preserve the code (discard only via mc_cleanup)',
   '  answer <name> <text>  — reply to a pending question (others keep running)',
   '  questions             — list pending questions as respondable forms',
+  '  report [--notes T] [--no-attachments] — emit the standardized final mission report (real state, gaps explicit)',
   '  order                 — preview dispatch order (priority lives in the plan lane)',
   '  session <name>        — read-only session access (does not drive the worker)',
   '  log <name>            — last milestone line (no raw log dump)',
@@ -80,7 +81,7 @@ export async function listQuestionForms(): Promise<string> {
     lines.push(renderQuestionForm(q), '');
   }
   if (lines.length === 0) {
-    return 'No pending questions. Workers continue; unanswered essentials auto-resolve with best judgment.';
+    return 'No pending questions. Ordinary questions auto-resolve with best judgment while workers continue; permission escalations are DENIED on timeout (silence never approves).';
   }
   return lines.join('\n');
 }
@@ -227,6 +228,27 @@ async function dispatchTokens(
 
     case 'questions':
       return listQuestionForms();
+
+    case 'report': {
+      // mc_report_final via the public conversational path (pendência 3 M4):
+      // same builder the MCP tool uses — real plan/job/report state, gaps
+      // explicit, operator text labeled as a note (never automatic evidence).
+      const noAttachments = rest.includes('--no-attachments');
+      const noteIndex = rest.findIndex((w) => w === '--notes');
+      const notes =
+        noteIndex >= 0
+          ? rest
+            .slice(noteIndex + 1)
+            .filter((w) => w !== '--no-attachments')
+            .join(' ')
+            .trim() || undefined
+          : undefined;
+      const { mc_report_final } = await import('../tools/report');
+      return mc_report_final.execute({
+        ...(notes ? { notes } : {}),
+        ...(noAttachments ? { includeAttachments: false } : {}),
+      });
+    }
 
     case 'order':
       return previewOrder();
