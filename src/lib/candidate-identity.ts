@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
-import { chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { isAbsolute, join } from 'path';
+import { dirname, isAbsolute, join, resolve } from 'path';
 import type { EnvPreparation } from './test-env.js';
 
 /**
@@ -182,6 +182,36 @@ function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+interface ResolvedFile {
+  bytes: Buffer;
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
+}
+
+/**
+ * P3: bytes effectively executed through a symlink (null when the target is
+ * not a readable regular file — dangling, dir, loop, permission). Callers
+ * fall back to the target-string identity in that case (a dangling link
+ * cannot execute bytes; a swapped target still changes link ctime).
+ */
+function readResolvedFile(absLink: string, target: string): ResolvedFile | null {
+  try {
+    const real = realpathSync(resolve(dirname(absLink), target));
+    const rst = lstatSync(real);
+    if (!rst.isFile()) return null;
+    const bytes = readFileSync(real);
+    return {
+      bytes,
+      mtimeMs: rst.mtimeMs,
+      ctimeMs: typeof rst.ctimeMs === 'number' ? rst.ctimeMs : -1,
+      size: rst.size,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function snapshotOne(dir: string, rel: string): { identity: FileIdentity; mode: number } {
   const missing: FileIdentity = { hash: '', mtimeMs: 0, size: -1, exists: false };
   try {
@@ -192,6 +222,15 @@ function snapshotOne(dir: string, rel: string): { identity: FileIdentity; mode: 
         target = readlinkSync(join(dir, rel));
       } catch {
         return { identity: missing, mode: 0 };
+      }
+      // P3: bind the bytes effectively executed, not just the target string —
+      // a write through the link into external bytes must change the identity.
+      const eff = readResolvedFile(join(dir, rel), target);
+      if (eff) {
+        return {
+          identity: { hash: sha256Hex(Buffer.concat([Buffer.from(`symlink:${target}\0`), eff.bytes])), mtimeMs: eff.mtimeMs, size: eff.size, exists: true },
+          mode: st.mode & 0o777,
+        };
       }
       return {
         identity: { hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, size: st.size, exists: true },
@@ -384,6 +423,16 @@ function snapshotStrict(dir: string, rel: string): StrictSnapshot {
       } catch {
         return missing;
       }
+      // P3: bind the bytes effectively executed (see snapshotOne). ctime is
+      // the max of link and target: replacing the link or writing the target
+      // both bump it, so a forged-mtime restore still differs.
+      const eff = readResolvedFile(join(dir, rel), target);
+      if (eff) {
+        return {
+          identity: { hash: sha256Hex(Buffer.concat([Buffer.from(`symlink:${target}\0`), eff.bytes])), mtimeMs: eff.mtimeMs, size: eff.size, exists: true },
+          ctimeMs: Math.max(typeof st.ctimeMs === 'number' ? st.ctimeMs : -1, eff.ctimeMs),
+        };
+      }
       return {
         identity: { hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, size: st.size, exists: true },
         ctimeMs: typeof st.ctimeMs === 'number' ? st.ctimeMs : -1,
@@ -452,6 +501,133 @@ interface DepEntry {
   mtimeMs: number;
   ctimeMs: number;
   size: number;
+  /** Absolute real path the link resolves to ('' when dangling/unreadable). */
+  resolved?: string;
+  /** Content fingerprint of the resolved file: the bytes effectively executed. */
+  targetHash?: string;
+  targetMtimeMs?: number;
+  targetCtimeMs?: number;
+  targetSize?: number;
+}
+
+/** Cap on files enumerated through a single dir link (absurd-tree guard). */
+const MAX_DEP_LINK_FILES = 4000;
+
+/**
+ * P3: record one symlink's effective bytes. File targets bind content bytes
+ * (+target times, so a forged-mtime restore still differs via target ctime).
+ * Dir targets enumerate effective files under the link path (cycle-guarded,
+ * capped) so a write through the link — inside or outside the tree — changes
+ * the tree even when the link string itself is untouched.
+ */
+function recordDepLink(
+  out: Map<string, DepEntry>,
+  absLink: string,
+  rel: string,
+  seen: Set<string>,
+  counter: { n: number },
+): void {
+  let target = '';
+  try {
+    target = readlinkSync(absLink);
+  } catch {
+    out.set(rel, { kind: 'link', hash: sha256Hex(Buffer.from('symlink:')), mtimeMs: 0, ctimeMs: -1, size: -1, resolved: '' });
+    return;
+  }
+  let st;
+  try {
+    st = lstatSync(absLink);
+  } catch {
+    return;
+  }
+  const ctimeMs = typeof st.ctimeMs === 'number' ? st.ctimeMs : -1;
+  const entry: DepEntry = {
+    kind: 'link',
+    hash: sha256Hex(Buffer.from(`symlink:${target}`)),
+    mtimeMs: st.mtimeMs,
+    ctimeMs,
+    size: st.size,
+  };
+  let real = '';
+  try {
+    real = realpathSync(resolve(dirname(absLink), target));
+    entry.resolved = real;
+  } catch {
+    entry.resolved = '';
+    out.set(rel, entry);
+    return;
+  }
+  let rst;
+  try {
+    rst = lstatSync(real);
+  } catch {
+    entry.resolved = '';
+    out.set(rel, entry);
+    return;
+  }
+  if (rst.isFile()) {
+    try {
+      const bytes = readFileSync(real);
+      entry.targetHash = sha256Hex(bytes);
+      entry.targetMtimeMs = rst.mtimeMs;
+      entry.targetCtimeMs = typeof rst.ctimeMs === 'number' ? rst.ctimeMs : -1;
+      entry.targetSize = rst.size;
+    } catch {
+      entry.resolved = '';
+    }
+    out.set(rel, entry);
+    return;
+  }
+  out.set(rel, entry);
+  if (!rst.isDirectory()) return;
+  collectDepDir(out, real, rel, seen, counter);
+}
+
+function collectDepDir(
+  out: Map<string, DepEntry>,
+  absDir: string,
+  prefix: string,
+  seen: Set<string>,
+  counter: { n: number },
+): void {
+  let real: string;
+  try {
+    real = realpathSync(absDir);
+  } catch {
+    return;
+  }
+  if (seen.has(real)) return;
+  seen.add(real);
+  let dirents: Array<{ name: string }>;
+  try {
+    dirents = readdirSync(absDir, { withFileTypes: true }) as Array<{ name: string }>;
+  } catch {
+    return;
+  }
+  for (const d of dirents) {
+    if (counter.n > MAX_DEP_LINK_FILES) {
+      out.set(`${prefix}/…truncated`, { kind: 'other', hash: `truncated:${counter.n}`, mtimeMs: 0, ctimeMs: -1, size: counter.n });
+      return;
+    }
+    const sub = `${prefix}/${d.name}`;
+    const full = join(absDir, d.name);
+    try {
+      const st = lstatSync(full);
+      const ctimeMs = typeof st.ctimeMs === 'number' ? st.ctimeMs : -1;
+      if (st.isSymbolicLink()) {
+        recordDepLink(out, full, sub, seen, counter);
+      } else if (st.isDirectory()) {
+        collectDepDir(out, full, sub, seen, counter);
+      } else if (st.isFile()) {
+        counter.n += 1;
+        out.set(sub, { kind: 'file', hash: sha256Hex(readFileSync(full)), mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+      } else {
+        out.set(sub, { kind: 'other', hash: '', mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+      }
+    } catch {
+      // Unreadable entry: skip (absence/change surfaces via the rest).
+    }
+  }
 }
 
 /**
@@ -499,11 +675,9 @@ function snapshotDepTree(dir: string): Map<string, DepEntry> {
         const st = lstatSync(f);
         const ctimeMs = typeof st.ctimeMs === 'number' ? st.ctimeMs : -1;
         if (st.isSymbolicLink()) {
-          let target = '';
-          try {
-            target = readlinkSync(f);
-          } catch {}
-          out.set(r, { kind: 'link', hash: sha256Hex(Buffer.from(`symlink:${target}`)), mtimeMs: st.mtimeMs, ctimeMs, size: st.size });
+          // P3: bind effective bytes, not just the target string (fresh
+          // cycle guard per top-level link; loops resolve to dangling).
+          recordDepLink(out, f, r, new Set<string>(), { n: 0 });
         } else if (st.isDirectory()) {
           stack.push(r);
         } else if (st.isFile()) {
@@ -530,7 +704,21 @@ function compareDepTrees(before: Map<string, DepEntry>, after: Map<string, DepEn
       hits.push(key);
       continue;
     }
-    if (b.kind !== a.kind || b.hash !== a.hash || b.mtimeMs !== a.mtimeMs || b.ctimeMs !== a.ctimeMs || b.size !== a.size) {
+    // P3: resolved/target fields bind the bytes effectively executed — a
+    // write through the link (even restored with forged mtime) differs via
+    // target content/ctime; a swapped target differs via resolved.
+    if (
+      b.kind !== a.kind ||
+      b.hash !== a.hash ||
+      b.mtimeMs !== a.mtimeMs ||
+      b.ctimeMs !== a.ctimeMs ||
+      b.size !== a.size ||
+      (b.resolved ?? '') !== (a.resolved ?? '') ||
+      (b.targetHash ?? '') !== (a.targetHash ?? '') ||
+      (b.targetMtimeMs ?? -1) !== (a.targetMtimeMs ?? -1) ||
+      (b.targetCtimeMs ?? -1) !== (a.targetCtimeMs ?? -1) ||
+      (b.targetSize ?? -1) !== (a.targetSize ?? -1)
+    ) {
       hits.push(key);
     }
   }
@@ -557,7 +745,7 @@ function fingerprintDeps(dir: string, tree: Map<string, DepEntry>): string {
   h.update(`\0tree:${keys.length}\0`);
   for (const k of keys) {
     const e = tree.get(k) as DepEntry;
-    h.update(`\0${k}\0${e.kind}\0${e.hash}\0${e.mtimeMs}\0${e.ctimeMs}\0${e.size}\0`);
+    h.update(`\0${k}\0${e.kind}\0${e.hash}\0${e.mtimeMs}\0${e.ctimeMs}\0${e.size}\0${e.resolved ?? ''}\0${e.targetHash ?? ''}\0${e.targetMtimeMs ?? -1}\0${e.targetCtimeMs ?? -1}\0${e.targetSize ?? -1}\0`);
   }
   return h.digest('hex');
 }
@@ -684,6 +872,19 @@ export async function runTestsOnImmutableSnapshot(
     snapDepsBefore = racedCopy === undefined ? snapshotDepTree(snapshotDir) : new Map<string, DepEntry>();
     depFingerprint = fingerprintDeps(snapshotDir, snapDepsBefore);
     envBlock = prep.status !== 'ready' ? blockedOutput : undefined;
+    // P3 override-proof gate: even with a custom envPrepOverride, never
+    // execute when the snapshot deps escape the copy (absolute/escaping
+    // links smuggle external bytes in). prepareTestEnv already refuses this
+    // on its own paths; this covers seams that bypass it.
+    if (envBlock === undefined && racedCopy === undefined) {
+      try {
+        const tmod = await import('./test-env.js');
+        const bad = tmod.findInsecureDepSymlinks(snapshotDir);
+        if (bad.length > 0) {
+          envBlock = `${envMarker}\n${tmod.describeInsecureDepSymlinks(bad)}`;
+        }
+      } catch {}
+    }
     test =
       racedCopy !== undefined
         ? { success: false, output: '', timedOut: false }

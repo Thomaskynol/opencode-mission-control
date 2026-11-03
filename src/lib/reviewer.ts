@@ -142,16 +142,25 @@ export interface ReviewVerdict {
  * execution deterministically (command + exit 0 + output + commit), and a
  * global `bun test` run that includes the task's tests passing satisfies
  * execution even when the requirement text names a per-file command.
- * Functional complaints (no call, no assertion, wrong result, vacuous impl)
- * are NEVER command-scope, even when they mention files.
+ * P2 (fail-closed): a semantic/functional rejection or an ambiguous/mixed
+ * reason NEVER counts as command-scope, even when wrapped in command-shape
+ * language ("observed output shows 1 pass across 1 files; tests never cover
+ * negative numbers" is functional). When in doubt the reason is functional:
+ * only a purely command-shaped complaint is discounted, and only with proof
+ * the task's tests executed (see reviewJob).
  */
 export function isCommandScopeComplaint(reason: string): boolean {
   if (!reason || reason.trim().length === 0) return false;
   const r = reason.toLowerCase();
   const commandScopePattern =
     /across\s+\d+\s+files?|\bisolated\b|single-file|command-specific|anchored command|in 1 file|observed output shows|no direct evidence.*command/;
+  // P2: broad semantic/functional signals (EN+PT). A mixed reason carries at
+  // least one of these, so it is never discounted as command-shape. Bare
+  // runner vocabulary ("expect calls", "fail-closed" verdict marker,
+  // "not demonstrated" without a functional object) stays command-scope.
+  // shortcut: keyword heuristic — upgrade to a structured parser if it misfires.
   const functionalPattern =
-    /no test (calls|asserts)|no assertion|does not define|ignores its inputs|only .*(length|size|count)|trivial.*assert|no bound|does not demonstrate.*(call|assert)|no test calls/;
+    /no test (calls|asserts)|no assertion|no cover|does not define|ignores its inputs|only .*(length|size|count)|trivial.*assert|no bound|does not demonstrate.*(call|assert)|no test calls|does not test|not tested|never test|untested|cover|cobr|missing|absent|lack|never\b|wrong|incorrect|mismatch|unexpected|diverg|expect(?:ed|ation)|instead of|rather than|negativ|diacritic|edge\s*case|boundary|n[ãa]o\s+cobr|sem\s+cobertura|falt\w*|errad[oa]|incorret[oa]|esperad[oa]|\bfail\b(?!-closed)/;
   if (!commandScopePattern.test(r)) return false;
   if (functionalPattern.test(r)) return false;
   return true;
@@ -1150,6 +1159,32 @@ export function assessFunctionalCoverage(
 }
 
 /**
+ * P2: task tests named by the product (explicit testPaths, else test-like
+ * files in scope). A global suite only satisfies an anchored per-file
+ * command when the observed records prove THOSE tests ran — a runner lists
+ * the files it executes; bare counts ("4 pass") and requirement names alone
+ * never prove it.
+ * shortcut: path/basename substring on observed records — upgrade if a runner stops listing files.
+ */
+function taskTestFiles(input: ReviewInput): string[] {
+  const explicit = input.testPaths ?? [];
+  const like = input.fileContents ? Object.keys(input.fileContents).filter(isTestPath) : [];
+  return [...new Set([...explicit, ...like])];
+}
+
+/** True when the observed command/output names at least one task test file. */
+function taskTestExecuted(input: ReviewInput): boolean {
+  const files = taskTestFiles(input);
+  if (files.length === 0) return false;
+  const hay = `${input.evidence?.command ?? ''}\n${input.evidence?.output ?? ''}`;
+  return files.some((f) => {
+    if (hay.includes(f)) return true;
+    const base = f.split('/').pop() ?? '';
+    return base.length >= 3 && hay.includes(base);
+  });
+}
+
+/**
  * Pure review. Never throws on bad input — returns fail with reasons.
  * Fail-closed: any missing proof is a fail, never a pass.
  */
@@ -1266,8 +1301,17 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
           discountedCommandScope = commandScope;
         }
       } else if (commandScope.length > 0) {
-        // Defer: only a functional local pass can discount this.
-        discountedCommandScope = commandScope;
+        // P2: defer ONLY with proof the task's tests executed in the
+        // observed run — a global suite count never proves the anchored
+        // scope ran. Without proof the external fail stands (fail-closed,
+        // no discount, never a pass by name/count inference).
+        if (taskTestExecuted(input)) {
+          discountedCommandScope = commandScope;
+        } else {
+          reasons.push(
+            `external functional review (opencode) did not pass: ${commandScope.join('; ') || 'no reason recorded'} — fail-closed (no proof the task tests executed: observed command/output do not list ${taskTestFiles(input).join(', ') || 'any task test file'})`,
+          );
+        }
       } else {
         reasons.push(
           `external functional review (opencode) did not pass: ${(suf.reasons ?? []).join('; ') || 'no reason recorded'} — fail-closed`,

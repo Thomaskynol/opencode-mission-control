@@ -246,12 +246,38 @@ export function isPathInsideWorktree(path: string, worktreePath: string): boolea
 }
 
 /**
- * Determine if a permission request should be auto-approved
+ * Consolidated policy outcome that the relay must respect end-to-end (P1).
+ * When the monitor forwards the effective decision (job > plan > global),
+ * the relay MUST NOT substitute a second, more permissive decision based
+ * only on type/path. `ask-user`/`deny` are a ceiling: never auto-approve.
+ * `auto-approve` still runs the safety guards below (publishing, outside
+ * worktree) as defense-in-depth — the monitor already fast-paths true
+ * allowlist hits, so this only makes direct relay callers fail-closed.
  */
+export type EffectivePermissionDecision = 'auto-approve' | 'deny' | 'ask-user';
 export function shouldAutoApprove(
   permission: PermissionRequest,
   worktreePath: string,
+  policyDecision?: EffectivePermissionDecision,
 ): PermissionResult {
+  // Effective policy decision wins: ask-user/deny are a ceiling and are
+  // never auto-approved. Auto-approve (or a legacy call without a decision)
+  // falls through to the safety guards below.
+  if (policyDecision === 'ask-user') {
+    return {
+      approved: false,
+      autoApproved: false,
+      reason: 'Requires user approval per permission policy',
+    };
+  }
+
+  if (policyDecision === 'deny') {
+    return {
+      approved: false,
+      autoApproved: false,
+      reason: 'Denied by permission policy',
+    };
+  }
   // Publishing actions never auto-approve, even inside the worktree.
   // Without this, a policy `ask-user` for `git push` inside the worktree
   // would be re-approved here and push without the operator.
@@ -411,8 +437,9 @@ export class QuestionRelay {
     job: Job,
     permission: PermissionRequest,
     _currentFile?: string,
+    policyDecision?: EffectivePermissionDecision,
   ): Promise<PermissionResult> {
-    const result = shouldAutoApprove(permission, job.worktreePath);
+    const result = shouldAutoApprove(permission, job.worktreePath, policyDecision);
 
     if (result.autoApproved) {
       // Auto-approve the permission on the worker session.
@@ -426,6 +453,24 @@ export class QuestionRelay {
       } else {
         console.warn(
           `[QuestionRelay] Cannot auto-approve permission for job ${job.name}: missing serve port or remote session.`,
+        );
+      }
+      return result;
+    }
+
+    // A policy deny blocks without relaying to the user: no pending
+    // question, no timeout — just the reject on the worker session.
+    if (policyDecision === 'deny') {
+      if (job.port && job.remoteSessionID) {
+        try {
+          const client = this.getClient(job.port);
+          await this.replyToPermission(client, job.remoteSessionID, permission.id, false, result.reason);
+        } catch (error) {
+          console.error(`[QuestionRelay] Failed to deny permission for job ${job.name}:`, error);
+        }
+      } else {
+        console.warn(
+          `[QuestionRelay] Cannot deny permission for job ${job.name}: missing serve port or remote session.`,
         );
       }
       return result;

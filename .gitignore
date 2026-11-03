@@ -41,3 +41,6 @@ yarn-error.log*
 
 # Sisyphus planning (local only)
 .sisyphus/
+
+# Planning scratch (local only, never commit)
+.planning/

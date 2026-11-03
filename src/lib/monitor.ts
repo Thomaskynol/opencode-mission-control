@@ -865,7 +865,7 @@ export class JobMonitor extends EventEmitter {
         return;
       }
 
-      await this.questionRelay.handlePermissionRequest(job, permission, accumulator.currentFile);
+      await this.questionRelay.handlePermissionRequest(job, permission, accumulator.currentFile, decision);
     } catch (error) {
       console.error(`[Monitor] Failed to process permission update for job ${job.name}:`, error);
     }
