@@ -101,6 +101,19 @@ export interface JobSpec {
    */
   serverPassword?: string;
   permissionPolicy?: PermissionPolicyConfig;
+  /**
+   * Lane docs2: explicit operator accept bound to the exact reviewed version
+   * (job commit + integration base). Honored once by the review gate while
+   * the pins match; any new commit or base move invalidates it (re-review).
+   * Never a blanket authorization for later changes.
+   */
+  reviewApproval?: {
+    reviewedCommit: string;
+    reviewedBase: string;
+    reason: string;
+    at: string;
+    kind: 'accept';
+  };
 }
 
 export const VALID_PLAN_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {

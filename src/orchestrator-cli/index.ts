@@ -65,7 +65,7 @@ export function createLiveControls(): HumanControls {
  * Library call paths (dispatchArgv, startAutonomous, resumeIntake) stay
  * ungated so unit fakes keep working.
  */
-const DRIVING_VERBS = new Set(['start', 'resume', 'approve']);
+const DRIVING_VERBS = new Set(['start', 'resume', 'approve', 'touchset']);
 
 function stripTestEnvFlag(argv: string[]): string[] {
   return argv.filter((a) => a !== '--allow-test-env' && !a.startsWith('--allow-test-env='));
