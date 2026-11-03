@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, rmSync } from 'fs';
-import { join } from 'path';
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, rmSync } from 'fs';
+import { dirname, join, resolve, sep } from 'path';
 
 /**
  * Shared test-env preparation (F): one helper used by review-snapshot
@@ -38,6 +38,142 @@ export type EnvPreparation =
   | { status: 'ready'; commands: string[]; output: string }
   | { status: 'failed'; commands: string[]; output: string }
   | { status: 'env-failure'; commands: string[]; output: string };
+
+export interface InsecureDepSymlink {
+  /** node_modules-relative path ('.' when node_modules itself is the link). */
+  rel: string;
+  /** Raw link target string. */
+  target: string;
+  /** Resolved absolute path ('' when dangling/unreadable/looping). */
+  resolved: string;
+}
+
+/**
+ * P3: nested symlinks inside <treeDir>/node_modules that escape the tree.
+ *
+ * `cp -a` preserves inner links, so an absolute (or escaping relative) link
+ * to outside lets the test write through into external bytes, execute evil,
+ * restore, and still pass — the old fingerprint hashed only the link target
+ * string, never the executed bytes. A link is isolable only when it resolves
+ * INSIDE treeDir (relative workspace links like ../packs/foo, pnpm .pnpm
+ * links, ./real dirs). Anything else — outside absolute/relative, an
+ * absolute link pinning the origin instead of the copy, dangling, loops —
+ * is insecure: preparation must fail explicit (env-failure, never pass/skip)
+ * instead of running on non-isolated bytes.
+ */
+export function findInsecureDepSymlinks(treeDir: string): InsecureDepSymlink[] {
+  const out: InsecureDepSymlink[] = [];
+  let treeReal: string;
+  try {
+    treeReal = realpathSync(treeDir);
+  } catch {
+    return out;
+  }
+  const inside = (real: string): boolean => real === treeReal || real.startsWith(treeReal + sep);
+  const base = join(treeDir, 'node_modules');
+  try {
+    const st = lstatSync(base);
+    if (st.isSymbolicLink()) {
+      let target = '';
+      try {
+        target = readlinkSync(base);
+      } catch {}
+      let resolved = '';
+      try {
+        resolved = realpathSync(resolve(dirname(base), target));
+      } catch {}
+      if (resolved === '' || !inside(resolved)) {
+        out.push({ rel: '.', target, resolved });
+      }
+      return out;
+    }
+    if (!st.isDirectory()) return out;
+  } catch {
+    return out;
+  }
+  // Descend into inside-resolving dir links too (e.g. a workspace target
+  // carrying its own nested escape); cycle-guarded via resolved realpaths.
+  const seen = new Set<string>();
+  const stack: string[] = [''];
+  let visits = 0;
+  while (stack.length > 0) {
+    const rel = stack.pop() as string;
+    const full = rel === '' ? base : join(base, rel);
+    try {
+      const key = realpathSync(full);
+      if (seen.has(key)) continue;
+      seen.add(key);
+    } catch {
+      // Unresolvable dir reached via a link: attribute to the link itself.
+      if (rel !== '') {
+        try {
+          const lst = lstatSync(full);
+          if (lst.isSymbolicLink()) {
+            let target = '';
+            try {
+              target = readlinkSync(full);
+            } catch {}
+            out.push({ rel, target, resolved: '' });
+          }
+        } catch {}
+      }
+      continue;
+    }
+    if (++visits > 100000) break; // shortcut: absurd tree, report what was found
+    let dirents: Array<{ name: string }>;
+    try {
+      dirents = readdirSync(full, { withFileTypes: true }) as Array<{ name: string }>;
+    } catch {
+      continue;
+    }
+    for (const d of dirents) {
+      const r = rel === '' ? d.name : `${rel}/${d.name}`;
+      const f = join(base, r);
+      let st;
+      try {
+        st = lstatSync(f);
+      } catch {
+        continue;
+      }
+      if (!st.isSymbolicLink()) {
+        if (st.isDirectory()) stack.push(r);
+        continue;
+      }
+      let target = '';
+      try {
+        target = readlinkSync(f);
+      } catch {
+        out.push({ rel: r, target, resolved: '' });
+        continue;
+      }
+      let resolved = '';
+      try {
+        resolved = realpathSync(resolve(dirname(f), target));
+      } catch {
+        resolved = '';
+      }
+      if (resolved === '' || !inside(resolved)) {
+        out.push({ rel: r, target, resolved });
+        continue;
+      }
+      try {
+        if (lstatSync(resolved).isDirectory() && !seen.has(resolved)) stack.push(r);
+      } catch {}
+    }
+  }
+  return out;
+}
+
+/** Explicit one-line-per-link diagnosis for the env-failure output. */
+export function describeInsecureDepSymlinks(bad: InsecureDepSymlink[]): string {
+  const items = bad.slice(0, 8).map((b) => {
+    const where = `node_modules/${b.rel}`;
+    if (b.resolved === '') return `${where} -> ${b.target || '(unreadable/dangling/loop)'}`;
+    return `${where} -> ${b.target} (resolves outside the isolated copy: ${b.resolved})`;
+  });
+  const more = bad.length > 8 ? `; …+${bad.length - 8} more` : '';
+  return `insecure dependency symlink(s) escape the isolated copy: ${items.join('; ')}${more} — refusing to run on non-isolated bytes (never pass/skip)`;
+}
 
 const INSTALL_COMMAND_BY_LOCKFILE = [
   { file: 'bun.lockb', command: 'bun install --frozen-lockfile' },
@@ -132,8 +268,17 @@ export async function prepareTestEnv(opts: {
     }
     return { status: 'ready', commands: setup, output: '' };
   }
-  // Already ready in the copy.
+  // Already ready in the copy. In a copy scenario (review snapshot) the
+  // tree may carry pre-existing inner links — refuse explicit when they
+  // escape the copy (P3). In-place (merge-train worktree, same dir) has no
+  // copy boundary; legacy behavior stays.
   if (hasNodeModules(snapshotDir)) {
+    if (!isSameDir(snapshotDir, sourceDir)) {
+      const bad = findInsecureDepSymlinks(snapshotDir);
+      if (bad.length > 0) {
+        return { status: 'env-failure', commands: [], output: `${ENV_UNPREPARED}\n${describeInsecureDepSymlinks(bad)}` };
+      }
+    }
     return { status: 'ready', commands: [], output: '' };
   }
   // Physical copy of untracked deps FROM the original INTO the snapshot copy.
@@ -150,13 +295,17 @@ export async function prepareTestEnv(opts: {
       } catch {}
       const cp = await runShell(snapshotDir, `cp -a ${shQuote(src)} ${shQuote(dst)}`, timeoutMs);
       if (!cp.success) throw new Error(cp.output || 'dep copy failed');
-      // Prove no link remains: the executed tree must be real bytes.
-      const st = lstatSync(dst);
-      if (st.isSymbolicLink()) {
+      // Prove isolation: no top-level link AND no nested escape. `cp -a`
+      // preserves inner links, so an absolute/escaping link would smuggle
+      // external bytes into the executed tree (P3) — fail explicit instead
+      // of running on non-isolated bytes. The copy is removed so a later
+      // install path (when available) starts from a clean slate.
+      const bad = findInsecureDepSymlinks(snapshotDir);
+      if (bad.length > 0) {
         try {
           rmSync(dst, { recursive: true, force: true });
         } catch {}
-        throw new Error('refused to link snapshot deps to origin');
+        return { status: 'env-failure', commands: [], output: `${ENV_UNPREPARED}\n${describeInsecureDepSymlinks(bad)}` };
       }
       if (hasNodeModules(snapshotDir)) {
         return { status: 'ready', commands: [], output: '' };
