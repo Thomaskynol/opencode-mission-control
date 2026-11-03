@@ -462,3 +462,208 @@ describe('QuestionRelay', () => {
     });
   });
 });
+
+describe('policy decision gating (P1)', () => {
+  const worktreePath = '/home/user/project';
+
+  it('ask-user is never auto-approved for shell inside worktree', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+      worktreePath,
+      'ask-user',
+    );
+    expect(result.autoApproved).toBe(false);
+    expect(result.approved).toBe(false);
+  });
+
+  it('ask-user is never auto-approved for file operations inside worktree', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'file_operation', path: '/home/user/project/src/a.ts', description: 'Edit file' },
+      worktreePath,
+      'ask-user',
+    );
+    expect(result.autoApproved).toBe(false);
+    expect(result.approved).toBe(false);
+  });
+
+  it('ask-user is never auto-approved for MCP tools', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'mcp', description: 'Execute MCP tool' },
+      worktreePath,
+      'ask-user',
+    );
+    expect(result.autoApproved).toBe(false);
+    expect(result.approved).toBe(false);
+  });
+
+  it('deny is never auto-approved, even for MCP', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'mcp', description: 'Execute MCP tool' },
+      worktreePath,
+      'deny',
+    );
+    expect(result.approved).toBe(false);
+    expect(result.autoApproved).toBe(false);
+  });
+
+  it('auto-approve policy still auto-approves shell inside worktree (positive)', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+      worktreePath,
+      'auto-approve',
+    );
+    expect(result.autoApproved).toBe(true);
+  });
+
+  it('auto-approve decision cannot re-approve publishing push (guard stays a ceiling)', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'shell_command', path: '/home/user/project', description: 'git push origin main' },
+      worktreePath,
+      'auto-approve',
+    );
+    expect(result.autoApproved).toBe(false);
+  });
+
+  it('legacy callers without a decision keep path-based behavior', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+      worktreePath,
+    );
+    expect(result.autoApproved).toBe(true);
+  });
+
+  it('rejects sibling-prefix paths even with auto-approve decision (no re-approval outside)', () => {
+    const result = shouldAutoApprove(
+      { id: 'p1', type: 'shell_command', path: '/home/user/project2/run.sh', description: 'Run build' },
+      worktreePath,
+      'auto-approve',
+    );
+    expect(result.autoApproved).toBe(false);
+  });
+});
+
+describe('QuestionRelay policy handling (P1)', () => {
+  let relay: QuestionRelay;
+  let outerStateDir = '';
+  let realFetch: typeof fetch;
+  const seen: Array<{ url: string; body: string }> = [];
+
+  const policyJob: Job = {
+    id: 'job-p1',
+    name: 'P1 Job',
+    worktreePath: '/home/user/project',
+    branch: 'main',
+    tmuxTarget: 'mc-p1',
+    placement: 'session',
+    status: 'running',
+    prompt: 'Do work',
+    mode: 'vanilla',
+    createdAt: new Date().toISOString(),
+    port: 18091,
+    remoteSessionID: 'ses_p1',
+  };
+
+  beforeEach(async () => {
+    relay = new QuestionRelay({ autoResponseTimeoutMs: 60_000 });
+    const fs = await import('fs');
+    outerStateDir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-relay-p1-'));
+    spyOn(paths, 'getDataDir').mockResolvedValue(join(outerStateDir, 'state'));
+    fs.mkdirSync(join(outerStateDir, 'state'), { recursive: true });
+    realFetch = globalThis.fetch;
+    seen.length = 0;
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      seen.push({ url: String(url), body: JSON.stringify((init as { body?: string })?.body ?? {}) });
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+  });
+
+  afterEach(async () => {
+    relay.dispose();
+    clearPendingQuestionsForJob('job-p1');
+    globalThis.fetch = realFetch;
+    (paths.getDataDir as unknown as { mockRestore?: () => void }).mockRestore?.();
+    const fs = await import('fs');
+    if (outerStateDir && fs.existsSync(outerStateDir)) {
+      fs.rmSync(outerStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('ask-user shell inside worktree is relayed, not auto-approved', async () => {
+    const result = await relay.handlePermissionRequest(
+      policyJob,
+      { id: 'p-ask-shell', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+      undefined,
+      'ask-user',
+    );
+    expect(result.autoApproved).toBe(false);
+    expect(result.approved).toBe(false);
+    // Escalated, not decided: no reply on the wire…
+    expect(seen.find((s) => s.url.includes('p-ask-shell'))).toBeUndefined();
+    // …but visible as pending.
+    expect(getPendingQuestionsForJob('job-p1').map((q) => q.partId)).toContain('perm:p-ask-shell');
+  });
+
+  it('ask-user MCP is relayed, not auto-approved', async () => {
+    const result = await relay.handlePermissionRequest(
+      policyJob,
+      { id: 'p-ask-mcp', type: 'mcp', description: 'Execute MCP tool' },
+      undefined,
+      'ask-user',
+    );
+    expect(result.autoApproved).toBe(false);
+    expect(seen.find((s) => s.url.includes('p-ask-mcp'))).toBeUndefined();
+    expect(getPendingQuestionsForJob('job-p1').map((q) => q.partId)).toContain('perm:p-ask-mcp');
+  });
+
+  it('deny blocks without relaying to the user (no pending, reject on the wire)', async () => {
+    const result = await relay.handlePermissionRequest(
+      policyJob,
+      { id: 'p-deny-shell', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+      undefined,
+      'deny',
+    );
+    expect(result.approved).toBe(false);
+    expect(result.autoApproved).toBe(false);
+    expect(getPendingQuestionsForJob('job-p1').map((q) => q.partId)).not.toContain('perm:p-deny-shell');
+    const call = seen.find((s) => s.url.includes('p-deny-shell'));
+    expect(call).toBeDefined();
+    expect(call!.body).toMatch(/reject/);
+  });
+
+  it('user response "yes" approves once and cancels the pending timeout (no double reply)', async () => {
+    const fast = new QuestionRelay({ autoResponseTimeoutMs: 30 });
+    try {
+      await fast.handlePermissionRequest(
+        policyJob,
+        { id: 'p-cancel', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+        undefined,
+        'ask-user',
+      );
+      await fast.handleUserResponse(policyJob, 'p-cancel', 'yes');
+      await new Promise((r) => setTimeout(r, 90));
+      const calls = seen.filter((s) => s.url.includes('p-cancel'));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toMatch(/once/);
+    } finally {
+      fast.dispose();
+    }
+  });
+
+  it('cleanup cancels pending escalation (restart-safe: no reply after cleanup)', async () => {
+    const fast = new QuestionRelay({ autoResponseTimeoutMs: 30 });
+    try {
+      await fast.handlePermissionRequest(
+        policyJob,
+        { id: 'p-cleanup', type: 'shell_command', path: '/home/user/project/run.sh', description: 'Run build' },
+        undefined,
+        'ask-user',
+      );
+      fast.cleanup(policyJob.id);
+      await new Promise((r) => setTimeout(r, 90));
+      expect(seen.filter((s) => s.url.includes('p-cleanup'))).toHaveLength(0);
+    } finally {
+      fast.dispose();
+      removePendingQuestion(policyJob.id, 'perm:p-cleanup');
+    }
+  });
+});
