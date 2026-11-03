@@ -148,22 +148,66 @@ export interface ReviewVerdict {
  * negative numbers" is functional). When in doubt the reason is functional:
  * only a purely command-shaped complaint is discounted, and only with proof
  * the task's tests executed (see reviewJob).
+ *
+ * P2-general (cause, not wording): the old check was a denylist of functional
+ * keywords — any functional objection phrased outside the list ("returns zero
+ * for inputs below zero") was discounted into a pass. The contract is now
+ * inverted: strip the small closed set of command-shape boilerplate (runner
+ * vocabulary, counts with units, file paths, requirement ids, the fail-closed
+ * marker); whatever substantive token REMAINS is a functional objection, in
+ * any language or phrasing, and the reason stays functional. Only a reason
+ * reduced to pure boilerplate — that still names execution shape — is
+ * discounted. Unknown words default to substantive (fail-closed).
+ * shortcut: boilerplate-strip heuristic — upgrade to a structured parser if it misfires.
  */
+const COMMAND_SCOPE_MARKER =
+  /across\s+\d+\s+files?|\bisolated\b|single-file|command-specific|anchored command|in 1 file|observed output shows|no direct evidence.*command/;
+
+/** Runner/execution-shape words: HOW tests ran, never WHAT the code must do. */
+const COMMAND_SHAPE_VOCABULARY = new Set([
+  'observed', 'output', 'outputs', 'shows', 'show', 'shown', 'reports', 'report', 'reported',
+  'across', 'isolated', 'isolation', 'anchored', 'command', 'commands', 'specific', 'single',
+  'per', 'shape', 'run', 'runs', 'running', 'ran', 'suite', 'suites', 'global', 'globally',
+  'demonstrated', 'demonstrates', 'demonstrate', 'demonstration', 'evidence', 'direct',
+  'file', 'files', 'test', 'tests', 'tested', 'testing', 'pass', 'passes', 'passed', 'passing',
+]);
+
+/** Pure grammatical glue: carries no objection by itself. */
+const REASON_GLUE = new Set([
+  'the', 'a', 'an', 'of', 'for', 'in', 'on', 'with', 'and', 'or', 'to',
+  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'it', 'its',
+  'this', 'that', 'these', 'those', 'as', 'by', 'from', 'at',
+  'but', 'not', 'no', 'nor', 'so', 'than', 'then', 'do', 'does', 'did', 'if',
+]);
+
+/**
+ * Substantive tokens left after removing command-shape boilerplate. Empty =
+ * the reason says nothing beyond execution shape (discountable when it names
+ * that shape); non-empty = it carries a functional objection (fail-closed).
+ */
+function commandShapeRemainder(reason: string): string[] {
+  let s = reason.toLowerCase();
+  s = s.replace(/\bfail-closed\b/g, ' ');
+  s = s.replace(/^\s*[\w.()~+-]+\s*:\s*/, ' '); // leading "req-id:" / "external:"
+  s = s.replace(/\b[a-z0-9_.-]*req-?\d+\b/g, ' '); // requirement refs ("sum-req-3")
+  s = s.replace(/\S*\/\S*/g, ' '); // file paths ("tests/sum.test.ts")
+  s = s.replace(/\b[\w~.-]+\.(?:test|spec)\.[a-z0-9]+\b/g, ' ');
+  s = s.replace(/\b[\w~.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts|py|go|rs|java|rb|php|cpp|c|h)\b/g, ' ');
+  s = s.replace(/\b\d+\s*(?:pass(?:es)?|fail(?:ed|s)?|tests?|expect(?:\(\))?\s*calls?|files?)\b/g, ' '); // counts with units
+  const tokens = s.split(/[^a-z0-9]+/).filter((t) => t.length > 0);
+  return tokens.filter((t) => {
+    if (/^\d+$/.test(t)) return true; // bare values ("-5", "0") are content
+    if (t.length === 1) return t !== 's'; // possessive residue; other letters may be code symbols
+    if (COMMAND_SHAPE_VOCABULARY.has(t)) return false;
+    if (REASON_GLUE.has(t)) return false;
+    return true;
+  });
+}
+
 export function isCommandScopeComplaint(reason: string): boolean {
   if (!reason || reason.trim().length === 0) return false;
-  const r = reason.toLowerCase();
-  const commandScopePattern =
-    /across\s+\d+\s+files?|\bisolated\b|single-file|command-specific|anchored command|in 1 file|observed output shows|no direct evidence.*command/;
-  // P2: broad semantic/functional signals (EN+PT). A mixed reason carries at
-  // least one of these, so it is never discounted as command-shape. Bare
-  // runner vocabulary ("expect calls", "fail-closed" verdict marker,
-  // "not demonstrated" without a functional object) stays command-scope.
-  // shortcut: keyword heuristic — upgrade to a structured parser if it misfires.
-  const functionalPattern =
-    /no test (calls|asserts)|no assertion|no cover|does not define|ignores its inputs|only .*(length|size|count)|trivial.*assert|no bound|does not demonstrate.*(call|assert)|no test calls|does not test|not tested|never test|untested|cover|cobr|missing|absent|lack|never\b|wrong|incorrect|mismatch|unexpected|diverg|expect(?:ed|ation)|instead of|rather than|negativ|diacritic|edge\s*case|boundary|n[ãa]o\s+cobr|sem\s+cobertura|falt\w*|errad[oa]|incorret[oa]|esperad[oa]|\bfail\b(?!-closed)/;
-  if (!commandScopePattern.test(r)) return false;
-  if (functionalPattern.test(r)) return false;
-  return true;
+  if (commandShapeRemainder(reason).length > 0) return false;
+  return COMMAND_SCOPE_MARKER.test(reason.toLowerCase());
 }
 
 /** Split external reasons into out-of-scope command-shape vs functional. */
@@ -345,6 +389,30 @@ function testCallsSymbol(testContent: string, symbol: string): boolean {
   const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const stripped = stripStringsAndComments(testContent);
   return new RegExp(`\\b${escaped}\\s*\\(`).test(stripped);
+}
+
+/**
+ * Remove non-executed test blocks: `test.skip(...)`, `it.skip(...)`,
+ * `describe.skip(...)`, `test.todo(...)`, `xit(...)`, `xtest(...)`,
+ * `xdescribe(...)`. A skipped assertion never runs, so it never demonstrates
+ * anything — counting it would let a green suite of other tests verify an
+ * unexecuted requirement (P2-general: skipped tests don't exercise the task).
+ * shortcut: balanced-paren removal — upgrade to a structured parser if it misfires.
+ */
+function stripSkippedTests(source: string): string {
+  let out = source;
+  const re = /\b(?:test|it|describe)\s*\.\s*skip\s*\(|\btest\s*\.\s*todo\s*\(|\bx(?:it|test|describe)\s*\(/g;
+  for (;;) {
+    re.lastIndex = 0;
+    const m = re.exec(out);
+    if (!m) break;
+    const open = out.indexOf('(', m.index);
+    if (open < 0) break;
+    const bal = extractBalanced(out, open);
+    if (!bal) break;
+    out = `${out.slice(0, m.index)}\n${out.slice(open + bal.length)}`;
+  }
+  return out;
 }
 
 /**
@@ -994,7 +1062,19 @@ export function assessFunctionalCoverage(
     };
   }
   const implPool = paths.filter((p) => !testPool.includes(p));
-  // Barrels only re-export: follow relative re-exports inside scope so the
+  // Executed tests only: skipped blocks never run, so they never demonstrate
+  // a requirement (P2-general). All test reads below use the runnable content.
+  const testContents: Record<string, string> = {};
+  let skippedBlocksIgnored = false;
+  for (const tp of testPool) {
+    const raw = contents[tp] ?? '';
+    const runnable = stripSkippedTests(raw);
+    testContents[tp] = runnable;
+    if (runnable !== raw) skippedBlocksIgnored = true;
+  }
+  const skipNote = skippedBlocksIgnored
+    ? ' (note: test.skip/describe.skip/xit blocks were ignored — skipped assertions never execute)'
+    : '';  // Barrels only re-export: follow relative re-exports inside scope so the
   // target defs count as candidates (cycles via visited-set; outside scope
   // ignored, never read from disk).
   const implSources = collectReExportExpandedSources(
@@ -1041,7 +1121,7 @@ export function assessFunctionalCoverage(
     const unbound: string[] = [];
     const trivialOnly: string[] = [];
     for (const cand of candidates) {
-      const assertedIn = testPool.filter((tp) => hasAssertedCall(contents[tp] ?? '', cand));
+      const assertedIn = testPool.filter((tp) => hasAssertedCall((testContents[tp] ?? ''), cand));
       if (assertedIn.length === 0) continue;
       if (isVacuousImpl(implSources, cand)) {
         if (!vacuous.some((s) => s.toLowerCase() === cand.toLowerCase())) vacuous.push(cand);
@@ -1053,12 +1133,12 @@ export function assessFunctionalCoverage(
       }
       if (
         required.length > 0 &&
-        !assertedIn.some((tp) => hasBoundAssertion(contents[tp] ?? '', cand, required))
+        !assertedIn.some((tp) => hasBoundAssertion((testContents[tp] ?? ''), cand, required))
       ) {
         if (!unbound.some((s) => s.toLowerCase() === cand.toLowerCase())) unbound.push(cand);
         continue;
       }
-      if (!emptySpecific && !assertedIn.some((tp) => callHasDistinguishingInput(contents[tp] ?? '', cand))) {
+      if (!emptySpecific && !assertedIn.some((tp) => callHasDistinguishingInput((testContents[tp] ?? ''), cand))) {
         if (!trivialOnly.some((s) => s.toLowerCase() === cand.toLowerCase())) trivialOnly.push(cand);
         continue;
       }
@@ -1090,7 +1170,7 @@ export function assessFunctionalCoverage(
     }
     return {
       covered: false,
-      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test asserts an implementation call — fix the tests to call the implementation and assert the expected behaviour`,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test asserts an implementation call — fix the tests to call the implementation and assert the expected behaviour${skipNote}`,
     };
   }
 
@@ -1127,7 +1207,7 @@ export function assessFunctionalCoverage(
   if (required.length === 0) {
     for (const sym of defined) {
       for (const tp of testPool) {
-        if (hasAssertedCall(contents[tp] ?? '', sym)) {
+        if (hasAssertedCall((testContents[tp] ?? ''), sym)) {
           return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}()` };
         }
       }
@@ -1135,17 +1215,17 @@ export function assessFunctionalCoverage(
   } else {
     for (const sym of defined) {
       for (const tp of testPool) {
-        if (hasBoundAssertion(contents[tp] ?? '', sym, required)) {
+        if (hasBoundAssertion((testContents[tp] ?? ''), sym, required)) {
           return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}() with expected ${required.join('/')} ` };
         }
       }
     }
   }
-  const anyCall = defined.some((sym) => testPool.some((tp) => testCallsSymbol(contents[tp] ?? '', sym)));
+  const anyCall = defined.some((sym) => testPool.some((tp) => testCallsSymbol((testContents[tp] ?? ''), sym)));
   if (anyCall) {
     return {
       covered: false,
-      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${defined.join('/')}() but no assertion checks expected ${required.join('/')} — fix the tests to assert the implementation result for the required case`,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${defined.join('/')}() but no assertion checks expected ${required.join('/')} — fix the tests to assert the implementation result for the required case${skipNote}`,
     };
   }
   const anchorHint = requirement.testAnchors.some((a) => testOutput.includes(a))
@@ -1154,7 +1234,7 @@ export function assessFunctionalCoverage(
   return {
     covered: false,
     // Legacy phrase kept: downstream automation matches /do not cover requirement/.
-    reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test calls ${defined.join('/')}() — fix the tests to exercise the implementation${anchorHint}`,
+    reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no test calls ${defined.join('/')}() — fix the tests to exercise the implementation${anchorHint}${skipNote}`,
   };
 }
 
@@ -1164,6 +1244,12 @@ export function assessFunctionalCoverage(
  * command when the observed records prove THOSE tests ran — a runner lists
  * the files it executes; bare counts ("4 pass") and requirement names alone
  * never prove it.
+ * P2-general: the file must be named in the product-OBSERVED output (runner
+ * record) together with a runner pass signal — a filename appearing only as
+ * text (requirement prose, or the command string echoing it without runner
+ * results) never proves execution. Real `bun test` output always lists the
+ * files it runs, so legitimate evidence keeps passing; anything weaker
+ * stays fail-closed (see reviewJob).
  * shortcut: path/basename substring on observed records — upgrade if a runner stops listing files.
  */
 function taskTestFiles(input: ReviewInput): string[] {
@@ -1172,15 +1258,16 @@ function taskTestFiles(input: ReviewInput): string[] {
   return [...new Set([...explicit, ...like])];
 }
 
-/** True when the observed command/output names at least one task test file. */
+/** True when the observed output records at least one task test file passing. */
 function taskTestExecuted(input: ReviewInput): boolean {
   const files = taskTestFiles(input);
   if (files.length === 0) return false;
-  const hay = `${input.evidence?.command ?? ''}\n${input.evidence?.output ?? ''}`;
+  const output = input.evidence?.output ?? '';
+  if (!hasPassSignal(output)) return false;
   return files.some((f) => {
-    if (hay.includes(f)) return true;
+    if (output.includes(f)) return true;
     const base = f.split('/').pop() ?? '';
-    return base.length >= 3 && hay.includes(base);
+    return base.length >= 3 && output.includes(base);
   });
 }
 
