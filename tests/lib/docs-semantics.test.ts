@@ -108,4 +108,31 @@ describe('docs semantics: denial blocks, substance required', () => {
     expect(r.covered).toBe(true);
     expect(r.status).toBe('covered');
   });
+
+  it('EN verbless denial (different wording): marker + criterion without instruction blocks', () => {
+    const r = assessDocsCoverage(
+      { id: 'rk1', description: 'Document the recovery key handling' },
+      { 'docs/key.md': '# Recovery key\nMissing recovery key. Recovery key handling recovery key handling recovery key rotation context and team notes.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('not-covered');
+  });
+
+  it('PT verbless denial (different wording): marker + criterion without instruction blocks', () => {
+    const r = assessDocsCoverage(
+      { id: 'rr1', description: 'Descreva o roteiro de restauração' },
+      { 'docs/rot.md': '# Roteiro\nAusente roteiro de restauração. Roteiro de restauração roteiro de restauração contexto de equipe e notas adicionais.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('not-covered');
+  });
+
+  it('descriptive without instruction is inconclusive (fail-closed, needs human/external)', () => {
+    const r = assessDocsCoverage(
+      { id: 'rw1', description: 'Explain the backup retention window' },
+      { 'docs/ret.md': '# Retention\nThe backup retention window spans thirty days across all regions with daily snapshots stored encrypted and replicated for compliance purposes and audit review.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('inconclusive');
+  });
 });
