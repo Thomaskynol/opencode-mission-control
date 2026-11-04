@@ -46,12 +46,15 @@ describe('lane F: ator registrado e exibido (humano vs agente-operador vs sistem
       Bun.spawnSync(['git', 'branch', '-M', 'main'], { cwd: base });
       Bun.spawnSync(['git', 'branch', 'feature'], { cwd: base });
       Bun.spawnSync(['git', 'branch', 'integration'], { cwd: base });
+      // cav-2.1: mesmo com evidência forjada, human permanece auto-declarado não atestado.
       const approval = await bindReviewApproval('feature', 'integration', base, 'reason test', {
         actor: 'human',
         actorEvidence: 'explicit --actor human (invocação humana via TUI)',
       });
-      const withActor = approval as unknown as { actor?: string };
+      const withActor = approval as unknown as { actor?: string; actorEvidence?: string };
       expect(withActor.actor).toBe('human');
+      expect(String(withActor.actorEvidence ?? '')).toMatch(/auto-declarado.*sem atesta/i);
+      expect(String(withActor.actorEvidence ?? '')).not.toMatch(/invocação humana via TUI/i);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

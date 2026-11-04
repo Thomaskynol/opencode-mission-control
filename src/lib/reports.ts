@@ -365,6 +365,26 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
       });
     }
   }
+  // cav-2.2: fallback por gap — rewording futuro de decisions não pode
+  // silenciar Problems. Para cada unmet/unverified sem cobertura em nenhum
+  // problema derivado (ou já passado em input.problems), emite desconhecido
+  // por entrada. Cobertura = contenção do trecho do gap (60 chars), não só
+  // job-name — pendência distinta exige entrada distinta.
+  const gaps = [...(input.unmet ?? []), ...(input.unverified ?? [])];
+  const existing = [...out, ...((input.problems ?? []) as FinalReportProblem[])];
+  for (const gap of gaps) {
+    const probe = gap.slice(0, 60);
+    const covered = existing.some(
+      (p) => p.problem.includes(probe) || gap.includes(p.problem.slice(0, 60)),
+    );
+    if (!covered) {
+      out.push({
+        problem: `pendência sem classificação: ${gap.slice(0, 240)} — causa não reconhecida nos registros, não assumir sucesso`,
+        solution: 'preservar decisions/logs e classificar a causa; re-verificar por critério antes de promover',
+        status: 'desconhecido',
+      });
+    }
+  }
   return out;
 }
 

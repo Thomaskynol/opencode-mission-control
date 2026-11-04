@@ -117,9 +117,14 @@ export const mc_report_final: ToolDefinition = tool({
     const tasks = plan.jobs.map((job) => {
       const appr = (job as unknown as { reviewApproval?: { actor?: string; actorEvidence?: string; reviewedCommit?: string } }).reviewApproval;
       const baseDetail = job.error ?? (job.mergedAt ? `merged at ${job.mergedAt}` : undefined);
-      // Lane F: ator exibido + ressalva visível no task (aceite nunca vira verified).
+      // Lane F cav-2.1: human é auto-declaração não atestada — nunca afirmar como fato.
       if (appr) {
-        const actorLabel = appr.actor ? `ator ${appr.actor}${appr.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : 'ator desconhecido (desconhecido)';
+        const actorLabel =
+          appr.actor === 'human'
+            ? 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
+            : appr.actor
+              ? `ator ${appr.actor} (não-humano)`
+              : 'ator desconhecido (desconhecido)';
         const extra = `aceite ${actorLabel} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
         return { name: job.name, status: job.status, detail: baseDetail ? `${baseDetail}; ${extra}` : extra };
       }
@@ -197,7 +202,7 @@ export const mc_report_final: ToolDefinition = tool({
     const decisions = [
       ...((intake as { decisions?: string[] } | null)?.decisions ?? []),
       ...((plan.auditLog ?? []) as Array<{ action: string; jobName?: string; actor?: string; actorEvidence?: string }>).map(
-        (a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}${a.actor ? ` — ator ${a.actor}${a.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : ''}${a.actorEvidence ? ` (${a.actorEvidence.slice(0, 120)})` : ''}`,
+        (a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}${a.actor ? (a.actor === 'human' ? ' — ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)' : ` — ator ${a.actor} (não-humano)`) : ''}${a.actorEvidence ? ` (${a.actorEvidence.slice(0, 120)})` : ''}`,
       ),
     ];
     // OMO status declared explicitly (never a silent success): without OMO
@@ -267,12 +272,17 @@ export const mc_report_final: ToolDefinition = tool({
           const rec = r as { jobName?: string; testStatus?: string; testCommand?: string; reviewedCommit?: string; testOutput?: string };
           return `${rec.jobName ?? 'job'} [${rec.testStatus ?? 'skipped'}]${rec.testCommand ? ` ${rec.testCommand}` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}${rec.testOutput ? ` — ${rec.testOutput.slice(0, 200)}` : ''}`;
         }),
-        // Lane F: aceites exibidos como evidência rotulada (nunca humana implícita) + ressalva.
+        // Lane F cav-2.1: aceites exibidos como evidência rotulada (auto-declaração nunca como fato) + ressalva.
         ...plan.jobs
           .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
           .map((job) => {
             const appr = (job as unknown as { reviewApproval: { actor?: string; reviewedCommit?: string; reason?: string } }).reviewApproval;
-            const label = appr.actor ? `${appr.actor}${appr.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : 'desconhecido (desconhecido)';
+            const label =
+              appr.actor === 'human'
+                ? 'human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
+                : appr.actor
+                  ? `${appr.actor} (não-humano)`
+                  : 'desconhecido (desconhecido)';
             return `accept "${job.name}" por ${label} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
           }),
         ...notes,
