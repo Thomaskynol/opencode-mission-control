@@ -413,3 +413,132 @@ describe('parseTaskFileExecution: estrutura por arquivo/caso/status', () => {
     expect(verdict.blocking).toBe(true);
   });
 });
+
+describe('Achado2: tarefa curta com barra ambígua entre dois dirs (fail-closed)', () => {
+  const AMBIGUOUS_SLASH_CONSOLE = `bun test v1.3.14 (0d9b296a)
+
+  2 pass
+  0 fail
+  2 expect() calls
+Ran 2 tests across 2 files. [12.00ms]
+`;
+  const AMBIGUOUS_SLASH_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2" assertions="2" failures="0" skipped="0" time="0.01">
+  <testsuite name="a/foo/bar.test.ts" file="a/foo/bar.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="a passes" classname="" time="0.00005" file="a/foo/bar.test.ts" line="2" assertions="1" />
+  </testsuite>
+  <testsuite name="b/foo/bar.test.ts" file="b/foo/bar.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="b passes" classname="" time="0.00005" file="b/foo/bar.test.ts" line="2" assertions="1" />
+  </testsuite>
+</testsuites>
+`;
+  const AMBIGUOUS_SLASH_OUTPUT = `${AMBIGUOUS_SLASH_CONSOLE}\n${AMBIGUOUS_SLASH_XML}`;
+  const AMBIGUOUS_SLASH_REASON =
+    'sum-req-3: observed output shows 2 pass across 2 files, not an isolated foo/bar.test.ts run; no direct evidence the anchored command passes — fail-closed';
+
+  it('tarefa curta com barra casando dois paths distintos → FAIL bloqueante, sem desconto', () => {
+    const verdict = reviewJob(
+      execProofInput({
+        output: AMBIGUOUS_SLASH_OUTPUT,
+        externalReason: AMBIGUOUS_SLASH_REASON,
+        testPaths: ['foo/bar.test.ts'],
+        changedFiles: ['src/sum.ts', 'foo/bar.test.ts'],
+        touchSet: ['src/sum.ts', 'foo/bar.test.ts'],
+        fileContents: { 'src/sum.ts': FIXED_SUM, 'foo/bar.test.ts': FULL_TEST },
+      }),
+    );
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.blocking).toBe(true);
+    expect((verdict.audit ?? []).join(' ')).not.toMatch(/discounted/i);
+  });
+
+  it('candidato único relativo com prefixo (sufixo, 1 path) continua passando', () => {
+    const singleConsole = `bun test v1.3.14 (0d9b296a)
+
+  1 pass
+  0 fail
+  1 expect() calls
+Ran 1 test across 1 file. [12.00ms]
+`;
+    const singleXml = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="1" assertions="1" failures="0" skipped="0" time="0.01">
+  <testsuite name="a/foo/bar.test.ts" file="a/foo/bar.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="a passes" classname="" time="0.00005" file="a/foo/bar.test.ts" line="2" assertions="1" />
+  </testsuite>
+</testsuites>
+`;
+    const verdict = reviewJob(
+      execProofInput({
+        output: `${singleConsole}\n${singleXml}`,
+        externalReason: AMBIGUOUS_SLASH_REASON,
+        testPaths: ['foo/bar.test.ts'],
+        changedFiles: ['src/sum.ts', 'foo/bar.test.ts'],
+        touchSet: ['src/sum.ts', 'foo/bar.test.ts'],
+        fileContents: { 'src/sum.ts': FIXED_SUM, 'foo/bar.test.ts': FULL_TEST },
+      }),
+    );
+    expect(verdict.verdict).toBe('pass');
+    expect(verdict.blocking).toBe(false);
+    expect((verdict.audit ?? []).join(' ')).toMatch(/discounted/i);
+  });
+
+  it('candidato único absoluto (prefixo de worktree) continua passando', () => {
+    const absConsole = `bun test v1.3.14 (0d9b296a)
+
+  2 pass
+  0 fail
+  2 expect() calls
+Ran 2 tests across 2 files. [12.00ms]
+`;
+    const absXml = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2" assertions="2" failures="0" skipped="0" time="0.01">
+  <testsuite name="/tmp/work/tests/sum.test.ts" file="/tmp/work/tests/sum.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="positive" classname="" time="0.00005" file="/tmp/work/tests/sum.test.ts" line="3" assertions="1" />
+  </testsuite>
+  <testsuite name="tests/other.test.ts" file="tests/other.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="other passes" classname="" time="0.00005" file="tests/other.test.ts" line="2" assertions="1" />
+  </testsuite>
+</testsuites>
+`;
+    const verdict = reviewJob(
+      execProofInput({
+        output: `${absConsole}\n${absXml}`,
+        externalReason: PURE,
+        fileContents: { 'src/sum.ts': FIXED_SUM, 'tests/sum.test.ts': FULL_TEST, 'tests/other.test.ts': OTHER_TEST },
+      }),
+    );
+    expect(verdict.verdict).toBe('pass');
+    expect(verdict.blocking).toBe(false);
+    expect((verdict.audit ?? []).join(' ')).toMatch(/discounted/i);
+  });
+
+  it('homônimos absolutos distintos (dois worktrees) → FAIL bloqueante', () => {
+    const homConsole = `bun test v1.3.14 (0d9b296a)
+
+  2 pass
+  0 fail
+  2 expect() calls
+Ran 2 tests across 2 files. [12.00ms]
+`;
+    const homXml = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2" assertions="2" failures="0" skipped="0" time="0.01">
+  <testsuite name="/tmp/w1/tests/sum.test.ts" file="/tmp/w1/tests/sum.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="positive" classname="" time="0.00005" file="/tmp/w1/tests/sum.test.ts" line="3" assertions="1" />
+  </testsuite>
+  <testsuite name="/tmp/w2/tests/sum.test.ts" file="/tmp/w2/tests/sum.test.ts" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="localhost.localdomain">
+    <testcase name="positive" classname="" time="0.00005" file="/tmp/w2/tests/sum.test.ts" line="3" assertions="1" />
+  </testsuite>
+</testsuites>
+`;
+    const verdict = reviewJob(
+      execProofInput({
+        output: `${homConsole}\n${homXml}`,
+        externalReason: PURE,
+        fileContents: { 'src/sum.ts': FIXED_SUM, 'tests/sum.test.ts': FULL_TEST },
+      }),
+    );
+    expect(verdict.verdict).toBe('fail');
+    expect(verdict.blocking).toBe(true);
+    expect((verdict.audit ?? []).join(' ')).not.toMatch(/discounted/i);
+  });
+});

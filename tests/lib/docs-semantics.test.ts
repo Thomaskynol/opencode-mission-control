@@ -135,4 +135,48 @@ describe('docs semantics: denial blocks, substance required', () => {
     expect(r.covered).toBe(false);
     expect(r.status).toBe('inconclusive');
   });
+
+  it('ACHADO1 EXACT case: plausible but wrong instructions are never covered', () => {
+    const r = assessDocsCoverage(BACKUP_REQ, {
+      'docs/backup.md': '# Backup restoration procedure\n\nTo restore backup, dance around the room and sing loudly.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+    expect(r.reason).toMatch(/inconclusive|not-covered|fail-closed|substance|explicit|external/i);
+  });
+
+  it('vague single-sentence instruction without verifiable detail is inconclusive (fail-closed)', () => {
+    const r = assessDocsCoverage(BACKUP_REQ, {
+      'docs/backup.md': '# Backup restoration procedure\n\nTo restore the backup, run the tool and follow the prompts carefully until it finishes.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('inconclusive');
+    expect(r.reason).toMatch(/inconclusive|fail-closed/i);
+  });
+
+  it('internal contradiction (negated instruction sharing an artifact) is at minimum inconclusive', () => {
+    const r = assessDocsCoverage(BACKUP_REQ, {
+      'docs/backup.md': '# Backup restoration procedure\n\nTo restore, run `restore.sh --from backup.tar.gz`, then verify files in /data. Never run `restore.sh` on Fridays.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('short criterion verb (run) copied by a dance sentence is never covered', () => {
+    const r = assessDocsCoverage(
+      { id: 'run1', description: 'Run migration' },
+      { 'docs/migrate.md': '# Migration\nRun dance migration with `migrate.sh` step 1 and enjoy the celebration routine carefully.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('contradiction without a shared artifact is fail-closed (never covered)', () => {
+    const r = assessDocsCoverage(
+      { id: 'dep1', description: 'Deploy the search index updates' },
+      { 'docs/search.md': '# Search index\nAlways open the search index dashboard with `sync.sh` and press the sync control to deploy updates. Never press the sync control for the search index deployment.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('inconclusive');
+  });
 });

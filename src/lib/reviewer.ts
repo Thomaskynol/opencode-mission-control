@@ -1376,9 +1376,10 @@ export function parseTaskFileExecution(output: string): TaskFileExecution[] {
 }
 
 /**
- * Full-path link: same basenames in different directories never match.
- * A bare task filename matches a unique listed path only (ambiguous when
- * several distinct listed paths share the basename — fail-closed).
+ * Full-path link: a task file matches a unique listed path only (ambiguous
+ * when several distinct listed paths match — fail-closed, with or without
+ * `/` in the task). A single suffix hit (relative-vs-absolute worktree
+ * prefix) stays tolerated — indistinguishable, necessary.
  */
 function sectionMatchesTaskFile(taskFile: string, header: string): boolean {
   const t = taskFile.trim();
@@ -1404,7 +1405,7 @@ function taskTestExecuted(input: ReviewInput): boolean {
   const check = (f: string): boolean => {
     const matched = parsed.filter((e) => sectionMatchesTaskFile(f, e.file));
     if (matched.length === 0) return false;
-    if (!f.includes('/') && new Set(matched.map((e) => e.file)).size > 1) return false;
+    if (new Set(matched.map((e) => e.file.trim())).size > 1) return false;
     const pass = matched.reduce((n, e) => n + e.pass, 0);
     const notExecuted = matched.reduce((n, e) => n + e.fail + e.skip, 0);
     // ≥1 linked pass AND zero skip/todo/fail: a skipped task case (or a

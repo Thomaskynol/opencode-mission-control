@@ -42,6 +42,33 @@ import {
   getDataDir,
   getXdgDataDir,
 } from '../lib/paths';
+import { formatActorLabel } from '../lib/reports';
+
+/**
+ * M6: ator auditável do CLI (takeover/retry/resume/accept exibem e logam o
+ * ator). Padrão fail-closed = agent-operator (não-humano); --actor human é
+ * auto-declaração não atestada (nunca afirma humano como fato); ausente nos
+ * registros = desconhecido (nunca presumir — ver extractActorMention).
+ */
+export type CliActor = 'human' | 'agent-operator' | 'system';
+
+export function resolveCliActor(flags: Map<string, string>, command: string): { actor: CliActor; evidence: string } {
+  const actorFlag = flags.get('actor');
+  let actor: CliActor = 'agent-operator';
+  if (actorFlag !== undefined && actorFlag !== '') {
+    if (actorFlag !== 'human' && actorFlag !== 'agent-operator' && actorFlag !== 'system') {
+      throw new Error(`Invalid --actor "${actorFlag}": expected human|agent-operator|system.`);
+    }
+    actor = actorFlag;
+  }
+  const evidence =
+    actor === 'human'
+      ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
+      : actor === 'system'
+        ? `sistema (automação do produto, pid ${process.pid})`
+        : `CLI ${command} sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`;
+  return { actor, evidence };
+}
 
 /**
  * Autonomous intake commands for the human TUI (public NL path).
@@ -995,20 +1022,11 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
   const wantTakeover = flags.has('takeover');
   // Lane F: ator auditável. Padrão fail-closed = agent-operator (não-humano);
   // --actor human é auto-declaração não atestada (nunca afirma humano como fato).
-  const actorFlag = flags.get('actor');
-  let approveActor: 'human' | 'agent-operator' | 'system' = 'agent-operator';
-  if (actorFlag !== undefined && actorFlag !== '') {
-    if (actorFlag !== 'human' && actorFlag !== 'agent-operator' && actorFlag !== 'system') {
-      throw new Error(`Invalid --actor "${actorFlag}": expected human|agent-operator|system.`);
-    }
-    approveActor = actorFlag;
-  }
-  const approveActorEvidence =
-    approveActor === 'human'
-      ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
-      : approveActor === 'system'
-        ? `sistema (automação do produto, pid ${process.pid})`
-        : `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`;
+  // M6: ator propagado aos logs (flag --actor nas strings de comando) e aos
+  // decisions do intake (takeover/retry/relaunch/resume/accept).
+  const { actor: approveActor, evidence: approveActorEvidence } = resolveCliActor(flags, 'approve');
+  const approveActorSuffix = ` --actor ${approveActor}`;
+  const approveActorLabel = formatActorLabel(approveActor);
   if (retry !== undefined && retry !== '' && relaunch !== undefined && relaunch !== '') {
     throw new Error('Cannot specify both "retry" and "relaunch". Use "retry" for manual fixes (re-validates) or "relaunch" to spawn an agent to fix violations.');
   }
@@ -1083,7 +1101,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctlIdem as never, record, (() => { try { return curModelIdem(); } catch { return undefined; } })());
         let idemHandoff: string;
         try {
-          idemHandoff = await recordConductorHandoff(ctlIdem as never, record, repoRoot, `approve/repeat ${targetJobName ?? 'resume'}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          idemHandoff = await recordConductorHandoff(ctlIdem as never, record, repoRoot, `approve/repeat ${targetJobName ?? 'resume'}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           try { ctlIdem.shutdown?.(); } catch {}
           throw error;
@@ -1118,12 +1136,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       // auto-reaped; --takeover bumps the epoch with audit.
       const approveFencing = await ensureApproveFencing(plan.id, repoRoot, {
         ...(wantTakeover ? { takeover: true as const } : {}),
-        command: `approve${wantTakeover ? ' --takeover' : ''}${retry ? ` --retry ${retry}` : ''}${relaunch ? ` --relaunch ${relaunch}` : ''}`,
+        command: `approve${wantTakeover ? ' --takeover' : ''}${retry ? ` --retry ${retry}` : ''}${relaunch ? ` --relaunch ${relaunch}` : ''}${approveActorSuffix}`,
       });
       if (wantTakeover && approveFencing) {
         try {
           const held = await readConductorLease(repoRoot).catch(() => null);
-          await appendAutoDecision(record.id, `conductor takeover: approve --takeover assumed plan ${plan.id} (epoch ${held?.epoch ?? '?'}, pid ${process.pid})`).catch(() => {});
+          await appendAutoDecision(record.id, `conductor takeover: approve --takeover${approveActorSuffix} assumed plan ${plan.id} (epoch ${held?.epoch ?? '?'}, pid ${process.pid}) — ${approveActorLabel}`).catch(() => {});
         } catch {}
       }
 
@@ -1158,12 +1176,13 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
         let handoff: string;
         try {
-          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
         }
         ctl.shutdown();
+        await appendAutoDecision(record.id, `approve --relaunch "${relaunch}"${approveActorSuffix} por ${approveActorLabel}: job relaunched with correction prompt; merge segue via review+merge gates`).catch(() => {});
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${relaunch}" relaunched with correction prompt.`,
           handoff,
@@ -1219,12 +1238,13 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         let retryHandoff: string;
         try {
-          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
         }
         ctl.shutdown();
+        await appendAutoDecision(record.id, `approve --retry "${retry}"${approveActorSuffix} por ${approveActorLabel}: job reset to ready_to_merge (touchSet re-validado quando aplicável); merge segue via review+merge gates`).catch(() => {});
         return [
           `Checkpoint "${checkpoint}" cleared. Job "${retry}" reset to ready_to_merge.`,
           retryHandoff,
@@ -1300,7 +1320,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
       let clearHandoff: string;
       try {
-        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/clear', { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/clear${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
       } catch (error) {
         ctl.shutdown();
         throw error;
@@ -1344,7 +1364,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     // G2: pending start also respects an existing lease (stale holder fenced).
     const startFencing = await ensureApproveFencing(plan.id, repoRoot, {
       ...(wantTakeover ? { takeover: true as const } : {}),
-      command: `approve${wantTakeover ? ' --takeover' : ''} --start`,
+      command: `approve${wantTakeover ? ' --takeover' : ''} --start${approveActorSuffix}`,
     });
     await savePlan(plan, repoRoot, startFencing);
     const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
@@ -1364,7 +1384,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
     let startHandoff: string;
     try {
-      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, 'approve/start', { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/start${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
     } catch (error) {
       ctl.shutdown();
       throw error;
@@ -1522,6 +1542,11 @@ export async function touchsetIntake(args: string[]): Promise<string> {
  */
 export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Promise<string> {
   const { flags } = parseFlags(args);
+  // M6: resume também registra ator (padrão agent-operator; human só via
+  // --actor explícito, sempre auto-declarado com ressalva).
+  const { actor: resumeActor } = resolveCliActor(flags, 'resume');
+  const resumeActorSuffix = ` --actor ${resumeActor}`;
+  const resumeActorLabel = formatActorLabel(resumeActor);
   const record = await resolveIntake(flags);
   // F02: resume inside the intake's repo scope (third-folder resume never touches launcher state).
   const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
@@ -1561,7 +1586,7 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
       // of declaring continuity. An old leader with a smaller epoch never
       // verifies here (fencing).
       try {
-        const lease = await claimConductorLease(plan.id, process.pid, `resume --intake ${record.id}`, 'resume', repoRoot);
+        const lease = await claimConductorLease(plan.id, process.pid, `resume --intake ${record.id}${resumeActorSuffix}`, 'resume', repoRoot);
         const owned = await verifyConductorLease(plan.id, process.pid, repoRoot, {
           token: lease.token,
           epoch: lease.epoch,
@@ -1585,7 +1610,7 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
         );
       }
     }
-    await appendAutoDecision(record.id, `handoff: ${line}`).catch(() => {});
+    await appendAutoDecision(record.id, `handoff: resume --intake ${record.id}${resumeActorSuffix} por ${resumeActorLabel} — ${line}`).catch(() => {});
     return line;
   }).catch(() => '');
   return [

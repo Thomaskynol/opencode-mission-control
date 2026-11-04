@@ -179,10 +179,27 @@ const DENIAL_MARKER_RE = new RegExp(
 );
 
 function splitSentences(text: string): string[] {
-  return text
-    .split(/[.!?\n;]+/)
-    .map((s) => s.trim().replace(/^#+\s*/, ''))
-    .filter((s) => s.length > 0);
+  // Backtick-aware: dots inside `code spans` (commands, paths, versions)
+  // are not sentence boundaries — splitting there shatters one instruction
+  // into fragments that prove nothing (or hide a contradiction).
+  const out: string[] = [];
+  let cur = '';
+  let inCode = false;
+  const flush = () => {
+    const s = cur.trim().replace(/^#+\s*/, '');
+    if (s.length > 0) out.push(s);
+    cur = '';
+  };
+  for (const ch of text) {
+    if (ch === '`') inCode = !inCode;
+    if (!inCode && (ch === '.' || ch === '!' || ch === '?' || ch === '\n' || ch === ';')) {
+      flush();
+    } else {
+      cur += ch;
+    }
+  }
+  flush();
+  return out;
 }
 
 function sentenceMentionsCriterion(sentenceLower: string, keywords: string[], literals: string[]): boolean {
@@ -216,15 +233,136 @@ function extrasOf(sentence: string, kwLower: string[], litLower: string[]): Set<
   return extras;
 }
 
-function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: string[]): boolean {
-  return PROCEDURAL_VERB_RE.test(sentence) && extrasOf(sentence, kwLower, litLower).size >= 2;
+function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: string[], criterionVerbs: string[] = []): boolean {
+  // A verb that merely restates a criterion keyword (same word family:
+  // "restore" for required "restoration") adds no instruction of its own —
+  // only a verb OUTSIDE the criterion's vocabulary counts. An exact
+  // (case-insensitive) copy of the criterion's own verb counts as a copy
+  // even when short (run/use/set) — it carries no new instruction.
+  const verbs = sentence.match(new RegExp(PROCEDURAL_VERB_RE.source, 'gi')) ?? [];
+  const addsInstruction = verbs.some((v) => !isKeywordCopyVerb(v, kwLower, criterionVerbs));
+  return addsInstruction && extrasOf(sentence, kwLower, litLower).size >= 2;
+}
+
+function commonPrefixLen(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
+}
+
+function isKeywordCopyVerb(verb: string, kwLower: string[], criterionVerbs: string[] = []): boolean {
+  const v = verb.toLowerCase();
+  if (criterionVerbs.includes(v)) return true;
+  if (v.length < 5) return false;
+  return kwLower.some((k) => k.length >= 5 && commonPrefixLen(v, k) >= 5);
+}
+
+/** Procedural verbs appearing in the criterion itself (lowercase, any length) —
+ *  the criterion's own wording, used only for the copy-verb check (never for gates). */
+function extractCriterionVerbs(description: string): string[] {
+  const out: string[] = [];
+  for (const m of description.match(new RegExp(PROCEDURAL_VERB_RE.source, 'gi')) ?? []) {
+    const v = m.toLowerCase();
+    if (!out.includes(v)) out.push(v);
+  }
+  return out;
 }
 
 /**
- * Affirmative explanatory substance: only an instructive sentence counts (procedural verb + new informative words).
- * Descriptive-only prose without instruction is inconclusive fail-closed (human/external decides, never auto-pass).
+ * Concrete checkable detail inside one sentence (general shapes, never
+ * topic words): inline code, a path, a number/version, or an explicit
+ * step marker. Bare prose verbs without any of these are shape without
+ * substance — any fluent nonsense passes a verb-only check.
  */
-function hasAffirmativeSubstance(combined: string, keywords: string[], literals: string[]): boolean {
+const STEP_MARKER_RE = new RegExp(
+  `(?:^|[\\s(])(?:\\d+[.)]|step\\s*\\d+|etapa\\s*\\d+|passo\\s*\\d+)\\b`,
+  'i',
+);
+
+function sentenceHasConcreteDetail(sentence: string): boolean {
+  if (/`[^`]+`/.test(sentence)) return true;
+  if (/\S+\/\S+/.test(sentence)) return true;
+  if (/\b\d/.test(sentence)) return true;
+  if (STEP_MARKER_RE.test(sentence)) return true;
+  return false;
+}
+
+// A negated instruction ("never run X", "do not delete Y", "não execute Z"):
+const NEGATED_INSTRUCTION_RE = new RegExp(
+  `(?:(?<![${WORD_CH}])(?:never|do\\s+not|don\\'t|does\\s+not|doesn\\'t|did\\s+not|didn\\'t|cannot|can\\'t|will\\s+not|won\\'t|n[ãa]o|nunca|jamais|sem)(?![${WORD_CH}]))[^.!?\\n]{0,40}(?<![${WORD_CH}])(?:${PROCEDURAL_VERB_SRC})(?![${WORD_CH}])`,
+  'i',
+);
+
+/** Checkable artifacts anchoring a sentence: code spans (whole + inner
+ * words, so `restore.sh` matches `restore.sh --from backup.tar.gz`),
+ * paths, numbers. */
+function sentenceArtifacts(sentence: string): Set<string> {
+  const out = new Set<string>();
+  const lower = sentence.toLowerCase();
+  for (const m of lower.matchAll(/`([^`]+)`|(\S+\/\S+)|\b\d+(?:\.\d+)*\b/g)) {
+    if (m[0]!.startsWith('`')) {
+      out.add(m[0]!);
+      for (const w of m[1]!.match(/[a-zà-ú0-9]{4,}/g) ?? []) {
+        if (!DOCS_STOPWORDS.has(w)) out.add(w);
+      }
+    } else {
+      out.add(m[0]!);
+    }
+  }
+  return out;
+}
+
+/**
+ * Internal contradiction (general, artifact-anchored): one sentence negates
+ * an instruction about the same checkable artifact another sentence gives
+ * ("run `restore.sh`" vs "never run `restore.sh`"). Word patterns cannot
+ * settle which side is right, so this is at minimum inconclusive
+ * fail-closed — never covered.
+ */
+function findContradiction(
+  sentences: string[],
+  keywords: string[] = [],
+  literals: string[] = [],
+  criterionVerbs: string[] = [],
+): string | null {
+  const arts = sentences.map(sentenceArtifacts);
+  for (let i = 0; i < sentences.length; i++) {
+    if (!NEGATED_INSTRUCTION_RE.test(sentences[i]!)) continue;
+    for (let j = 0; j < sentences.length; j++) {
+      if (i === j || arts[j]!.size === 0) continue;
+      const shared = [...arts[i]!].filter((a) => arts[j]!.has(a));
+      if (shared.length > 0) return `"${sentences[i]!.slice(0, 120)}" contradicts "${sentences[j]!.slice(0, 120)}"`;
+    }
+  }
+  // Fail-closed without a shared artifact: a negated instruction about the
+  // criterion plus another instructive sentence about the criterion pull in
+  // opposite directions — word patterns cannot settle it, never covered.
+  const kwLower = keywords.map((k) => k.toLowerCase());
+  const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i]!;
+    if (!NEGATED_INSTRUCTION_RE.test(s)) continue;
+    if (!sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
+    for (let j = 0; j < sentences.length; j++) {
+      if (i === j) continue;
+      const o = sentences[j]!;
+      if (!sentenceMentionsCriterion(o.toLowerCase(), keywords, literals)) continue;
+      if (!sentenceHasInstruction(o, kwLower, litLower, criterionVerbs)) continue;
+      return `"${s.slice(0, 120)}" contradicts "${o.slice(0, 120)}" (no shared artifact — fail-closed)`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Affirmative explanatory substance: instructive sentences (procedural verb
+ * beyond the criterion's own vocabulary + new informative words).
+ * Descriptive-only prose without instruction is inconclusive fail-closed
+ * (human/external decides, never auto-pass).
+ */
+function qualifyingInstructionSentences(combined: string, keywords: string[], literals: string[], criterionVerbs: string[] = []): string[] {
+  const found: string[] = [];
   const kwLower = keywords.map((k) => k.toLowerCase());
   const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
   for (const raw of splitSentences(combined)) {
@@ -235,10 +373,11 @@ function hasAffirmativeSubstance(combined: string, keywords: string[], literals:
     if (DENIAL_MARKER_RE.test(s) && sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
     const words3 = s.toLowerCase().match(/[a-zà-ú0-9]{3,}/g) ?? [];
     if (words3.length < 5) continue;
-    if (sentenceHasInstruction(s, kwLower, litLower)) return true;
+    if (sentenceHasInstruction(s, kwLower, litLower, criterionVerbs)) found.push(s);
   }
-  return false;
+  return found;
 }
+
 
 /**
  * Judge one acceptance requirement against examined docs content.
@@ -282,6 +421,7 @@ export function assessDocsCoverage(
   const keywords = extractKeywords(requirement.description).filter(
     (k) => !literals.some((l) => l.toLowerCase().includes(k)),
   );
+  const criterionVerbs = extractCriterionVerbs(requirement.description);
   // Global disclaimers void the whole doc (general patterns, EN+PT).
   for (const raw of splitSentences(combined)) {
     if (isGlobalDisclaimerSentence(raw)) {
@@ -305,7 +445,7 @@ export function assessDocsCoverage(
     if (DENIAL_MARKER_RE.test(raw)) {
       const kwLower = keywords.map((k) => k.toLowerCase());
       const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
-      if (!sentenceHasInstruction(raw, kwLower, litLower)) {
+      if (!sentenceHasInstruction(raw, kwLower, litLower, criterionVerbs)) {
         return failNotCovered(
           `docs deny coverage ("${raw.slice(0, 140)}") — content contradicts the criterion, fix the docs or accept explicitly`,
         );
@@ -347,12 +487,32 @@ export function assessDocsCoverage(
       }
     }
   }
-  // Substance gate: mention is not explanation. Without an affirmative
-  // instructional/explanatory sentence about the topic, coverage cannot be
-  // established — return the dedicated inconclusive state (fail-closed).
-  if (!hasAffirmativeSubstance(combined, keywords, literals)) {
+  // Internal contradiction voids coverage (at minimum inconclusive, fail-closed).
+  const contradiction = findContradiction(
+    splitSentences(combined).map((s) => s.trim()).filter((s) => s.length > 0),
+    keywords,
+    literals,
+    criterionVerbs,
+  );
+  if (contradiction) {
+    return failInconclusive(`docs contradict themselves (${contradiction}) — word patterns cannot settle which side is right`);
+  }
+  // Substance gate: mention is not explanation. With required literals, the
+  // literal plus an instructive sentence is verifiable substance. Without
+  // literals (broad criteria), only an instructive sentence ABOUT the
+  // criterion carrying concrete checkable detail counts — a single vague
+  // sentence, or plausible-but-unverifiable prose, is inconclusive
+  // fail-closed (never auto-pass, never "covered" on shape alone).
+  const instructions = qualifyingInstructionSentences(combined, keywords, literals, criterionVerbs);
+  const verified =
+    literals.length > 0
+      ? instructions.length > 0
+      : instructions.some(
+          (s) => sentenceMentionsCriterion(s.toLowerCase(), keywords, literals) && sentenceHasConcreteDetail(s),
+        );
+  if (!verified) {
     return failInconclusive(
-      `docs mention the topic but provide no affirmative explanatory substance (no instructive sentence with new informative content — only repetition, titles, or disclaimed text found)`,
+      `docs mention the topic but provide no verifiable affirmative substance (no instructive sentence with concrete checkable detail — only vague prose, repetition, titles, or disclaimed text found)`,
     );
   }
   const covered: DocsAssessment = {

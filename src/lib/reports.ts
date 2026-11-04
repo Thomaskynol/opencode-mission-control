@@ -118,6 +118,38 @@ export function describeOmoLimitation(detected: boolean, mode?: string): string 
   return `Limitation: OMO not detected${scope} — OMO paths unavailable; vanilla execution only, no silent OMO fallback.`;
 }
 
+/**
+ * M6: rotulagem canônica de ator para decisões/log/report.
+ * - human: auto-declaração via --actor, sem atestação fora de banda (nunca fato).
+ * - agent-operator / system: não-humanos.
+ * - ausente/qualquer outro: desconhecido (nunca atribuir ação a pessoa sem evidência).
+ */
+export function formatActorLabel(actor?: string): string {
+  if (actor === 'human') {
+    return 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)';
+  }
+  if (actor === 'agent-operator') {
+    return 'ator agent-operator (não-humano)';
+  }
+  if (actor === 'system') {
+    return 'ator system (automação do produto, não-humano)';
+  }
+  return 'ator desconhecido (desconhecido)';
+}
+
+/**
+ * M6: extrai o ator mencionado numa linha de decisão/log (`ator human|...`
+ * ou `--actor X`). Retorna undefined quando não há evidência de ator —
+ * o chamador deve então registrar desconhecido, nunca presumir.
+ */
+export function extractActorMention(text: string): 'human' | 'agent-operator' | 'system' | undefined {
+  const labeled = text.match(/ator\s+(human|agent-operator|system)\b/i);
+  if (labeled) return labeled[1]!.toLowerCase() as 'human' | 'agent-operator' | 'system';
+  const flag = text.match(/--actor\s*[= ]\s*(human|agent-operator|system)\b/i);
+  if (flag) return flag[1]!.toLowerCase() as 'human' | 'agent-operator' | 'system';
+  return undefined;
+}
+
 /** Max length for one-line report summaries shown in the human TUI. */
 export const REPORT_LINE_MAX = 140;
 
@@ -337,10 +369,16 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
     });
   }
   // Conductor takeover / intervenção do operador (evidência real de handoff).
-  if (/conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|touchset:/i.test(joined)) {
-    const excerpt = decisions.find((d) => /conductor takeover|approve --takeover|approve\/retry|touchset:/i.test(d));
+  // M6: cada decisão exibe o ator (human auto-declarado COM RESSALVA vs
+  // agent-operator vs system); sem evidência de ator, desconhecido.
+  if (/conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|approve --retry|approve --relaunch|approve\/clear|approve\/start|approve --start|resume --intake|resume: conductor|touchset:/i.test(joined)) {
+    const excerpt = decisions.find((d) => /conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|approve --retry|approve --relaunch|approve\/clear|approve\/start|approve --start|resume --intake|resume: conductor|touchset:/i.test(d));
+    const mentioned = excerpt ? extractActorMention(excerpt) : undefined;
+    const actorSuffix = mentioned
+      ? ` — por ${formatActorLabel(mentioned)}`
+      : ' — ator desconhecido (sem evidência de ator nos registros)';
     out.push({
-      problem: `intervenção do operador via caminho público${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}`,
+      problem: `intervenção do operador via caminho público${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}${actorSuffix}`,
       solution: 'handoff auditado (epoch/pid) + re-validação do produto; sem extrapolar posse',
       status: hasNonAcceptPass ? 'resolvido' : 'pendente',
     });
@@ -530,10 +568,19 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
     '',
     '## Gaps (Unmet / Unverified)',
     '',
-    ...finalReportLines(
-      (input.unmet ?? []).map((item) => `Unmet: ${item}`),
-      'No unmet items reported',
-    ),
+    ...(() => {
+      const unmetItems = input.unmet ?? [];
+      const unverifiedCount = (input.unverified ?? []).length + missingGapEntries.length;
+      // M6: "No unmet items" convivendo com Unverified induz otimismo —
+      // ausência de Unmet nunca é sucesso quando há Unverified.
+      if (unmetItems.length === 0 && unverifiedCount > 0) {
+        return [`- No unmet items reported (atenção: há ${unverifiedCount} item(ns) Unverified abaixo — ausência de Unmet não é sucesso)`];
+      }
+      return finalReportLines(
+        unmetItems.map((item) => `Unmet: ${item}`),
+        'No unmet items reported',
+      );
+    })(),
     '',
     ...finalReportLines(
       [...(input.unverified ?? []), ...missingGapEntries].map((item) => `Unverified: ${item}`),

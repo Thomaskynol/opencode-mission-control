@@ -8,6 +8,7 @@ import {
   writeFinalReport,
   describeOmoLimitation,
   deriveProblemsFromRecords,
+  formatActorLabel,
   type ReportStatus,
 } from '../lib/reports';
 import { writeReport } from '../lib/reports';
@@ -118,14 +119,9 @@ export const mc_report_final: ToolDefinition = tool({
       const appr = (job as unknown as { reviewApproval?: { actor?: string; actorEvidence?: string; reviewedCommit?: string } }).reviewApproval;
       const baseDetail = job.error ?? (job.mergedAt ? `merged at ${job.mergedAt}` : undefined);
       // Lane F cav-2.1: human é auto-declaração não atestada — nunca afirmar como fato.
+      // M6: rótulo canônico via formatActorLabel (human/com-ressalva vs não-humano vs desconhecido).
       if (appr) {
-        const actorLabel =
-          appr.actor === 'human'
-            ? 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
-            : appr.actor
-              ? `ator ${appr.actor} (não-humano)`
-              : 'ator desconhecido (desconhecido)';
-        const extra = `aceite ${actorLabel} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+        const extra = `aceite ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
         return { name: job.name, status: job.status, detail: baseDetail ? `${baseDetail}; ${extra}` : extra };
       }
       return {
@@ -168,12 +164,18 @@ export const mc_report_final: ToolDefinition = tool({
     // Pending human decisions always listed (parity with auto-report).
     let pendingGaps: string[] = [];
     try {
-      const persisted = (snap as { pendingQuestions?: Array<{ jobId: string; question: string }> } | null)?.pendingQuestions ?? [];
+      const persisted = (snap as { pendingQuestions?: Array<{ jobId: string; question: string; partId?: string }> } | null)?.pendingQuestions ?? [];
       const qs = [
         ...((intake as { questions?: string[] } | null)?.questions ?? []),
-        ...persisted.map((q) => `[${q.jobId}] ${q.question}`),
+        // M6: escalações de permissão (ask-user, timeout=Deny) rotuladas como
+        // tal quando o partId persistido indica perm:; demais seguem genéricas.
+        ...persisted.map((q) => (q.partId?.startsWith('perm:')
+          ? `permission escalation pendente (ask-user, timeout=Deny): [${q.jobId}] ${q.question}`
+          : `[${q.jobId}] ${q.question}`)),
       ];
-      pendingGaps = qs.map((q) => `pending human decision (blocks acceptance): ${q}`);
+      pendingGaps = qs.map((q) => q.startsWith('permission escalation')
+        ? q
+        : `pending human decision (blocks acceptance): ${q}`);
     } catch {
       pendingGaps = [];
     }
@@ -202,7 +204,7 @@ export const mc_report_final: ToolDefinition = tool({
     const decisions = [
       ...((intake as { decisions?: string[] } | null)?.decisions ?? []),
       ...((plan.auditLog ?? []) as Array<{ action: string; jobName?: string; actor?: string; actorEvidence?: string }>).map(
-        (a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}${a.actor ? (a.actor === 'human' ? ' — ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)' : ` — ator ${a.actor} (não-humano)`) : ''}${a.actorEvidence ? ` (${a.actorEvidence.slice(0, 120)})` : ''}`,
+        (a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''} — ${formatActorLabel(a.actor)}${a.actorEvidence ? ` (${a.actorEvidence.slice(0, 120)})` : ''}`,
       ),
     ];
     // OMO status declared explicitly (never a silent success): without OMO
@@ -211,19 +213,38 @@ export const mc_report_final: ToolDefinition = tool({
     // already names merged jobs without mc_report under Per-Instance
     // Contributions and Gaps.
     let omoLine = 'Limitation: OMO status unknown — vanilla execution only.';
-    let omoEnv = 'OMO status unknown — vanilla execution only (detection is not use).';
+    // M6: disponível vs carregado vs efetivamente utilizado (detecção nunca é uso).
+    const modesUsed = [...new Set(state.jobs.map((j) => j.mode))];
+    const modesStr = modesUsed.join(', ') || 'none';
+    let omoEnv = `OMO (disponível: status desconhecido; carregado: sem evidência runtime; utilizado: não — effective modes: ${modesStr}; detection is not use).`;
     try {
       const omo = await detectOMO().catch(() => null);
       if (omo) {
         omoLine = describeOmoLimitation(omo.detected, omo.configSource ?? undefined);
-        const modesUsed = [...new Set(state.jobs.map((j) => j.mode))];
         omoEnv = omo.detected
-          ? `OMO detected (${omo.configSource ?? 'unknown'} config) — NOT used: effective modes this run: ${modesUsed.join(', ') || 'none'}; detection is not use.`
-          : `OMO not detected — vanilla execution only (effective modes: ${modesUsed.join(', ') || 'none'}).`;
+          ? `OMO (disponível: detectado em config ${omo.configSource ?? 'unknown'}; carregado: sem evidência runtime; utilizado: não — effective modes this run: ${modesStr}; detection is not use).`
+          : `OMO (disponível: não detectado — vanilla execution only; carregado: n/a; utilizado: não — effective modes: ${modesStr}).`;
       }
     } catch {
       // Best-effort: the unknown-status line above already fails closed.
     }
+    // M6: plugins/skills em leitura apenas (sem alterar perfil global) —
+    // configurado não prova carregado, e nada disso prova utilizado.
+    let pluginEnv = 'plugins (disponível: ./opencode.json ilegível/ausente; carregado: sem evidência runtime; utilizado: nenhum comprovado — configuração não é uso).';
+    try {
+      const raw = await Bun.file('./opencode.json').text();
+      const cfg = JSON.parse(raw) as Record<string, unknown>;
+      const names = (['plugin', 'plugins'] as const).flatMap((k) => {
+        const v = cfg[k];
+        return Array.isArray(v) ? v : typeof v === 'string' ? [v] : [];
+      }).filter((x): x is string => typeof x === 'string');
+      pluginEnv = names.length > 0
+        ? `plugins (disponível: declarados em ./opencode.json: ${names.join(', ')}; carregado: sem evidência runtime; utilizado: nenhum comprovado — configuração não é uso).`
+        : 'plugins (disponível: nenhum declarado em ./opencode.json; carregado: sem evidência runtime; utilizado: nenhum comprovado).';
+    } catch {
+      // Best-effort: a linha padrão acima já declara o desconhecido.
+    }
+    const skillEnv = 'skills (disponível: sem inventário afirmado; carregado: sem evidência runtime; utilizado: nenhuma skill comprovadamente utilizada neste run).';
 
     // Used vs detected, from the records the run wrote (jobs.json pins are
     // server-observed, never config claims): per-job effective mode, agent
@@ -240,7 +261,39 @@ export const mc_report_final: ToolDefinition = tool({
         return `${job.name} [mode ${job.mode}, agent ${agent ?? 'unset'}] requested ${req} / observed ${obs}${job.remoteSessionID ? ` session ${job.remoteSessionID}` : ''}`;
       }),
       omoEnv,
+      pluginEnv,
+      skillEnv,
     ];
+
+    // M6: ramos não exercitados pertinentes + budget auto-fix, ambos a partir
+    // de registros reais (nunca valores afirmados sem evidência).
+    const allDecisions = decisions.join('\n');
+    const autoFixMatches = [...allDecisions.matchAll(/auto-fix attempt (\d+)\/(\d+)/g)];
+    let autoFixLine: string;
+    if (autoFixMatches.length > 0) {
+      const used = Math.max(...autoFixMatches.map((m) => Number(m[1])));
+      const budget = autoFixMatches[0]![2];
+      const exhausted = /auto-fix budget exhausted/i.test(allDecisions);
+      autoFixLine = `auto-fix: ${used}/${budget} tentativa(s) usada(s) (budget ${budget}, de 'auto-fix attempt N/${budget}' nos registros)${exhausted ? ' — budget esgotado, escalado ao operador' : ''}`;
+    } else {
+      autoFixLine = 'auto-fix: nenhuma tentativa registrada nos decisions — budget não observável nos registros (não afirmar valor)';
+    }
+    // fix-before-rollback só existe para jobs serve-mode (port + sessão
+    // remota); fora disso o merge segue para rollback direto em falha de teste.
+    const serveJobs = state.jobs.filter((j) => (j.port ?? 0) > 0 && j.remoteSessionID);
+    const nonServeJobs = state.jobs.filter((j) => !((j.port ?? 0) > 0 && j.remoteSessionID));
+    const fixRollbackLine = serveJobs.length > 0
+      ? `fix-before-rollback: disponível para ${serveJobs.map((j) => j.name).join(', ')} (serve-mode com sessão remota)${nonServeJobs.length > 0 ? `; inativo para ${nonServeJobs.map((j) => j.name).join(', ')} (sem port/remoteSessionID — falha de teste segue para rollback direto)` : ''}`
+      : 'fix-before-rollback: ramo não exercitado neste run (nenhum job serve-mode com sessão remota; falha de teste segue para rollback direto)';
+    const permissionLogLine = 'decisionLog de permissões (policy): efêmero em runtime, não conservado em estado persistido — sem anexo; escalações ask-user (timeout=Deny) aparecem em Gaps quando persistidas como pendingQuestions';
+
+    // M6: "nenhum accept usado" explícito quando for o caso; com aceites, a
+    // lista sob ressalva (nunca Verified por aceite — regra Lane F preservada).
+    const acceptJobs = plan.jobs.filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval);
+    const acceptDecisionCount = allDecisions.split('\n').filter((d) => /approve accept|operator accept honored/i.test(d)).length;
+    const noAcceptLine = acceptJobs.length === 0 && acceptDecisionCount === 0
+      ? 'Nenhum review accept usado neste run (nenhum aceite registrado — sem ressalvas pendentes por aceite)'
+      : null;
 
     const markdown = buildFinalReportMarkdown({
       title: plan.name,
@@ -273,17 +326,13 @@ export const mc_report_final: ToolDefinition = tool({
           return `${rec.jobName ?? 'job'} [${rec.testStatus ?? 'skipped'}]${rec.testCommand ? ` ${rec.testCommand}` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}${rec.testOutput ? ` — ${rec.testOutput.slice(0, 200)}` : ''}`;
         }),
         // Lane F cav-2.1: aceites exibidos como evidência rotulada (auto-declaração nunca como fato) + ressalva.
+        // M6: rótulo canônico via formatActorLabel; sem aceites, linha explícita (nunca silêncio).
+        ...(noAcceptLine ? [noAcceptLine] : []),
         ...plan.jobs
           .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
           .map((job) => {
             const appr = (job as unknown as { reviewApproval: { actor?: string; reviewedCommit?: string; reason?: string } }).reviewApproval;
-            const label =
-              appr.actor === 'human'
-                ? 'human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
-                : appr.actor
-                  ? `${appr.actor} (não-humano)`
-                  : 'desconhecido (desconhecido)';
-            return `accept "${job.name}" por ${label} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+            return `accept "${job.name}" por ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
           }),
         ...notes,
         `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
@@ -319,7 +368,7 @@ export const mc_report_final: ToolDefinition = tool({
       unmet,
       unverified,
       environment,
-      limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine],
+      limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine, autoFixLine, fixRollbackLine, permissionLogLine],
       nextSteps: unverified.length > 0 || unmet.length > 0
         ? ['Resolve the Gaps above, then re-run this report']
         : [],
