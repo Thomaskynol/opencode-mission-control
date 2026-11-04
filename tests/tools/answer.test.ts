@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import * as jobState from '../../src/lib/job-state';
 import * as config from '../../src/lib/config';
 import * as sdkClient from '../../src/lib/sdk-client';
@@ -22,6 +22,10 @@ const mockContext = {
 } as any;
 
 describe('mc_answer v2 sender (review fix)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
 
