@@ -143,7 +143,11 @@ export const mc_report_final: ToolDefinition = tool({
     //   acceptance-less). Integration-only smoke never verifies; it renders
     //   under Gaps. Unknown work stays under Gaps, never under Verified.
     const evidenceRecs = Object.values(mergeEvidence as Record<string, { testStatus?: string; testCommand?: string; reviewedCommit?: string; scope?: string; acceptanceLess?: boolean }>);
-    const { isTaskVerified } = await import('../lib/verification.js');
+    const { isTaskVerified, isTrivialTestCommand } = await import('../lib/verification.js');
+    const trivialOf = (name: string): string | null => {
+      const rec = (mergeEvidence as Record<string, { testCommand?: string }>)[name];
+      return rec?.testCommand && isTrivialTestCommand(rec.testCommand) ? rec.testCommand : null;
+    };
     // R2: retry operacional (sem reviewApproval) pode verificar via gates;
     // accept (com reviewApproval) nunca — fail-closed mesmo com task-scoped pass
     // (ex.: pass anterior + aceite posterior). retry ≠ accept em todos os escopos.
@@ -159,8 +163,12 @@ export const mc_report_final: ToolDefinition = tool({
         return `${name} [merged, task-scoped]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
       });
     const verified = excludeAcceptedFromVerified(verifiedCandidates, [...acceptedByJob.keys()]);
+    // Trivial no-op (`true`/echo puro) nunca verifica: fora de Verified
+    // (via isTaskVerified) e fora do smoke global — gap explícito próprio.
+    const trivialNames = merged.filter((name) => trivialOf(name) !== null);
+    const trivialGaps = trivialNames.map((name) => `${name} [merged] — comando de teste trivial "${trivialOf(name)}" (no-op, não é verificação funcional), outcome not verified`);
     const integrationCovered = merged
-      .filter((name) => !isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never) && (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed')
+      .filter((name) => !isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never) && (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed' && trivialOf(name) === null)
       .map((name) => {
         const rec = (mergeEvidence as Record<string, { testCommand?: string }>)[name];
         return `${name} [merged] — covered only by global integration smoke${rec?.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
@@ -177,7 +185,7 @@ export const mc_report_final: ToolDefinition = tool({
       .filter(([name]) => merged.includes(name) && !verifiedNames.has(name))
       .map(([name, actor]) => formatAcceptGap(name, actor));
     const silentMergedGaps = merged
-      .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name))
+      .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && trivialOf(name) === null)
       .map((name) => `${name} [merged] — sem evidência task-scoped, outcome not verified`);
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
@@ -210,6 +218,7 @@ export const mc_report_final: ToolDefinition = tool({
         .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
         .map((job) => `${job.name} [${job.status}] — outcome not verified`),
       ...integrationCovered.map((entry) => `${entry}`),
+      ...trivialGaps.map((entry) => `${entry}`),
       ...acceptGaps,
       ...silentMergedGaps,
       ...pendingGaps,
@@ -226,7 +235,14 @@ export const mc_report_final: ToolDefinition = tool({
       .filter((r) => (r as { testCommand?: string }).testCommand)
       .map((r) => {
         const rec = r as { testCommand?: string; testStatus?: string; testOutput?: string };
-        return { command: rec.testCommand!, result: rec.testStatus ?? 'skipped', output: rec.testOutput };
+        const trivial = !!rec.testCommand && isTrivialTestCommand(rec.testCommand);
+        return {
+          command: rec.testCommand!,
+          result: trivial && (rec.testStatus ?? 'skipped') === 'passed'
+            ? 'passed (no-op, não é verificação funcional)'
+            : (rec.testStatus ?? 'skipped'),
+          output: rec.testOutput,
+        };
       });
     const decisions = [
       ...((intake as { decisions?: string[] } | null)?.decisions ?? []),
@@ -366,11 +382,18 @@ export const mc_report_final: ToolDefinition = tool({
       ],
       problems: (() => {
         // Lane F: Problems de registros reais (resolvido/pendente/desconhecido).
-        const base = unmet.map((entry) => ({
-          problem: entry,
-          solution: 'See job error and retry via mc_plan_approve',
-          status: 'pendente' as const,
-        }));
+        const base = [
+          ...unmet.map((entry) => ({
+            problem: entry,
+            solution: 'See job error and retry via mc_plan_approve',
+            status: 'pendente' as const,
+          })),
+          ...trivialNames.map((name) => ({
+            problem: `comando de teste trivial "${trivialOf(name)}" em "${name}" (no-op, não é verificação funcional) — sem verificação funcional`,
+            solution: 'configurar comando de teste funcional (ex.: bun test / node --test) e re-verificar por critério',
+            status: 'pendente' as const,
+          })),
+        ];
         const derived = deriveProblemsFromRecords({
           title: plan.name,
           decisions,

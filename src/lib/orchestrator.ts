@@ -8,6 +8,7 @@ import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAt
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit, matchesTouchPattern } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, needsReReview, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
 import { isDocsOnlyChange, assessDocsCoverage, assessDocsCoverageWithSemantics } from './docs-review';
+import { isTrivialTestCommand } from './verification';
 import { reviewFunctionallyViaOpenCode, reviewDocsViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput, type DocsCriterionResult } from './opencode-reviewer';
 import { runTestsOnImmutableSnapshot } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
@@ -266,6 +267,9 @@ export function validateCeiling(ceiling?: { maxParallel?: number; testCommand?: 
     if (typeof t !== 'string' || !t.trim()) {
       throw new Error('Invalid ceiling testCommand: must be a non-empty string.');
     }
+    if (isTrivialTestCommand(t)) {
+      throw new Error(`Invalid ceiling testCommand "${t.trim()}": trivial no-op (não é verificação funcional) — configure um comando de teste funcional.`);
+    }
     out.testCommand = t.trim();
   }
   return out;
@@ -286,6 +290,9 @@ export function resolveEffectiveMaxParallel(ceilingMax?: number, fallback?: numb
 export function resolveEffectiveTestCommand(ceilingTest?: string, fallback?: string): string | undefined {
   if (ceilingTest !== undefined) {
     if (!ceilingTest.trim()) throw new Error('Invalid ceiling testCommand: must be non-empty.');
+    if (isTrivialTestCommand(ceilingTest)) {
+      throw new Error(`Invalid ceiling testCommand "${ceilingTest.trim()}": trivial no-op (não é verificação funcional) — configure um comando de teste funcional.`);
+    }
     return ceilingTest.trim();
   }
   return fallback;
@@ -1746,7 +1753,7 @@ export class Orchestrator {
         // ou A→B→A restore no original durante o run falha, nunca é atribuído.
         const configured = this.getEffectiveTestCommand();
         const cmd = configured ?? await detectTestCommand(repoRoot);
-        if (!cmd) {
+        if (!cmd || isTrivialTestCommand(cmd)) {
           throw new Error('Destination advanced since plan base but no test command exists to reverify — refusing to complete');
         }
         const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
@@ -1945,8 +1952,12 @@ export class Orchestrator {
           .map((job) => [job.name, (job as unknown as { reviewApproval: { actor?: string } }).reviewApproval.actor] as const),
       );
       const verified = excludeAcceptedFromVerified(verifiedCandidates, [...acceptedByJob.keys()]);
+      // Trivial no-op (`true`/echo puro) nunca verifica: fora de Verified
+      // (via isTaskVerified) e fora do smoke global — gap explícito próprio.
+      const trivialNames = merged.filter((name) => isTrivialTestCommand(evOf(name).testCommand));
+      const trivialGaps = trivialNames.map((name) => `${name} [merged] — comando de teste trivial "${evOf(name).testCommand}" (no-op, não é verificação funcional), outcome not verified`);
       const integrationCovered = merged
-        .filter((name) => !taskVerified(name) && evOf(name).testStatus === 'passed')
+        .filter((name) => !taskVerified(name) && evOf(name).testStatus === 'passed' && !isTrivialTestCommand(evOf(name).testCommand))
         .map((name) => {
           const rec = evOf(name);
           return `${name} [merged] — covered only by global integration smoke${rec.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
@@ -1961,7 +1972,7 @@ export class Orchestrator {
         .filter(([name]) => merged.includes(name) && !verifiedNames.has(name))
         .map(([name, actor]) => formatAcceptGap(name, actor));
       const silentMergedGaps = merged
-        .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && !evOf(name).acceptanceLess)
+        .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && !evOf(name).acceptanceLess && !isTrivialTestCommand(evOf(name).testCommand))
         .map((name) => `${name} [merged] — sem evidência task-scoped, outcome not verified`);
       const unmet = plan.jobs
         .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
@@ -2001,6 +2012,7 @@ export class Orchestrator {
           .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
           .map((job) => `${job.name} [${job.status}] — outcome not verified`),
         ...integrationCovered.map((entry) => `${entry}`),
+        ...trivialGaps.map((entry) => `${entry}`),
         ...acceptGaps.map((entry) => `${entry}`),
         ...silentMergedGaps.map((entry) => `${entry}`),
         ...acceptanceLessEntries.map((entry) => `${entry}`),
@@ -2017,7 +2029,13 @@ export class Orchestrator {
       ])];
       const tests = evidenceList
         .filter((r) => r.testCommand)
-        .map((r) => ({ command: `${r.scope === 'integration' ? '[integration] ' : r.scope === 'task' ? '[task] ' : ''}${r.testCommand!}`, result: r.testStatus, output: r.testOutput }));
+        .map((r) => ({
+          command: `${r.scope === 'integration' ? '[integration] ' : r.scope === 'task' ? '[task] ' : ''}${r.testCommand!}`,
+          result: isTrivialTestCommand(r.testCommand) && r.testStatus === 'passed'
+            ? 'passed (no-op, não é verificação funcional)'
+            : r.testStatus,
+          output: r.testOutput,
+        }));
       const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
       // OMO status declared explicitly (never a silent success): without OMO
       // the report records vanilla-only execution as the limitation.
@@ -2057,7 +2075,13 @@ export class Orchestrator {
           ...evidenceList.map((r) => `${r.jobName} [${r.testStatus}]${r.testCommand ? ` ${r.testCommand}` : ''}${r.reviewedCommit ? ` @ ${r.reviewedCommit.slice(0, 8)}` : ''}${r.testOutput ? ` — ${r.testOutput.slice(0, 200)}` : ''}`),
           `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
         ],
-        problems: unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
+        problems: [
+          ...unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
+          ...trivialNames.map((name) => ({
+            problem: `comando de teste trivial "${evOf(name).testCommand}" em "${name}" (no-op, não é verificação funcional) — sem verificação funcional`,
+            solution: 'configurar comando de teste funcional (ex.: bun test / node --test) e re-verificar por critério',
+          })),
+        ],
         verified,
         unmet,
         unverified,
@@ -2967,9 +2991,15 @@ export class Orchestrator {
           const verifyWorktree = latestPlan.integrationWorktree!;
           const verifyConfigured = this.getEffectiveTestCommand();
           const verifyCommand = verifyConfigured ?? await detectTestCommand(verifyWorktree);
-          if (!verifyCommand) {
-            this.showToast('Mission Control', 'All jobs merged but no test command exists — blocked (never verified without evidence).', 'error');
-            this.notify('❌ All jobs merged but no test command exists to verify the integration — blocked (never success-skipped). Add a test command and retry with mc_plan_approve(checkpoint: "on_error").');
+          // Trivial no-op (`true`/echo puro) nunca é verificação funcional:
+          // sem comando válido o gate segue o caminho !verifyCommand existente
+          // (fail-closed, nunca success-skipped).
+          if (!verifyCommand || isTrivialTestCommand(verifyCommand)) {
+            const why = verifyCommand
+              ? `trivial no-op "${verifyCommand}" (não é verificação funcional)`
+              : 'no test command exists';
+            this.showToast('Mission Control', `All jobs merged but ${why} — blocked (never verified without evidence).`, 'error');
+            this.notify(`❌ All jobs merged but ${why} to verify the integration — blocked (never success-skipped). Add a test command and retry with mc_plan_approve(checkpoint: "on_error").`);
             await this.setCheckpoint('on_error', latestPlan, {
               jobName: latestPlan.jobs[latestPlan.jobs.length - 1]?.name ?? 'unknown',
               failureKind: 'test_failure',

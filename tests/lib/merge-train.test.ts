@@ -65,7 +65,7 @@ async function setupRepo(): Promise<TestRepo> {
 
   writeFileSync(
     join(repoDir, 'package.json'),
-    JSON.stringify({ scripts: { test: 'true' } }, null, 2),
+    JSON.stringify({ scripts: { test: 'test -f package.json' } }, null, 2),
   );
   writeFileSync(join(repoDir, '.gitignore'), 'node_modules\n');
   writeFileSync(join(repoDir, 'base.txt'), 'base\n');
@@ -116,7 +116,7 @@ describe('MergeTrain', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.testReport.status).toBe('passed');
-      expect(result.testReport.command).toBe('true');
+      expect(result.testReport.command).toBe('test -f package.json');
       expect(result.testReport.setup.status).toBe('skipped');
     }
     const status = await mustExec(
@@ -304,7 +304,7 @@ describe('MergeTrain', () => {
 
     const train = new MergeTrain(testRepo.integrationWorktree, {
       setupCommands: ['false'],
-      testCommand: 'true',
+      testCommand: 'test -f package.json',
       testTimeout: 60000,
     });
     train.enqueue(makeJob('feature-setup-fail'));

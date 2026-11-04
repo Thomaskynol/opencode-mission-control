@@ -133,4 +133,39 @@ describe('OMO Detector', () => {
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
   });
+
+  it('should detect OMO with real user config (plugins plural + slim@version)', async () => {
+    const config = {
+      plugins: ['oh-my-opencode-slim@3.0.4', 'opencode-mission-control'],
+    };
+    await Bun.write('./opencode.json', JSON.stringify(config));
+
+    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+
+    expect(status.detected).toBe(true);
+    expect(status.configSource).toBe('local');
+  });
+
+  it('should detect OMO with oh-my-openagent entry', async () => {
+    const config = {
+      plugins: ['oh-my-openagent', 'opencode-mission-control'],
+    };
+    await Bun.write('./opencode.json', JSON.stringify(config));
+
+    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+
+    expect(status.detected).toBe(true);
+    expect(status.configSource).toBe('local');
+  });
+
+  it('should resolve sisyphusPath from localPath directory', async () => {
+    mkdirSync('./sub', { recursive: true });
+    mkdirSync('./sub/.sisyphus', { recursive: true });
+    await Bun.write('./sub/opencode.json', JSON.stringify({ plugins: ['oh-my-openagent'] }));
+
+    const status = await detectOMO('./sub/opencode.json', '/nonexistent/global.json');
+
+    expect(status.detected).toBe(true);
+    expect(status.sisyphusPath).toBe('sub/.sisyphus');
+  });
 });

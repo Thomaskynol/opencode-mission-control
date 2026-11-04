@@ -3,6 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import * as paths from '../../src/lib/paths';
 import { addPendingQuestion, clearPendingQuestionsForJob } from '../../src/lib/question-relay';
+import { ensureBaseReady } from '../../src/lib/auto-plan';
 import { answerQuestion } from '../../src/orchestrator-cli/forms';
 import { dispatchCommand, type HumanControls } from '../../src/orchestrator-cli/commands';
 import { loadAutoIntake } from '../../src/lib/durable-state';
@@ -199,5 +200,123 @@ describe('answer routing: free-text content is never an approve/deny', () => {
     ).rejects.toThrow(/clarification/i);
     expect(prompted).toBe(0);
     expect(calls.filter((c) => c.url.includes('/permission/'))).toHaveLength(0);
+  });
+});
+
+describe('ensureBaseReady detached-HEAD fallback (lane worktrees)', () => {
+  async function git(cwd: string, ...args: string[]): Promise<void> {
+    const proc = Bun.spawn(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+    await proc.exited;
+  }
+
+  /** Isolated fixture: git init tmp + commit + branch -M main, then detach. */
+  async function makeDetachedRepo(): Promise<string> {
+    const fs = await import('fs');
+    const dir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-detached-'));
+    await git(dir, 'init', '-q');
+    await git(
+      dir,
+      '-c',
+      'user.email=t@t',
+      '-c',
+      'user.name=t',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'init',
+    );
+    await git(dir, 'branch', '-M', 'main');
+    await git(dir, 'checkout', '--detach', 'HEAD');
+    return dir;
+  }
+
+  it('falls back to main/master instead of throwing "has no current branch"', async () => {
+    const fs = await import('fs');
+    const dir = await makeDetachedRepo();
+    try {
+      const ready = await ensureBaseReady(dir);
+      expect(ready.baseBranch).toBe('main');
+      expect(ready.createdBranch).toBe(false);
+      expect(ready.baseCommit).toMatch(/^[0-9a-f]+$/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stays fail-closed: no commits still throws, invalid branch still throws', async () => {
+    const fs = await import('fs');
+    const empty = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-empty-'));
+    try {
+      await git(empty, 'init', '-q');
+      await expect(ensureBaseReady(empty)).rejects.toThrow(/no commits|minimal preparation/i);
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
+    const dir = await makeDetachedRepo();
+    try {
+      await expect(ensureBaseReady(dir, 'bad name')).rejects.toThrow(/invalid destination/i);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('H1: refuses to guess when show-current fails while HEAD is attached', async () => {
+    const fs = await import('fs');
+    // Attached repo: show-current would normally print "main". The shim
+    // breaks ONLY `branch --show-current`, so the old code silently fell back
+    // to main; the fix must rethrow instead of masking the git failure.
+    const dir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-attached-'));
+    await git(dir, 'init', '-q');
+    await git(
+      dir,
+      '-c',
+      'user.email=t@t',
+      '-c',
+      'user.name=t',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'init',
+    );
+    await git(dir, 'branch', '-M', 'main');
+    // Shim git: fail ONLY `branch --show-current` (simulated broken git).
+    // Bun resolves binaries via the startup PATH, so the shim must run in a
+    // subprocess born with the shim first — in-process PATH mutation never
+    // intercepts. The old code silently fell back to main here.
+    const realGitProc = Bun.spawn(['sh', '-c', 'command -v git'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const realGit = (await new Response(realGitProc.stdout).text()).trim();
+    await realGitProc.exited;
+    const shimDir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-shim-'));
+    await Bun.write(
+      join(shimDir, 'git'),
+      `#!/bin/sh\nif [ "$1" = "branch" ] && [ "$2" = "--show-current" ]; then echo "simulated git breakage" >&2; exit 1; fi\nexec ${realGit} "$@"\n`,
+    );
+    const chmod = Bun.spawn(['chmod', '+x', join(shimDir, 'git')], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    await chmod.exited;
+    const autoPlanPath = join(import.meta.dir, '..', '..', 'src', 'lib', 'auto-plan.ts');
+    const code = [
+      `import { ensureBaseReady } from ${JSON.stringify(autoPlanPath)};`,
+      `try { const r = await ensureBaseReady(${JSON.stringify(dir)}); console.log('RESOLVED ' + r.baseBranch); }`,
+      `catch (e) { console.log('REJECTED ' + (e as Error).message); }`,
+    ].join('\n');
+    const proc = Bun.spawn([process.execPath, '-e', code], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, PATH: `${shimDir}:${process.env.PATH ?? ''}` },
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    try {
+      expect(out).toMatch(/REJECTED.*show-current/i);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(shimDir, { recursive: true, force: true });
+    }
   });
 });

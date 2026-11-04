@@ -113,7 +113,7 @@ async function createTestRepo(): Promise<{ path: string; cleanup: () => void }> 
   mkdirSync(join(repoPath, 'src'), { recursive: true });
   writeFileSync(
     join(repoPath, 'package.json'),
-    JSON.stringify({ scripts: { test: "echo 'Tests pass'" } }, null, 2),
+    JSON.stringify({ scripts: { test: 'test -f package.json' } }, null, 2),
   );
   writeFileSync(join(repoPath, 'README.md'), '# Mission Control\n');
   writeFileSync(join(repoPath, 'src', 'index.ts'), "export const value = 'initial';\n");

@@ -443,4 +443,115 @@ describe('ensureBaseReady (fresh repo / missing branch)', () => {
       /repo not found|not a directory/i,
     );
   });
+
+  it('H1: rejects a non-git directory as not-a-repo (never "no commits")', async () => {
+    const fs = await import('fs');
+    const dir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-notrepo-'));
+    try {
+      await expect(ensureBaseReady(dir)).rejects.toThrow(/not a git repository/i);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('H2: prefers the branch containing the detached commit when main and master both exist', async () => {
+    const fs = await import('fs');
+    const dir = await makeRepo(true);
+    try {
+      await git(dir, 'branch', '-M', 'main');
+      await git(dir, 'branch', 'master');
+      await git(dir, 'checkout', '-q', 'master');
+      await git(dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'master-only');
+      const proc = Bun.spawn(['git', 'rev-parse', 'HEAD'], {
+        cwd: dir,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const sha = (await new Response(proc.stdout).text()).trim();
+      await proc.exited;
+      await git(dir, 'checkout', '-q', '--detach', sha);
+      const ready = await ensureBaseReady(dir);
+      expect(ready.baseBranch).toBe('master');
+      expect(ready.createdBranch).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('H2: uses the repo default deterministically when both main and master contain HEAD', async () => {
+    const fs = await import('fs');
+    const dir = await makeRepo(true);
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warns.push(args.map(String).join(' '));
+    };
+    try {
+      await git(dir, 'branch', '-M', 'main');
+      await git(dir, 'branch', 'master');
+      await git(dir, 'checkout', '-q', '--detach', 'HEAD');
+      const ready = await ensureBaseReady(dir);
+      expect(ready.baseBranch).toBe('main');
+      expect(warns.join('\n')).toMatch(/both.*main.*master/i);
+    } finally {
+      console.warn = origWarn;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('H3: stays fail-closed with a detached-HEAD diagnosis when no default branch exists', async () => {
+    const fs = await import('fs');
+    const dir = await makeRepo(true);
+    try {
+      await git(dir, 'branch', '-M', 'main');
+      await git(dir, 'checkout', '-qb', 'trunk');
+      await git(dir, 'branch', '-D', 'main');
+      await git(dir, 'checkout', '-q', '--detach', 'HEAD');
+      await expect(ensureBaseReady(dir)).rejects.toThrow(/detached HEAD/i);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('H4: operates on the given repo regardless of process cwd', async () => {
+    const fs = await import('fs');
+    const { relative } = await import('path');
+    const dir = await makeRepo(true);
+    const other = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-elsewhere-'));
+    const prevCwd = process.cwd();
+    try {
+      await git(dir, 'branch', '-M', 'main');
+      await git(dir, 'checkout', '-q', '--detach', 'HEAD');
+      process.chdir(other);
+      const abs = await ensureBaseReady(dir);
+      expect(abs.baseBranch).toBe('main');
+      const rel = await ensureBaseReady(relative(other, dir));
+      expect(rel.baseBranch).toBe('main');
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('H5: never substitutes the fallback for an explicit targetBranch', async () => {
+    const fs = await import('fs');
+    const dir = await makeRepo(true);
+    try {
+      await git(dir, 'branch', '-M', 'main');
+      await git(dir, 'branch', 'master');
+      // Explicit invalid fails even though main is valid (no silent fallback).
+      await expect(ensureBaseReady(dir, 'bad name')).rejects.toThrow(/invalid destination/i);
+      // Explicit non-default valid is respected (not replaced by main).
+      const explicit = await ensureBaseReady(dir, 'master');
+      expect(explicit.baseBranch).toBe('master');
+      expect(explicit.createdBranch).toBe(false);
+      // Explicit missing is created locally (not replaced by main).
+      const created = await ensureBaseReady(dir, 'feat/from-explicit');
+      expect(created.baseBranch).toBe('feat/from-explicit');
+      expect(created.createdBranch).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

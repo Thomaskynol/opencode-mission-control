@@ -78,7 +78,7 @@ describe('F04 ceiling regression (public path, --max-parallel 1 respected)', () 
     // Public Orchestrator entry used by `start --repo ... --max-parallel 1 --test-command ...`
     // with launch deferred (no tmux) — still must validate + apply effective config.
     const res = await orch.startAutonomousPlan(
-      { request: 'do X', repo: repoA, ceiling: { maxParallel: 1, testCommand: 'echo hi' } },
+      { request: 'do X', repo: repoA, ceiling: { maxParallel: 1, testCommand: 'node --test' } },
       generate,
       { launch: false } as unknown as { launch?: boolean },
     );
@@ -90,7 +90,7 @@ describe('F04 ceiling regression (public path, --max-parallel 1 respected)', () 
     });
     expect(typeof eff.getEffectiveMaxParallel).toBe('function');
     expect(eff.getEffectiveMaxParallel!()).toBe(1);
-    expect(eff.getEffectiveTestCommand!()).toBe('echo hi');
+    expect(eff.getEffectiveTestCommand!()).toBe('node --test');
     // Clamp 4-8 must NOT reinterpret explicit 1 as 4.
     const { clampMaxParallel } = await import('../../src/lib/coordinator');
     expect(clampMaxParallel(1)).toBe(4); // documents the old reinterpretation

@@ -1,5 +1,5 @@
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { existsSync } from 'fs';
 
 export interface OMOStatus {
@@ -17,7 +17,7 @@ export async function detectOMO(
   localPath: string = './opencode.json',
   globalPath: string = join(homedir(), '.config', 'opencode', 'opencode.json'),
 ): Promise<OMOStatus> {
-  const basePath = '.';
+  const basePath = dirname(localPath);
 
   // Check local config first
   const localStatus = await checkConfigFile(localPath);
@@ -106,13 +106,18 @@ function stripJsonc(text: string): string {
 }
 
 /**
- * Match OMO plugin entries: exact "oh-my-opencode" or variants like
- * "oh-my-opencode-slim", ignoring a "@version" pin suffix.
+ * Match OMO plugin entries: "oh-my-opencode" (+ "-slim" etc. variants) and
+ * its successor "oh-my-openagent", ignoring a "@version" pin suffix.
  */
 function isOmoEntry(entry: unknown): boolean {
   if (typeof entry !== 'string') return false;
   const base = entry.split('@')[0] ?? '';
-  return base === 'oh-my-opencode' || base.startsWith('oh-my-opencode-');
+  return (
+    base === 'oh-my-opencode' ||
+    base.startsWith('oh-my-opencode-') ||
+    base === 'oh-my-openagent' ||
+    base.startsWith('oh-my-openagent-')
+  );
 }
 
 /**
@@ -158,8 +163,7 @@ async function getSisyphusPath(basePath: string = '.'): Promise<string | null> {
   try {
     const sisyphusPath = join(basePath, '.sisyphus');
     const exists = existsSync(sisyphusPath);
-    // Return relative path without leading ./
-    return exists ? '.sisyphus' : null;
+    return exists ? sisyphusPath : null;
   } catch {
     return null;
   }

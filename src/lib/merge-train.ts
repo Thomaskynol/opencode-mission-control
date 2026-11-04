@@ -6,6 +6,8 @@ import { getIntegrationWorktree, withIntegrationLock } from './integration';
 import { extractConflicts } from './utils';
 import { createV2Client, v2Prompt } from './sdk-client';
 import type { ReviewVerdict } from './reviewer';
+import { isTrivialTestCommand } from './verification';
+export { isTrivialTestCommand } from './verification';
 import {
   verifyMergeFencing,
   type MergeFencingIdentity,
@@ -371,9 +373,10 @@ export async function detectTestCommand(worktreePath: string): Promise<string | 
     };
 
     const testScript = packageJson.scripts?.test;
-    return typeof testScript === 'string' && testScript.trim() !== ''
-      ? testScript
-      : null;
+    if (typeof testScript !== 'string' || testScript.trim() === '') return null;
+    // `true`/no-op nunca é verificação funcional — sem comando executável.
+    if (isTrivialTestCommand(testScript)) return null;
+    return testScript;
   } catch {
     return null;
   }

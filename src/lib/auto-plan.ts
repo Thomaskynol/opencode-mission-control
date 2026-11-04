@@ -14,7 +14,7 @@ import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
 import { matchesTouchPattern, touchPatternsOverlap } from './merge-train';
-import { gitCommand } from './git';
+import { gitCommand, getDefaultBranch } from './git';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 
 export interface AutoCeiling {
@@ -656,6 +656,59 @@ export function draftToJobSpecs(draft: AutoPlanDraft): Array<Omit<JobSpec, 'id' 
 }
 
 /**
+ * Detached-HEAD fallback precedence (deterministic, documented):
+ * 1. only one of main/master exists locally → that one;
+ * 2. both exist → the one containing the detached commit
+ *    (`merge-base --is-ancestor HEAD <branch>`); when both or neither
+ *    contain it, the repo default (getDefaultBranch) wins if it resolves
+ *    locally, and the ambiguity is console.warn-logged, never silent;
+ * 3. neither exists → the repo default (e.g. origin/HEAD) if verifiable,
+ *    else fail closed with the checked refs named (never guess silently).
+ */
+async function resolveDetachedFallbackBranch(absRepo: string, displayRepo: string): Promise<string> {
+  const probe = (args: string[]) => gitCommand(args, { cwd: absRepo });
+  const existsLocal = async (branch: string): Promise<boolean> =>
+    (await probe(['rev-parse', '--verify', branch])).exitCode === 0;
+  const containsHead = async (branch: string): Promise<boolean> =>
+    (await probe(['merge-base', '--is-ancestor', 'HEAD', branch])).exitCode === 0;
+  const failClosed = async (): Promise<never> => {
+    const dflt = await getDefaultBranch(absRepo);
+    throw new Error(
+      `Repo at "${displayRepo}" is on a detached HEAD and no default branch resolves ` +
+        `(no local "main"/"master"; repo default "${dflt}" does not resolve) — ` +
+        `minimal preparation: git switch -c main (or git branch -m main on an attached branch), then retry.`,
+    );
+  };
+
+  const hasMain = await existsLocal('main');
+  const hasMaster = await existsLocal('master');
+  if (hasMain !== hasMaster) return hasMain ? 'main' : 'master';
+
+  if (hasMain && hasMaster) {
+    const [inMain, inMaster] = [await containsHead('main'), await containsHead('master')];
+    if (inMain !== inMaster) return inMain ? 'main' : 'master';
+    const dflt = await getDefaultBranch(absRepo);
+    if (await existsLocal(dflt)) {
+      console.warn(
+        `[MC] Detached HEAD is contained in ${inMain ? 'both' : 'neither of'} "main" and "master" — using repo default "${dflt}".`,
+      );
+      return dflt;
+    }
+    if (inMain) {
+      console.warn(
+        '[MC] Detached HEAD is contained in both "main" and "master" but the repo default does not resolve locally — using "main".',
+      );
+      return 'main';
+    }
+    return failClosed();
+  }
+
+  const dflt = await getDefaultBranch(absRepo);
+  if (await existsLocal(dflt)) return dflt;
+  return failClosed();
+}
+
+/**
  * Fresh-repo / missing-branch handling. Creates a missing destination
  * branch locally from HEAD (never pushes); a repo without commits cannot
  * yield a base, so it fails with the minimal preparation instead of
@@ -666,9 +719,19 @@ export async function ensureBaseReady(
   targetBranch?: string,
 ): Promise<{ baseCommit: string; baseBranch: string; createdBranch: boolean }> {
   const fs = await import('fs');
+  const path = await import('path');
+  // H4: canonicalize once — every git op below runs with cwd=absRepo, so the
+  // caller's process cwd can never redirect the repo mid-flight.
+  const absRepo = (() => {
+    try {
+      return fs.realpathSync(repo);
+    } catch {
+      return path.resolve(repo);
+    }
+  })();
   let stat: import('fs').Stats | null = null;
   try {
-    stat = fs.statSync(repo);
+    stat = fs.statSync(absRepo);
   } catch {
     stat = null;
   }
@@ -684,7 +747,16 @@ export async function ensureBaseReady(
     }
   }
 
-  const head = await gitCommand(['rev-parse', 'HEAD'], { cwd: repo });
+  // H1: tell "not a repo" apart from "empty repo" — the old "no commits"
+  // label sent users down `git commit` in a directory where git cannot run.
+  const gitDir = await gitCommand(['rev-parse', '--git-dir'], { cwd: absRepo });
+  if (gitDir.exitCode !== 0) {
+    throw new Error(
+      `Repo at "${repo}" is not a git repository (${gitDir.stderr || gitDir.stdout || 'git rev-parse --git-dir failed'}) — minimal preparation: git init, one commit, then retry.`,
+    );
+  }
+
+  const head = await gitCommand(['rev-parse', 'HEAD'], { cwd: absRepo });
   if (head.exitCode !== 0) {
     throw new Error(
       `Repo at "${repo}" has no commits — minimal preparation: git commit --allow-empty -m "chore: initial"` +
@@ -695,21 +767,34 @@ export async function ensureBaseReady(
   const baseCommit = head.stdout.trim();
 
   if (!targetBranch) {
-    const current = await gitCommand(['branch', '--show-current'], { cwd: repo });
+    const current = await gitCommand(['branch', '--show-current'], { cwd: absRepo });
     const baseBranch = current.stdout.trim();
-    if (current.exitCode !== 0 || !baseBranch) {
+    if (current.exitCode === 0 && baseBranch) {
+      return { baseCommit, baseBranch, createdBranch: false };
+    }
+    // H1: an empty/failed show-current is not proof of detached HEAD (broken
+    // git, wrong dir). Confirm detachment — HEAD valid (above) plus a
+    // non-symbolic HEAD — before falling back; otherwise rethrow the original
+    // failure instead of masking it with a guessed default branch.
+    const symbolic = await gitCommand(['symbolic-ref', '-q', 'HEAD'], { cwd: absRepo });
+    if (symbolic.exitCode === 0) {
+      const detail = current.stderr || current.stdout || `exit ${current.exitCode}`;
       throw new Error(
-        `Repo at "${repo}" has no current branch — minimal preparation: git branch -m main, then retry.`,
+        `Repo at "${repo}" is on a branch (${symbolic.stdout.trim()}) but "git branch --show-current" failed (${detail}) — refusing to guess a base branch; repair git output and retry.`,
       );
     }
-    return { baseCommit, baseBranch, createdBranch: false };
+    // Confirmed detached HEAD (lane worktrees): deterministic fallback that
+    // stays fail-closed when no default branch resolves. The explicit
+    // targetBranch path below never reaches this fallback (H5).
+    const fallback = await resolveDetachedFallbackBranch(absRepo, repo);
+    return { baseCommit, baseBranch: fallback, createdBranch: false };
   }
 
-  const exists = await gitCommand(['rev-parse', '--verify', targetBranch], { cwd: repo });
+  const exists = await gitCommand(['rev-parse', '--verify', targetBranch], { cwd: absRepo });
   if (exists.exitCode === 0) {
     return { baseCommit, baseBranch: targetBranch, createdBranch: false };
   }
-  const created = await gitCommand(['branch', targetBranch, baseCommit], { cwd: repo });
+  const created = await gitCommand(['branch', targetBranch, baseCommit], { cwd: absRepo });
   if (created.exitCode !== 0) {
     throw new Error(
       `Cannot create destination branch "${targetBranch}": ${created.stderr || created.stdout}`,
