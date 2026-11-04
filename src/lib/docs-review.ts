@@ -128,9 +128,10 @@ const LINK_RE = /\[[^\]]*\]\(([^)\s]+)\)/g;
  * to a single example wording). Literals/titles/links/keywords are auxiliary
  * evidence only: a doc that mentions the topic while denying it, disclaiming
  * utility, or carrying only placeholders does NOT cover the criterion.
- * Targeted denials (negated explanatory verb + criterion term in the same
- * sentence) contradict the criterion; global disclaimers (futility about the
- * instructions themselves, TODO/TBD/placeholder) void the whole doc.
+ * Targeted denials (denial/absence marker + criterion term in the same
+ * sentence without instruction there) contradict the criterion; global
+ * disclaimers (futility about the instructions themselves, TODO/TBD/
+ * placeholder) void the whole doc.
  */
 
 // Negated explanatory verbs: "does not explain/cover/describe/..." (EN, general).
@@ -159,10 +160,23 @@ const GLOBAL_FUTILITY_RES: RegExp[] = [
   /\bn[ãa]o\s+inclu[íi]do/i,
 ];
 
-// Procedural/instructional verbs (EN+PT, general): an explanatory doc tells the
-// reader to DO something or adds informative content beyond the criterion terms.
-const PROCEDURAL_VERB_RE =
-  /\b(run|runs|running|execute|executes|executing|open|opens|click|clicks|type|types|enter|enters|install|installs|configure|configures|create|creates|copy|copies|paste|save|saves|restore|restores|restoring|recover|recovers|recovering|select|selects|choose|chooses|follow|follows|following|use|uses|using|set|sets|add|adds|remove|removes|delete|deletes|update|updates|verify|verifies|check|checks|ensure|ensures|restart|reboot|connect|connects|download|downloads|upload|uploads|extract|extracts|mount|start|starts|stop|stops|enable|enables|disable|disables|navigate|press|invoke|call|calls|edit|modify|fetch|fetches|perform|see|sees|refer|refers|rode|rodar|abra|abre|abrir|clique|clica|clicar|digite|digita|digitar|instale|instala|instalar|configura|configurar|crie|cria|criar|copie|copia|copiar|cole|cola|colar|salve|salva|salvar|restaure|restaura|restaurar|recupere|recupera|recuperar|selecione|seleciona|selecionar|escolha|escolhe|escolher|siga|segue|seguir|usar|defina|define|definir|adicione|adiciona|adicionar|remova|remover|exclua|exclui|excluir|atualize|atualiza|atualizar|verifique|verifica|verificar|reinicie|reinicia|reiniciar|conecte|conecta|conectar|baixe|baixa|baixar|extraia|extrai|extrair|inicie|inicia|iniciar|habilite|desabilite|navegue|pressione|edite|modifique|consulte|veja|acesse)\b/i;
+// Procedural/instructional verbs (EN+PT, general). Word boundaries are
+// Unicode-aware (ASCII \b splits "restauração" into "restaura"+..., so a
+// mention would fake an instruction); only whole words count as verbs.
+const WORD_CH = 'A-Za-zÀ-ú0-9_';
+const PROCEDURAL_VERB_SRC =
+  'run|runs|running|execute|executes|executing|open|opens|click|clicks|type|types|enter|enters|install|installs|configure|configures|create|creates|copy|copies|paste|save|saves|restore|restores|restoring|recover|recovers|recovering|select|selects|choose|chooses|follow|follows|following|use|uses|using|set|sets|add|adds|remove|removes|delete|deletes|update|updates|verify|verifies|check|checks|ensure|ensures|restart|reboot|connect|connects|download|downloads|upload|uploads|extract|extracts|mount|start|starts|stop|stops|enable|enables|disable|disables|navigate|press|invoke|call|calls|edit|modify|fetch|fetches|perform|see|sees|refer|refers|rode|rodar|abra|abre|abrir|clique|clica|clicar|digite|digita|digitar|instale|instala|instalar|configura|configurar|crie|cria|criar|copie|copia|copiar|cole|cola|colar|salve|salva|salvar|restaure|restaura|restaurar|recupere|recupera|recuperar|selecione|seleciona|selecionar|escolha|escolhe|escolher|siga|segue|seguir|usar|defina|define|definir|adicione|adiciona|adicionar|remova|remover|exclua|exclui|excluir|atualize|atualiza|atualizar|verifique|verifica|verificar|reinicie|reinicia|reiniciar|conecte|conecta|conectar|baixe|baixa|baixar|extraia|extrai|extrair|inicie|inicia|iniciar|habilite|desabilite|navegue|pressione|edite|modifique|consulte|veja|acesse';
+const PROCEDURAL_VERB_RE = new RegExp(`(?<![${WORD_CH}])(?:${PROCEDURAL_VERB_SRC})(?![${WORD_CH}])`, 'i');
+
+// General denial/disclaimer markers (EN+PT classes, never example phrases):
+// negation (not/n't/no/never/.../não/nunca/jamais...), absence (without/missing/
+// lacking/absent/sem/falta/fora/ausente...) and exclusion (except/outside/fora
+// de/out of...). Used only together with criterion overlap + no instruction in
+// the same sentence, so "without downtime, run..." (with instruction) still passes.
+const DENIAL_MARKER_RE = new RegExp(
+  `(?:(?<![${WORD_CH}])(?:not|no|never|neither|nor|without|missing|lacking|absent|excluded|outside|except|fails?|failed|denied|denies|void|n[ãa]o|nunca|jamais|sem|ausentes?|falta|faltando|faltam|fora|exclu[íi]dos?|nada)(?![${WORD_CH}])|n\\'t(?![${WORD_CH}])|(?<![${WORD_CH}])fora\\s+de(?![${WORD_CH}])|(?<![${WORD_CH}])out\\s+of(?![${WORD_CH}]))`,
+  'i',
+);
 
 function splitSentences(text: string): string[] {
   return text
@@ -191,11 +205,24 @@ function isGlobalDisclaimerSentence(sentence: string): boolean {
   return GLOBAL_FUTILITY_RES.some((re) => re.test(sentence));
 }
 
+function extrasOf(sentence: string, kwLower: string[], litLower: string[]): Set<string> {
+  const extras = new Set<string>();
+  for (const w of sentence.toLowerCase().match(/[a-zà-ú0-9]{4,}/g) ?? []) {
+    if (DOCS_STOPWORDS.has(w)) continue;
+    if (kwLower.includes(w)) continue;
+    if (litLower.some((l) => l.includes(w))) continue;
+    extras.add(w);
+  }
+  return extras;
+}
+
+function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: string[]): boolean {
+  return PROCEDURAL_VERB_RE.test(sentence) && extrasOf(sentence, kwLower, litLower).size >= 2;
+}
+
 /**
- * Affirmative explanatory substance (general): at least one non-disclaimed
- * sentence that either instructs (procedural verb + new informative words) or
- * adds descriptive content beyond mere repetition of the criterion terms.
- * A doc that only repeats the topic words without explaining fails here.
+ * Affirmative explanatory substance: only an instructive sentence counts (procedural verb + new informative words).
+ * Descriptive-only prose without instruction is inconclusive fail-closed (human/external decides, never auto-pass).
  */
 function hasAffirmativeSubstance(combined: string, keywords: string[], literals: string[]): boolean {
   const kwLower = keywords.map((k) => k.toLowerCase());
@@ -205,18 +232,10 @@ function hasAffirmativeSubstance(combined: string, keywords: string[], literals:
     if (s.length < 20) continue; // titles/fragments alone prove nothing
     if (isGlobalDisclaimerSentence(s)) continue;
     if (isNegatedSentence(s)) continue;
+    if (DENIAL_MARKER_RE.test(s) && sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
     const words3 = s.toLowerCase().match(/[a-zà-ú0-9]{3,}/g) ?? [];
     if (words3.length < 5) continue;
-    const hasVerb = PROCEDURAL_VERB_RE.test(s);
-    const extras = new Set<string>();
-    for (const w of s.toLowerCase().match(/[a-zà-ú0-9]{4,}/g) ?? []) {
-      if (DOCS_STOPWORDS.has(w)) continue;
-      if (kwLower.includes(w)) continue;
-      if (litLower.some((l) => l.includes(w))) continue;
-      extras.add(w);
-    }
-    if (hasVerb && extras.size >= 2) return true;
-    if (!hasVerb && extras.size >= 3 && words3.length >= 8) return true;
+    if (sentenceHasInstruction(s, kwLower, litLower)) return true;
   }
   return false;
 }
@@ -271,14 +290,26 @@ export function assessDocsCoverage(
       );
     }
   }
-  // Targeted denial: a negated explanatory sentence about the criterion itself
-  // contradicts it (general linguistic shape + criterion-term overlap, never an
-  // example-specific string). Negations about unrelated topics do not block.
+  // Targeted denial (general, verb-independent): a sentence with a denial/
+  // absence marker about the criterion itself contradicts it when that same
+  // sentence carries no affirmative instruction. Negations about unrelated
+  // topics, or markers inside an instructive sentence, do not block.
   for (const raw of splitSentences(combined)) {
-    if (isNegatedSentence(raw) && sentenceMentionsCriterion(raw.toLowerCase(), keywords, literals)) {
+    const lower = raw.toLowerCase();
+    if (!sentenceMentionsCriterion(lower, keywords, literals)) continue;
+    if (isNegatedSentence(raw)) {
       return failNotCovered(
         `docs deny coverage ("${raw.slice(0, 140)}") — content contradicts the criterion, fix the docs or accept explicitly`,
       );
+    }
+    if (DENIAL_MARKER_RE.test(raw)) {
+      const kwLower = keywords.map((k) => k.toLowerCase());
+      const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
+      if (!sentenceHasInstruction(raw, kwLower, litLower)) {
+        return failNotCovered(
+          `docs deny coverage ("${raw.slice(0, 140)}") — content contradicts the criterion, fix the docs or accept explicitly`,
+        );
+      }
     }
   }
   // Required literals (commands, file names, numbers, quoted spans) must appear verbatim.
