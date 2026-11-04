@@ -994,7 +994,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
   const checkpointFlag = flags.get('checkpoint');
   const wantTakeover = flags.has('takeover');
   // Lane F: ator auditável. Padrão fail-closed = agent-operator (não-humano);
-  // só --actor human registra humano (exige invocação humana explícita).
+  // --actor human é auto-declaração não atestada (nunca afirma humano como fato).
   const actorFlag = flags.get('actor');
   let approveActor: 'human' | 'agent-operator' | 'system' = 'agent-operator';
   if (actorFlag !== undefined && actorFlag !== '') {
@@ -1005,7 +1005,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
   }
   const approveActorEvidence =
     approveActor === 'human'
-      ? `explicit --actor human (invocação humana via TUI, pid ${process.pid})`
+      ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
       : approveActor === 'system'
         ? `sistema (automação do produto, pid ${process.pid})`
         : `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`;
@@ -1273,9 +1273,14 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       plan.checkpointContext = null;
       await savePlan(plan, repoRoot, approveFencing);
       if (acceptRecorded) {
+        // Lane F cav-2.1: human é auto-declaração não atestada — nunca afirmar como fato.
+        const actorLabel =
+          acceptRecorded.actor === 'human'
+            ? 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
+            : `ator ${acceptRecorded.actor} (não-humano)`;
         await appendAutoDecision(
           record.id,
-          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — ator ${acceptRecorded.actor}${acceptRecorded.actor === 'human' ? ' (humano)' : ' (não-humano)'} — COM RESSALVA (permanece Unverified, sem selo verified); re-review honored while pins match, any new commit/base re-reviews`,
+          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — ${actorLabel} — COM RESSALVA (permanece Unverified, sem selo verified); re-review honored while pins match, any new commit/base re-reviews`,
         ).catch(() => {});
       }
       const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
@@ -1304,7 +1309,9 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
       const acceptRessalva =
         acceptRecorded != null
-          ? ` Aceite por ${acceptRecorded.actor}${acceptRecorded.actor === 'human' ? ' (humano)' : ' (não-humano)'} — COM RESSALVA (permanece Unverified, sem selo verified).`
+          ? acceptRecorded.actor === 'human'
+            ? ` Aceite por ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado) — COM RESSALVA (permanece Unverified, sem selo verified).`
+            : ` Aceite por ator ${acceptRecorded.actor} (não-humano) — COM RESSALVA (permanece Unverified, sem selo verified).`
           : '';
       return [
         `Checkpoint "${checkpoint}" cleared.${acceptMsg}${acceptRessalva} Plan "${plan.name}" resuming (intake ${record.id}).`,
@@ -1411,8 +1418,10 @@ export async function bindReviewApproval(
     kind: 'accept',
     actor: opts?.actor ?? 'agent-operator',
     actorEvidence:
-      opts?.actorEvidence ??
-      `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`,
+      (opts?.actor ?? 'agent-operator') === 'human'
+        ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
+        : (opts?.actorEvidence ??
+          `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`),
   };
 }
 
