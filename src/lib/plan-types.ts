@@ -23,12 +23,23 @@ export interface CheckpointContext {
 
 export type AuditAction = 'skip_job' | 'add_job' | 'reorder_jobs' | 'fork_session' | 'relay_finding' | 'fix_prompted' | 'permission-timeout-denied';
 
+/**
+ * Lane F: quem decidiu (ator auditável). Toda decisão registra o ator com
+ * evidência; ação de agente NUNCA é apresentada como decisão humana.
+ * - human: pessoa via TUI (exige --actor human explícito).
+ * - agent-operator: operador-agente via CLI (padrão fail-closed).
+ * - system: automação do produto (sem operador).
+ */
+export type ReviewActor = 'human' | 'agent-operator' | 'system';
+
 export interface AuditLogEntry {
   timestamp: string;
   action: AuditAction;
   jobName?: string;
   details: Record<string, unknown>;
   userApproved?: boolean;
+  actor?: ReviewActor;
+  actorEvidence?: string;
 }
 
 export type JobStatus =
@@ -113,6 +124,13 @@ export interface JobSpec {
     reason: string;
     at: string;
     kind: 'accept';
+    /**
+     * Lane F: ator do aceite (humano vs agente-operador vs sistema) com
+     * evidência. Padrão fail-closed: agent-operator (não-humano) salvo
+     * quando o CLI roda sem --actor human explícito.
+     */
+    actor?: ReviewActor;
+    actorEvidence?: string;
   };
 }
 
