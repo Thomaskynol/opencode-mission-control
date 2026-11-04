@@ -78,12 +78,16 @@ export const JobStatusSchema = z.enum([
 
 export const AuditActionSchema = z.enum(['skip_job', 'add_job', 'reorder_jobs', 'fork_session', 'relay_finding', 'fix_prompted', 'permission-timeout-denied']);
 
+export const ReviewActorSchema = z.enum(['human', 'agent-operator', 'system']);
+
 export const AuditLogEntrySchema = z.object({
   timestamp: z.string(),
   action: AuditActionSchema,
   jobName: z.string().optional(),
   details: z.record(z.string(), z.unknown()),
   userApproved: z.boolean().optional(),
+  actor: ReviewActorSchema.optional(),
+  actorEvidence: z.string().optional(),
 });
 
 export const PermissionPolicyDecisionSchema = z.enum(['auto-approve', 'deny', 'ask-user']);
@@ -134,6 +138,7 @@ export const JobSpecSchema = z.object({
   serverPassword: z.string().optional(),
   permissionPolicy: PermissionPolicySchema.optional(),
   // Lane docs2: version-bound operator accept (see plan-types JobSpec.reviewApproval).
+  // Lane F: actor auditável (humano vs agente-operador vs sistema); ausente = desconhecido.
   reviewApproval: z
     .object({
       reviewedCommit: z.string(),
@@ -141,6 +146,8 @@ export const JobSpecSchema = z.object({
       reason: z.string(),
       at: z.string(),
       kind: z.enum(['accept']),
+      actor: ReviewActorSchema.optional(),
+      actorEvidence: z.string().optional(),
     })
     .optional(),
 });

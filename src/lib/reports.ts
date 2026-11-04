@@ -227,6 +227,13 @@ export interface FinalReportTest {
 export interface FinalReportProblem {
   problem: string;
   solution: string;
+  /**
+   * Lane F: estado do problema a partir de registros reais.
+   * - resolvido: evidência posterior de pass/merged.
+   * - pendente: aceite com ressalva, retry/deadlock sem pass, gap aberto.
+   * - desconhecido: sem evidência para classificar (lacuna, nunca sucesso).
+   */
+  status?: 'resolvido' | 'pendente' | 'desconhecido';
 }
 
 /**
@@ -281,6 +288,90 @@ export interface FinalReportInput {
 
 /** Annex cap: long logs are truncated with an explicit marker, never dropped silently. */
 export const FINAL_REPORT_ATTACHMENT_MAX = 12000;
+
+/**
+ * Lane F: deriva Problems de REGISTROS REAIS (decisions, unmet, unverified,
+ * contributions ausentes). Distingue resolvido / pendente / desconhecido;
+ * sem inventar dados (lacuna = "desconhecido", não sucesso). Aceite explícito
+ * é sempre pendente com ressalva — nunca resolvido, nunca verified.
+ */
+export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportProblem[] {
+  const out: FinalReportProblem[] = [];
+  const decisions = input.decisions ?? [];
+  const joined = decisions.join('\n');
+  const hasNonAcceptPass = decisions.some(
+    (d) => /:\s*pass\b/i.test(d) && !/accept honored/i.test(d),
+  );
+  // Sem evidência para classificar causa (records removidos): lacuna explícita.
+  if (decisions.length === 0 && ((input.unmet ?? []).length > 0 || (input.unverified ?? []).length > 0)) {
+    out.push({
+      problem: 'causa sem evidência registrada (decisions vazias) — registros removidos ou nunca persistidos',
+      solution: 're-executar com decisions/logs preservados para classificar; não assumir sucesso',
+      status: 'desconhecido',
+    });
+  }
+  // Outage transitória do provedor (evidência real: provider.no-route / Model unavailable).
+  if (/provider\.no-route|Model unavailable|outage/i.test(joined)) {
+    out.push({
+      problem: 'outage transitória do provedor (provider.no-route / Model unavailable) — revisor externo indisponível, fail-closed',
+      solution: 'fail-closed + retentativa via retry/resume; superada quando revisão passa sem outage',
+      status: hasNonAcceptPass ? 'resolvido' : 'pendente',
+    });
+  }
+  // Deadlock / retry / fail-closed (evidência real: vereditos alternados, auto-fix, fail).
+  if (/deadlock|req-3.*req-4|vereditos alternados|auto-fix attempt|review .*: fail/i.test(joined)) {
+    const excerpt = decisions.find((d) => /deadlock|req-3|auto-fix attempt|review .*: fail/i.test(d));
+    out.push({
+      problem: `deadlock/retry do gate funcional (fail → correção → fail)${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}`,
+      solution: 'correção via retry/relaunch com re-revisão; aceite só com ressalva quando pins travam',
+      status: hasNonAcceptPass ? 'resolvido' : 'pendente',
+    });
+  }
+  // Aceites explícitos (evidência real: approve accept / operator accept honored).
+  const acceptDecs = decisions.filter((d) => /approve accept|operator accept honored/i.test(d));
+  for (const dec of acceptDecs) {
+    out.push({
+      problem: `aceite explícito com ressalva: ${dec.slice(0, 240)} — prossegue COM RESSALVA, sem selo verified`,
+      solution: 'permanece Unverified (cobertura só por smoke global); resolver pendência e re-verificar por critério',
+      status: 'pendente',
+    });
+  }
+  // Conductor takeover / intervenção do operador (evidência real de handoff).
+  if (/conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|touchset:/i.test(joined)) {
+    const excerpt = decisions.find((d) => /conductor takeover|approve --takeover|approve\/retry|touchset:/i.test(d));
+    out.push({
+      problem: `intervenção do operador via caminho público${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}`,
+      solution: 'handoff auditado (epoch/pid) + re-validação do produto; sem extrapolar posse',
+      status: hasNonAcceptPass ? 'resolvido' : 'pendente',
+    });
+  }
+  // Pendências aceitas cobertas só por smoke global (unverified integration-only).
+  for (const entry of input.unverified ?? []) {
+    if (/covered only by global integration/i.test(entry)) {
+      out.push({
+        problem: `pendência aceita sem verificação task-scoped: ${entry.slice(0, 240)} — COM RESSALVA`,
+        solution: 'não promove a Verified; re-verificar por critério task-scoped',
+        status: 'pendente',
+      });
+    }
+  }
+  // Reports por instância ausentes (merged sem mc_report).
+  for (const name of missingContributionJobs(input)) {
+    if (!out.some((p) => p.problem.includes(`"${name}"`))) {
+      out.push({
+        problem: `merged sem mc_report por instância: "${name}" (autoria não comprovada)`,
+        solution: 'cobrar mc_report do worker ou registrar lacuna; merge é integração, não verificação',
+        status: 'pendente',
+      });
+    }
+  }
+  return out;
+}
+
+function formatProblemEntry(entry: FinalReportProblem): string {
+  const status = entry.status ?? 'desconhecido';
+  return `- Problem: ${entry.problem} | Solution: ${entry.solution} | Status: ${status}`;
+}
 
 function finalReportLines(items: string[] | undefined, emptyNote: string): string[] {
   if (!items || items.length === 0) {
@@ -394,9 +485,24 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
     '',
     '## Problems & Solutions',
     '',
-    ...((input.problems ?? []).length > 0
-      ? input.problems!.map((entry) => `- Problem: ${entry.problem} | Solution: ${entry.solution}`)
-      : ['- No problems reported']),
+    ...(() => {
+      const derived = deriveProblemsFromRecords(input);
+      const seen = new Set<string>();
+      const merged: FinalReportProblem[] = [];
+      for (const entry of [...(input.problems ?? []), ...derived]) {
+        const key = entry.problem.slice(0, 160);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(entry);
+      }
+      if (merged.length === 0) {
+        const hasGaps = ((input.unmet ?? []).length > 0) || ((input.unverified ?? []).length > 0) || missingGapEntries.length > 0;
+        // shortcut: sem evidência e sem gaps = nada a declarar; com gaps = desconhecido (nunca sucesso).
+        if (!hasGaps) return ['- No problems reported'];
+        return ['- Unknown: sem evidência de problemas registrada (desconhecido — não verificado como sucesso) | Status: desconhecido'];
+      }
+      return merged.map(formatProblemEntry);
+    })(),
     '',
     '## Verified',
     '',

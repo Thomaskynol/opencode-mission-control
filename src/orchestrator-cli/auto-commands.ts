@@ -993,6 +993,22 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
   const relaunch = flags.get('relaunch');
   const checkpointFlag = flags.get('checkpoint');
   const wantTakeover = flags.has('takeover');
+  // Lane F: ator auditável. Padrão fail-closed = agent-operator (não-humano);
+  // só --actor human registra humano (exige invocação humana explícita).
+  const actorFlag = flags.get('actor');
+  let approveActor: 'human' | 'agent-operator' | 'system' = 'agent-operator';
+  if (actorFlag !== undefined && actorFlag !== '') {
+    if (actorFlag !== 'human' && actorFlag !== 'agent-operator' && actorFlag !== 'system') {
+      throw new Error(`Invalid --actor "${actorFlag}": expected human|agent-operator|system.`);
+    }
+    approveActor = actorFlag;
+  }
+  const approveActorEvidence =
+    approveActor === 'human'
+      ? `explicit --actor human (invocação humana via TUI, pid ${process.pid})`
+      : approveActor === 'system'
+        ? `sistema (automação do produto, pid ${process.pid})`
+        : `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`;
   if (retry !== undefined && retry !== '' && relaunch !== undefined && relaunch !== '') {
     throw new Error('Cannot specify both "retry" and "relaunch". Use "retry" for manual fixes (re-validates) or "relaunch" to spawn an agent to fix violations.');
   }
@@ -1234,7 +1250,8 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       // it once while the pins match; any new commit or base move re-reviews
       // (never a blanket authorization). Jobs without a branch keep the
       // legacy behavior (pause cleared, no approval bound).
-      let acceptRecorded: { job: string; commit: string; base: string } | null = null;
+      // Lane F: ator auditável + ressalva (Unverified, sem selo verified).
+      let acceptRecorded: { job: string; commit: string; base: string; actor: string } | null = null;
       if (ctx?.failureKind === 'test_failure' && ctx.jobName) {
         const job = plan.jobs.find((j) => j.name === ctx.jobName);
         if (job && job.status === 'failed' && job.branch) {
@@ -1243,11 +1260,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
             plan.integrationBranch,
             repoRoot,
             `operator accept of on_error checkpoint for "${job.name}"`,
+            { actor: approveActor, actorEvidence: approveActorEvidence },
           );
           job.reviewApproval = approval;
           job.status = 'ready_to_merge';
           job.error = undefined;
-          acceptRecorded = { job: job.name, commit: approval.reviewedCommit, base: approval.reviewedBase };
+          acceptRecorded = { job: job.name, commit: approval.reviewedCommit, base: approval.reviewedBase, actor: approval.actor };
         }
       }
       plan.status = 'running';
@@ -1257,7 +1275,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       if (acceptRecorded) {
         await appendAutoDecision(
           record.id,
-          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — re-review honored while pins match, any new commit/base re-reviews`,
+          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — ator ${acceptRecorded.actor}${acceptRecorded.actor === 'human' ? ' (humano)' : ' (não-humano)'} — COM RESSALVA (permanece Unverified, sem selo verified); re-review honored while pins match, any new commit/base re-reviews`,
         ).catch(() => {});
       }
       const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
@@ -1284,8 +1302,12 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       }
       ctl.shutdown();
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
+      const acceptRessalva =
+        acceptRecorded != null
+          ? ` Aceite por ${acceptRecorded.actor}${acceptRecorded.actor === 'human' ? ' (humano)' : ' (não-humano)'} — COM RESSALVA (permanece Unverified, sem selo verified).`
+          : '';
       return [
-        `Checkpoint "${checkpoint}" cleared.${acceptMsg} Plan "${plan.name}" resuming (intake ${record.id}).`,
+        `Checkpoint "${checkpoint}" cleared.${acceptMsg}${acceptRessalva} Plan "${plan.name}" resuming (intake ${record.id}).`,
         clearHandoff,
         '',
         `  ID:   ${plan.id}`,
@@ -1359,13 +1381,15 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
  * Resolves the job branch HEAD and the integration base HEAD in the mission
  * repo — never the launcher cwd. Fail-closed: an unresolvable ref refuses
  * the accept explicitly instead of recording a dangling approval.
+ * Lane F: ator auditável (padrão agent-operator, nunca humano implícito).
  */
 export async function bindReviewApproval(
   jobBranch: string,
   integrationBranch: string,
   repoRoot: string,
   reason: string,
-): Promise<{ reviewedCommit: string; reviewedBase: string; reason: string; at: string; kind: 'accept' }> {
+  opts?: { actor?: 'human' | 'agent-operator' | 'system'; actorEvidence?: string },
+): Promise<{ reviewedCommit: string; reviewedBase: string; reason: string; at: string; kind: 'accept'; actor: 'human' | 'agent-operator' | 'system'; actorEvidence: string }> {
   const { gitCommand } = await import('../lib/git');
   const jobHead = await gitCommand(['rev-parse', jobBranch], { cwd: repoRoot });
   if (jobHead.exitCode !== 0 || !jobHead.stdout.trim()) {
@@ -1385,6 +1409,10 @@ export async function bindReviewApproval(
     reason,
     at: new Date().toISOString(),
     kind: 'accept',
+    actor: opts?.actor ?? 'agent-operator',
+    actorEvidence:
+      opts?.actorEvidence ??
+      `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`,
   };
 }
 

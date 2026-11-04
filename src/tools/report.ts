@@ -7,6 +7,7 @@ import {
   buildFinalReportMarkdown,
   writeFinalReport,
   describeOmoLimitation,
+  deriveProblemsFromRecords,
   type ReportStatus,
 } from '../lib/reports';
 import { writeReport } from '../lib/reports';
@@ -113,11 +114,21 @@ export const mc_report_final: ToolDefinition = tool({
     const intake = (snap as { autoIntake?: { request?: string; requirements?: Array<{ id: string; text: string }>; decisions?: string[]; questions?: string[] } | null } | null)?.autoIntake ?? null;
     const withAttachments = args.includeAttachments ?? true;
 
-    const tasks = plan.jobs.map((job) => ({
-      name: job.name,
-      status: job.status,
-      detail: job.error ?? (job.mergedAt ? `merged at ${job.mergedAt}` : undefined),
-    }));
+    const tasks = plan.jobs.map((job) => {
+      const appr = (job as unknown as { reviewApproval?: { actor?: string; actorEvidence?: string; reviewedCommit?: string } }).reviewApproval;
+      const baseDetail = job.error ?? (job.mergedAt ? `merged at ${job.mergedAt}` : undefined);
+      // Lane F: ator exibido + ressalva visível no task (aceite nunca vira verified).
+      if (appr) {
+        const actorLabel = appr.actor ? `ator ${appr.actor}${appr.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : 'ator desconhecido (desconhecido)';
+        const extra = `aceite ${actorLabel} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+        return { name: job.name, status: job.status, detail: baseDetail ? `${baseDetail}; ${extra}` : extra };
+      }
+      return {
+        name: job.name,
+        status: job.status,
+        detail: baseDetail,
+      };
+    });
     const merged = plan.jobs.filter((job) => job.status === 'merged').map((job) => job.name);
     const conflicts = plan.jobs
       .filter((job) => job.status === 'conflict' || job.status === 'needs_rebase')
@@ -183,7 +194,12 @@ export const mc_report_final: ToolDefinition = tool({
         const rec = r as { testCommand?: string; testStatus?: string; testOutput?: string };
         return { command: rec.testCommand!, result: rec.testStatus ?? 'skipped', output: rec.testOutput };
       });
-    const decisions = [...(intake?.decisions ?? []), ...(plan.auditLog ?? []).map((a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}`)];
+    const decisions = [
+      ...((intake as { decisions?: string[] } | null)?.decisions ?? []),
+      ...((plan.auditLog ?? []) as Array<{ action: string; jobName?: string; actor?: string; actorEvidence?: string }>).map(
+        (a) => `${a.action}${a.jobName ? ` ${a.jobName}` : ''}${a.actor ? ` — ator ${a.actor}${a.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : ''}${a.actorEvidence ? ` (${a.actorEvidence.slice(0, 120)})` : ''}`,
+      ),
+    ];
     // OMO status declared explicitly (never a silent success): without OMO
     // the report records vanilla-only execution as the limitation.
     // missingContributionJobs needs no separate call — buildFinalReportMarkdown
@@ -251,10 +267,44 @@ export const mc_report_final: ToolDefinition = tool({
           const rec = r as { jobName?: string; testStatus?: string; testCommand?: string; reviewedCommit?: string; testOutput?: string };
           return `${rec.jobName ?? 'job'} [${rec.testStatus ?? 'skipped'}]${rec.testCommand ? ` ${rec.testCommand}` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}${rec.testOutput ? ` — ${rec.testOutput.slice(0, 200)}` : ''}`;
         }),
+        // Lane F: aceites exibidos como evidência rotulada (nunca humana implícita) + ressalva.
+        ...plan.jobs
+          .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
+          .map((job) => {
+            const appr = (job as unknown as { reviewApproval: { actor?: string; reviewedCommit?: string; reason?: string } }).reviewApproval;
+            const label = appr.actor ? `${appr.actor}${appr.actor === 'human' ? ' (humano)' : ' (não-humano)'}` : 'desconhecido (desconhecido)';
+            return `accept "${job.name}" por ${label} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+          }),
         ...notes,
         `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
       ],
-      problems: unmet.map((entry) => ({ problem: entry, solution: 'See job error and retry via mc_plan_approve' })),
+      problems: (() => {
+        // Lane F: Problems de registros reais (resolvido/pendente/desconhecido).
+        const base = unmet.map((entry) => ({
+          problem: entry,
+          solution: 'See job error and retry via mc_plan_approve',
+          status: 'pendente' as const,
+        }));
+        const derived = deriveProblemsFromRecords({
+          title: plan.name,
+          decisions,
+          tasks: tasks.map((t) => ({ name: t.name, status: t.status, detail: t.detail ?? undefined })),
+          contributions: reports.map((report) => ({ instance: report.jobId, job: report.jobName, summary: `[${report.status}] ${report.message}` })),
+          integration: { branch: plan.integrationBranch, merged, conflicts },
+          verified: [],
+          unmet,
+          unverified,
+        });
+        const seen = new Set(base.map((b) => b.problem.slice(0, 160)));
+        const mergedProblems = [...base];
+        for (const d of derived) {
+          const key = d.problem.slice(0, 160);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          mergedProblems.push(d);
+        }
+        return mergedProblems;
+      })(),
       verified,
       unmet,
       unverified,
