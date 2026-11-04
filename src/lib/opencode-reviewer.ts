@@ -481,3 +481,239 @@ export function toSufficiencyDecision(results: FunctionalCriterionResult[]): Suf
     reasons: failures.map((f) => `${f.id}: ${f.reason}`),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Docs semantic review (lane r2-docs): heuristics are auxiliary only.
+// A docs requirement that demands semantic judgment is verified ONLY by an
+// external OpenCode verdict with reasons + specific doc citations.
+// Fail-closed: transport failure, unpinned model, absent/malformed reply,
+// contradiction, uncertainty ("unclear", empty evidence) → never verified
+// (verdict `inconclusive` or `fail`, demonstrated false). Reuses the
+// functional reviewer's transport pattern (resolveReviewModel + `opencode
+// run --standalone --format json`), never a new dependency.
+// ---------------------------------------------------------------------------
+
+export interface DocsCriterionInput {
+  id: string;
+  description: string;
+}
+
+export interface DocsReviewArgs {
+  requirements: DocsCriterionInput[];
+  docsFiles?: Record<string, string>;
+  /** Unified diff text (alternative/complement to docsFiles). */
+  docsDiff?: string;
+  model?: ReviewModelInput;
+  allowDivergentModel?: ReviewModelInput;
+  timeoutMs?: number;
+  /** Binary under test; defaults to $MC_OPENCODE_BIN, $OPENCODE_BIN, `opencode`. */
+  bin?: string;
+}
+
+export interface DocsCriterionResult {
+  id: string;
+  demonstrated: boolean;
+  evidence: string[];
+  verdict: 'pass' | 'fail' | 'inconclusive';
+  reason: string;
+}
+
+function failClosedDocs(requirements: DocsCriterionInput[], reason: string): DocsCriterionResult[] {
+  return requirements.map((r) => ({
+    id: r.id,
+    demonstrated: false,
+    evidence: [],
+    verdict: 'inconclusive' as const,
+    reason: `${reason} — fail-closed (criterion "${r.id}": ${r.description.slice(0, 160)})`,
+  }));
+}
+
+const DOCS_UNCERTAINTY_RE =
+  /\b(unclear|uncertain|unknown|cannot\s+(determine|verify|confirm)|insufficient\s+evidence|not\s+sure|ambiguous|possibly|might\s+be)\b/i;
+
+const DOCS_CONTRADICTS_PASS_RE =
+  /\b(incorrect|wrong|false|missing|fails?\s+to|contradicts?|destructive|harmful|does\s+not\s+(satisfy|meet|cover|explain|describe))\b/i;
+
+export function buildDocsPrompt(args: DocsReviewArgs): string {
+  const lines: string[] = [
+    'You are a strict documentation reviewer. Decide ONLY from the evidence below.',
+    'For EACH requirement, answer whether the DOCUMENTATION correctly and sufficiently',
+    'satisfies it: the docs must contain correct, usable guidance (steps, commands, or',
+    'an accurate description matching the criterion) — not just keyword mentions.',
+    'A plausible but factually wrong instruction (wrong command, wrong path, invented',
+    'flag, destructive step) NEVER satisfies the requirement, even when keywords match.',
+    'Descriptive criteria (no step-by-step demanded) are satisfied only by accurate',
+    'descriptive content about the criterion with concrete checkable detail; vague prose',
+    'alone is insufficient.',
+    'Cite specific evidence: quote the exact doc passages supporting the verdict in',
+    '`evidence` (verbatim quotes, 1-3 items). An empty evidence array NEVER supports',
+    'verdict "pass". Uncertainty words ("unclear", "cannot determine", "insufficient',
+    'evidence") NEVER support "pass" — use "fail" or "inconclusive" instead.',
+    'When in doubt, verdict "fail" or "inconclusive" (never "pass" without evidence).',
+    'Reply with STRICT JSON only: an array of',
+    '{"id": "<requirement id>", "demonstrated": true|false, "evidence": ["<verbatim doc quote>", ...], "verdict": "pass"|"fail"|"inconclusive", "reason": "..."}.',
+    'No prose outside the JSON array. `demonstrated` is true only when verdict is "pass" with non-empty evidence.',
+    '',
+    '## Requirements',
+  ];
+  for (const r of args.requirements) {
+    lines.push(`- [${r.id}] ${r.description}`);
+  }
+  if (args.docsDiff) lines.push('', '## Documentation diff', '```diff', args.docsDiff.slice(0, 20_000), '```');
+  if (args.docsFiles) {
+    for (const [path, content] of Object.entries(args.docsFiles)) {
+      lines.push('', `## Documentation file: ${path}`, '```', content.slice(0, 20_000), '```');
+    }
+  }
+  return lines.join('\n');
+}
+
+/** Best-effort extraction of a per-criterion docs JSON array; fail-closed null on malformed. */
+function extractDocsResults(raw: string, requirements: DocsCriterionInput[]): DocsCriterionResult[] | null {
+  const texts: string[] = [];
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  texts.push(trimmed);
+  texts.push(...unwrapEnvelopeCandidates(trimmed));
+  const fenced = [...trimmed.matchAll(/```(?:json)?\s*\n([\s\S]*?)\n```/g)].map((m) => m[1]!.trim());
+  texts.push(...fenced);
+  for (const t of texts) {
+    const candidates = [t];
+    const brackets = [...t.matchAll(/\[[\s\S]*\]/g)].map((m) => m[0]).sort((a, b) => b.length - a.length);
+    candidates.push(...brackets.slice(0, 3));
+    for (const c of candidates) {
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(c);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(parsed)) continue;
+      const byId = new Map(requirements.map((r) => [r.id, r]));
+      const out: DocsCriterionResult[] = [];
+      let ok = true;
+      for (const item of parsed) {
+        if (typeof item !== 'object' || item === null) {
+          ok = false;
+          break;
+        }
+        const rec = item as Record<string, unknown>;
+        if (typeof rec.id !== 'string' || !byId.has(rec.id)) continue;
+        if (rec.verdict !== 'pass' && rec.verdict !== 'fail' && rec.verdict !== 'inconclusive') {
+          ok = false;
+          break;
+        }
+        const evidence = Array.isArray(rec.evidence)
+          ? rec.evidence.map(String).map((s) => s.trim()).filter((s) => s.length > 0).slice(0, 8)
+          : [];
+        const reason =
+          typeof rec.reason === 'string' && rec.reason.trim() ? rec.reason.trim().slice(0, 500) : 'no reason recorded';
+        let verdict = rec.verdict as DocsCriterionResult['verdict'];
+        // Fail-closed downgrades: pass without evidence, with uncertainty, or
+        // contradicting its own reason is never verified.
+        if (verdict === 'pass') {
+          if (evidence.length === 0) verdict = 'inconclusive';
+          else if (DOCS_UNCERTAINTY_RE.test(reason)) verdict = 'inconclusive';
+          else if (DOCS_CONTRADICTS_PASS_RE.test(reason)) verdict = 'inconclusive';
+          else if (rec.demonstrated !== true) verdict = 'inconclusive';
+        }
+        out.push({
+          id: rec.id,
+          demonstrated: verdict === 'pass',
+          evidence,
+          verdict,
+          reason,
+        });
+      }
+      if (!ok || out.length === 0) continue;
+      return requirements.map(
+        (r) =>
+          out.find((o) => o.id === r.id) ?? {
+            id: r.id,
+            demonstrated: false,
+            evidence: [],
+            verdict: 'inconclusive' as const,
+            reason: `reviewer returned no verdict for "${r.id}" — fail-closed`,
+          },
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * Ask a real OpenCode (`run --standalone --format json`, separate context)
+ * for per-criterion docs verdicts. Never throws: every failure mode
+ * (missing binary, timeout, non-zero exit, unparseable output, unpinned
+ * model) resolves to all-`inconclusive` (fail-closed, never verified).
+ * Model pin mirrors the functional reviewer (args.model → MC_REVIEW_MODEL →
+ * effectiveModel → unpinned fail-closed).
+ */
+export async function reviewDocsViaOpenCode(
+  args: DocsReviewArgs,
+  effectiveModel?: ReviewModelInput,
+): Promise<DocsCriterionResult[]> {
+  const { requirements } = args;
+  if (requirements.length === 0) return [];
+  let model: string | undefined;
+  try {
+    model = resolveReviewModel(args, effectiveModel);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return failClosedDocs(requirements, msg.slice(0, 300));
+  }
+  if (!model) return failClosedDocs(requirements, 'review model unpinned (MC_REVIEW_MODEL not set)');
+  const bin = args.bin ?? process.env.MC_OPENCODE_BIN ?? process.env.OPENCODE_BIN ?? 'opencode';
+  const timeoutMs = args.timeoutMs ?? 300_000;
+  const prompt = buildDocsPrompt(args);
+  let raw: string;
+  try {
+    raw = await new Promise<string>((resolve, reject) => {
+      const argv = [bin, 'run', '--standalone', '--model', model, '--format', 'json', prompt];
+      let proc: ReturnType<typeof Bun.spawn>;
+      try {
+        proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try {
+          proc.kill();
+        } catch {}
+        reject(new Error(`OpenCode docs reviewer timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+      (async () => {
+        try {
+          const [stdout, stderr, exitCode] = await Promise.all([
+            new Response(proc.stdout).text(),
+            new Response(proc.stderr).text(),
+            proc.exited,
+          ]);
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (exitCode !== 0) {
+            reject(new Error(`OpenCode docs reviewer failed (exit ${exitCode}): ${(stderr || stdout).slice(0, 500)}`));
+            return;
+          }
+          resolve(stdout);
+        } catch (error) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        }
+      })();
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return failClosedDocs(requirements, `OpenCode docs reviewer unavailable (${msg.slice(0, 200)})`);
+  }
+  const results = extractDocsResults(raw, requirements);
+  if (!results) return failClosedDocs(requirements, 'OpenCode docs reviewer returned no parseable per-criterion verdict');
+  return results;
+}

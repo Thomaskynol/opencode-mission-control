@@ -3,7 +3,7 @@ import { join } from 'path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { EventEmitter } from 'events';
-import { assessDocsCoverage } from '../../src/lib/docs-review';
+import { assessDocsCoverage, assessDocsCoverageWithSemantics } from '../../src/lib/docs-review';
 
 /**
  * Lane docs3 — semantics: mention is not coverage.
@@ -176,6 +176,126 @@ describe('docs semantics: denial blocks, substance required', () => {
       { id: 'dep1', description: 'Deploy the search index updates' },
       { 'docs/search.md': '# Search index\nAlways open the search index dashboard with `sync.sh` and press the sync control to deploy updates. Never press the sync control for the search index deployment.' },
     );
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('inconclusive');
+  });
+});
+
+/**
+ * Verified path (TDD RED): heuristic is auxiliary only — covered/verified
+ * requires a semantic pass with reasons + specific evidence (doc citations).
+ * Fail-closed: missing/malformed/uncertain/contradictory reviewer output is
+ * never verified. LLM may err: these tests prove the fail-closed wiring and
+ * the prompt/evidence contract, not infallibility.
+ */
+const WRONG_RESTORE_DOC = `# Backup restoration procedure
+To restore, run \`restore.sh --from backup.tar.gz --delete-source\`, then verify files in /data-restored.
+Steps: 1. Open the backup folder 2. Select the snapshot 3. Run \`rm -rf /data\` to clean before restore and follow the checklist to recover files carefully.`;
+
+const SEM_PASS_CORRECT = {
+  verdict: 'pass' as const,
+  demonstrated: true,
+  evidence: ['To restore, run `restore.sh --from backup.tar.gz`, then verify files in /data'],
+  reason: 'Docs give correct usable restoration steps matching the criterion, citing the restore command and verification path.',
+};
+
+describe('docs verified path: semantic decides, heuristic never alone', () => {
+  it('(1) correct sufficient docs + semantic pass with evidence → covered/verified', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, { 'docs/backup.md': BACKUP_CORRECT }, SEM_PASS_CORRECT);
+    expect(r.covered).toBe(true);
+    expect(r.status).toBe('covered');
+  });
+
+  it('(2) plausible factually wrong instruction + semantic fail → never verified', () => {
+    const r = assessDocsCoverageWithSemantics(
+      BACKUP_REQ,
+      { 'docs/backup.md': WRONG_RESTORE_DOC },
+      {
+        verdict: 'fail',
+        demonstrated: false,
+        evidence: ['Run `rm -rf /data` to clean before restore'],
+        reason: 'Docs instruct a destructive wrong step (`rm -rf /data`) and a false path/detail, so they do not correctly satisfy the restoration criterion.',
+      },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('(3) incomplete docs + semantic inconclusive → inconclusive/fail (never verified)', () => {
+    const r = assessDocsCoverageWithSemantics(
+      BACKUP_REQ,
+      { 'docs/backup.md': '# Backup restoration procedure\nBackup restoration procedure backup restoration procedure backup restoration procedure backup restoration.' },
+      { verdict: 'inconclusive', demonstrated: false, evidence: [], reason: 'Repetition without usable instruction; insufficient evidence to confirm correctness.' },
+    );
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('(4a) descriptive correct without step-by-step + semantic pass with real basis → covered (honest)', () => {
+    const req = { id: 'rw1', description: 'Explain the backup retention window' };
+    const doc = '# Retention\nThe backup retention window spans thirty days across all regions with daily snapshots stored encrypted and replicated for compliance purposes and audit review.';
+    const r = assessDocsCoverageWithSemantics(req, { 'docs/ret.md': doc }, {
+      verdict: 'pass',
+      demonstrated: true,
+      evidence: ['The backup retention window spans thirty days across all regions with daily snapshots'],
+      reason: 'Descriptive criterion: docs accurately describe the retention window with concrete checkable detail (thirty days, daily snapshots), no steps demanded.',
+    });
+    expect(r.covered).toBe(true);
+    expect(r.status).toBe('covered');
+  });
+
+  it('(4b) descriptive vague + semantic inconclusive → inconclusive, never auto-pass', () => {
+    const req = { id: 'rw1', description: 'Explain the backup retention window' };
+    const doc = '# Retention\nThe backup retention window spans thirty days across all regions with daily snapshots stored encrypted and replicated for compliance purposes and audit review.';
+    const r = assessDocsCoverageWithSemantics(req, { 'docs/ret.md': doc }, {
+      verdict: 'inconclusive',
+      demonstrated: false,
+      evidence: [],
+      reason: 'Unclear whether the prose is accurate; no verifiable basis cited.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('(5a) missing semantic (null) → never verified (fail-closed)', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, { 'docs/backup.md': BACKUP_CORRECT }, null);
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('inconclusive');
+    expect(r.reason).toMatch(/fail-closed|external reviewer|semantic/i);
+  });
+
+  it('(5b) semantic pass without evidence → never verified (fail-closed)', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, { 'docs/backup.md': BACKUP_CORRECT }, {
+      verdict: 'pass',
+      demonstrated: true,
+      evidence: [],
+      reason: 'Looks good.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('(5c) semantic pass with uncertainty (“unclear”) → never verified (fail-closed)', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, { 'docs/backup.md': BACKUP_CORRECT }, {
+      verdict: 'pass',
+      demonstrated: true,
+      evidence: ['To restore, run `restore.sh --from backup.tar.gz`'],
+      reason: 'Unclear whether this command is actually correct for this repo.',
+    });
+    expect(r.covered).toBe(false);
+    expect(r.status).not.toBe('covered');
+  });
+
+  it('heuristic denial stays not-covered even with semantic pass (no override)', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, { 'docs/backup.md': BACKUP_NEGATION }, SEM_PASS_CORRECT);
+    expect(r.covered).toBe(false);
+    expect(r.status).toBe('not-covered');
+  });
+
+  it('heuristic contradiction stays inconclusive even with semantic pass (needs human)', () => {
+    const r = assessDocsCoverageWithSemantics(BACKUP_REQ, {
+      'docs/backup.md': '# Backup restoration procedure\n\nTo restore, run `restore.sh --from backup.tar.gz`, then verify files in /data. Never run `restore.sh` on Fridays.',
+    }, SEM_PASS_CORRECT);
     expect(r.covered).toBe(false);
     expect(r.status).toBe('inconclusive');
   });

@@ -120,13 +120,15 @@ export function describeOmoLimitation(detected: boolean, mode?: string): string 
 
 /**
  * M6: rotulagem canônica de ator para decisões/log/report.
- * - human: auto-declaração via --actor, sem atestação fora de banda (nunca fato).
+ * - human: auto-declaração sem atestação fora de banda (nunca fato).
+ *   A flag --actor human não comprova humano; origem não comprovada salvo
+ *   conferência externa explícita (humano necessário nunca simulado).
  * - agent-operator / system: não-humanos.
  * - ausente/qualquer outro: desconhecido (nunca atribuir ação a pessoa sem evidência).
  */
 export function formatActorLabel(actor?: string): string {
   if (actor === 'human') {
-    return 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)';
+    return 'ator human (auto-declarado, sem atestação fora de banda — não verificado, origem não comprovada; --actor human não comprova humano)';
   }
   if (actor === 'agent-operator') {
     return 'ator agent-operator (não-humano)';
@@ -134,7 +136,27 @@ export function formatActorLabel(actor?: string): string {
   if (actor === 'system') {
     return 'ator system (automação do produto, não-humano)';
   }
-  return 'ator desconhecido (desconhecido)';
+  return 'ator desconhecido (desconhecido, origem não comprovada)';
+}
+
+/**
+ * R2: fonte da alegação de ator a partir do texto do registro.
+ * - flag CLI (`--actor X`) → fonte flag CLI.
+ * - sessão interativa / conferência externa explícitas → respectivas fontes.
+ * - indistinguível (caso comum: rótulo "ator human" sem flag nem
+ *   conferência) → "origem não comprovada" (nunca presumir humano).
+ */
+export function describeActorSource(text: string): string {
+  if (/--actor\s*[= ]\s*(human|agent-operator|system)\b/i.test(text)) {
+    return 'fonte: flag CLI (--actor)';
+  }
+  if (/sessão interativa/i.test(text)) {
+    return 'fonte: sessão interativa';
+  }
+  if (/conferência externa|atestação externa|verificado externamente/i.test(text)) {
+    return 'fonte: conferência externa';
+  }
+  return 'origem não comprovada';
 }
 
 /**
@@ -360,10 +382,18 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
     });
   }
   // Aceites explícitos (evidência real: approve accept / operator accept honored).
+  // R2: todo aceite renderiza ator + fonte + COM RESSALVA (nunca Verified).
+  // Sem menção de ator nos registros = desconhecido com origem não
+  // comprovada (nunca presumir humano); --actor human nunca comprova humano.
   const acceptDecs = decisions.filter((d) => /approve accept|operator accept honored/i.test(d));
   for (const dec of acceptDecs) {
+    const mentioned = extractActorMention(dec);
+    const hasLabel = /ator\s+(human|agent-operator|system)\b|auto-declarado|não-humano|desconhecido/i.test(dec);
+    const actorPart = mentioned
+      ? (hasLabel ? '' : ` — por ${formatActorLabel(mentioned)}`)
+      : ` — por ator desconhecido (desconhecido, origem não comprovada)`;
     out.push({
-      problem: `aceite explícito com ressalva: ${dec.slice(0, 240)} — prossegue COM RESSALVA, sem selo verified`,
+      problem: `aceite explícito com ressalva: ${dec.slice(0, 240)}${actorPart} (${describeActorSource(dec)}) — prossegue COM RESSALVA, sem selo verified (aceite nunca Verified; --actor human não comprova humano)`,
       solution: 'permanece Unverified (cobertura só por smoke global); resolver pendência e re-verificar por critério',
       status: 'pendente',
     });
@@ -371,14 +401,17 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
   // Conductor takeover / intervenção do operador (evidência real de handoff).
   // M6: cada decisão exibe o ator (human auto-declarado COM RESSALVA vs
   // agent-operator vs system); sem evidência de ator, desconhecido.
+  // R2: fonte da alegação sempre explícita (flag CLI vs origem não comprovada);
+  // identidade declarada sem confirmação nunca lê-se como humano confirmado.
   if (/conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|approve --retry|approve --relaunch|approve\/clear|approve\/start|approve --start|resume --intake|resume: conductor|touchset:/i.test(joined)) {
     const excerpt = decisions.find((d) => /conductor takeover|approve --takeover|approve\/retry|approve\/relaunch|approve --retry|approve --relaunch|approve\/clear|approve\/start|approve --start|resume --intake|resume: conductor|touchset:/i.test(d));
     const mentioned = excerpt ? extractActorMention(excerpt) : undefined;
     const actorSuffix = mentioned
       ? ` — por ${formatActorLabel(mentioned)}`
-      : ' — ator desconhecido (sem evidência de ator nos registros)';
+      : ' — ator desconhecido (desconhecido, origem não comprovada)';
+    const sourceSuffix = ` (${describeActorSource(excerpt ?? '')})`;
     out.push({
-      problem: `intervenção do operador via caminho público${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}${actorSuffix}`,
+      problem: `intervenção do operador via caminho público${excerpt ? `: ${excerpt.slice(0, 220)}` : ''}${actorSuffix}${sourceSuffix}`,
       solution: 'handoff auditado (epoch/pid) + re-validação do produto; sem extrapolar posse',
       status: hasNonAcceptPass ? 'resolvido' : 'pendente',
     });
@@ -424,6 +457,50 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
     }
   }
   return out;
+}
+
+/**
+ * R2: aceite nunca Verified — linha de gap canônica para jobs com
+ * reviewApproval integrados. Renderiza ator + COM RESSALVA em Gaps, mesmo
+ * quando a evidência task-scoped existir (retry operacional, sem approval,
+ * pode verificar; accept, com approval, nunca).
+ */
+export function formatAcceptGap(jobName: string, actor?: string): string {
+  return `${jobName} [merged, aceite ${formatActorLabel(actor)}] — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified)`;
+}
+
+/**
+ * R2: nomes de jobs aceitos a partir das decisões (`approve accept: "N"`
+ * ou `accept "N"`). Usado para excluir aceites de Verified mesmo quando o
+ * chamador só tem decisions (sem acesso ao plan).
+ */
+export function acceptedJobNamesFromDecisions(decisions: string[]): string[] {
+  const out = new Set<string>();
+  for (const d of decisions) {
+    const m1 = d.match(/approve accept:\s*"([^"]+)"/i);
+    if (m1?.[1]) out.add(m1[1]);
+    const m2 = d.match(/\baccept\s+"([^"]+)"/i);
+    if (m2?.[1] && /approve accept|operator accept/i.test(d)) out.add(m2[1]);
+    const m3 = d.match(/review\s+(\S+?):\s*pass\s*\(operator accept honored/i);
+    if (m3?.[1]) out.add(m3[1]);
+  }
+  return [...out];
+}
+
+/**
+ * R2: exclui aceites de uma lista Verified já montada (fail-closed).
+ * Entradas Verified têm forma `${job} [...]`; qualquer entrada cujo job
+ * conste em `accepted` é removida (aceite nunca Verified, em nenhum escopo).
+ */
+export function excludeAcceptedFromVerified(verified: string[], accepted: string[]): string[] {
+  if (accepted.length === 0) return verified;
+  const set = new Set(accepted);
+  return verified.filter((entry) => {
+    for (const name of set) {
+      if (entry === name || entry.startsWith(`${name} `) || entry.startsWith(`${name} [`)) return false;
+    }
+    return true;
+  });
 }
 
 function formatProblemEntry(entry: FinalReportProblem): string {

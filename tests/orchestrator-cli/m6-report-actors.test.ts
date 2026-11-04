@@ -249,3 +249,302 @@ describe('M6: mc_report_final honesto (no-accept, budget, rollback, tri-state, a
     expect(captured).toMatch(/auto-fix: nenhuma tentativa registrada.*não observável/);
   });
 });
+
+describe('R2 actor: human via flag sempre com ressalva + origem em todas as superfícies', () => {
+  it('formatActorLabel human carrega ressalva + origem não comprovada + não comprova', async () => {
+    const { formatActorLabel } = await import('../../src/lib/reports');
+    const label = formatActorLabel('human');
+    expect(label).toMatch(/auto-declarado/i);
+    expect(label).toMatch(/não verificado/i);
+    expect(label).toMatch(/origem não comprovada/i);
+    expect(label).toMatch(/--actor human não comprova humano/i);
+    expect(label).not.toMatch(/\(humano\)/);
+  });
+
+  it('resolveCliActor human evidencia flag CLI + origem + não comprova (nunca fato)', async () => {
+    const { resolveCliActor } = await import('../../src/orchestrator-cli/auto-commands');
+    const human = resolveCliActor(new Map([['actor', 'human']]), 'approve');
+    expect(human.evidence).toMatch(/auto-declarado/i);
+    expect(human.evidence).toMatch(/não verificado/i);
+    expect(human.evidence).toMatch(/origem não comprovada/i);
+    expect(human.evidence).toMatch(/--actor human não comprova humano/i);
+    expect(human.evidence).toMatch(/flag --actor/i);
+  });
+
+  it('bindReviewApproval human com evidência forjada permanece auto-declarado + origem', async () => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const { bindReviewApproval } = await import('../../src/orchestrator-cli/auto-commands');
+    const base = mkdtempSync(join(tmpdir(), 'mc-r2-actor-'));
+    try {
+      Bun.spawnSync(['git', 'init'], { cwd: base });
+      Bun.spawnSync(['git', 'config', 'user.email', 't@t.com'], { cwd: base });
+      Bun.spawnSync(['git', 'config', 'user.name', 'T'], { cwd: base });
+      writeFileSync(join(base, 'a.txt'), 'hi');
+      Bun.spawnSync(['git', 'add', '.'], { cwd: base });
+      Bun.spawnSync(['git', 'commit', '-m', 'init'], { cwd: base });
+      Bun.spawnSync(['git', 'branch', '-M', 'main'], { cwd: base });
+      Bun.spawnSync(['git', 'branch', 'feature'], { cwd: base });
+      Bun.spawnSync(['git', 'branch', 'integration'], { cwd: base });
+      const approval = await bindReviewApproval('feature', 'integration', base, 'reason', {
+        actor: 'human',
+        actorEvidence: 'sessão interativa confirmada por humano (forjado)',
+      });
+      const withActor = approval as unknown as { actor?: string; actorEvidence?: string };
+      expect(withActor.actor).toBe('human');
+      expect(String(withActor.actorEvidence ?? '')).toMatch(/auto-declarado/i);
+      expect(String(withActor.actorEvidence ?? '')).toMatch(/origem não comprovada/i);
+      expect(String(withActor.actorEvidence ?? '')).toMatch(/--actor human não comprova humano/i);
+      expect(String(withActor.actorEvidence ?? '')).not.toMatch(/sessão interativa confirmada/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('describeActorSource: flag CLI vs origem não comprovada (indistinguível)', async () => {
+    const { describeActorSource } = await import('../../src/lib/reports');
+    expect(describeActorSource('approve --retry a --actor human')).toMatch(/flag CLI/i);
+    expect(describeActorSource('approve --takeover --actor agent-operator')).toMatch(/flag CLI/i);
+    expect(describeActorSource('handoff: conductor detached pid 5')).toMatch(/origem não comprovada/i);
+    expect(describeActorSource('aceite por ator human sem flag')).toMatch(/origem não comprovada/i);
+  });
+
+  it('REPRO: handoff flag-only (--actor human sem rótulo) deriva Problem com ressalva + origem', async () => {
+    const { deriveProblemsFromRecords } = await import('../../src/lib/reports');
+    const problems = deriveProblemsFromRecords({
+      title: 'R2',
+      decisions: ['handoff: approve/retry gooddocs --actor human: conductor detached driver pid 1345325 (lease ok)'],
+      verified: [],
+      unmet: [],
+      unverified: ['gooddocs [running] — outcome not verified'],
+      integration: { branch: 'mc/i', merged: [], conflicts: [] },
+      contributions: [],
+    } as never);
+    const entry = problems.find((p) => /intervenção do operador/i.test(p.problem));
+    expect(entry).toBeDefined();
+    expect(entry!.problem).toMatch(/auto-declarado/i);
+    expect(entry!.problem).toMatch(/não verificado/i);
+    expect(entry!.problem).toMatch(/origem não comprovada|flag CLI/i);
+    expect(entry!.problem).not.toMatch(/\(humano\)/);
+  });
+
+  it('accept sem ator nos registros marca desconhecido + origem + COM RESSALVA (nunca presume humano)', async () => {
+    const { deriveProblemsFromRecords } = await import('../../src/lib/reports');
+    const problems = deriveProblemsFromRecords({
+      title: 'R2',
+      decisions: ['review s: pass (operator accept honored for a81ccfb6 on base 899a0b76 — version-bound, no re-review)'],
+      verified: [],
+      unmet: [],
+      unverified: ['s [merged] — covered only by global integration smoke (bun test), no task-scoped verification'],
+      integration: { branch: 'mc/i', merged: ['s'] },
+      contributions: [],
+    } as never);
+    const acceptEntry = problems.find((p) => /accept/i.test(p.problem));
+    expect(acceptEntry).toBeDefined();
+    expect(acceptEntry!.problem).toMatch(/desconhecido/i);
+    expect(acceptEntry!.problem).toMatch(/origem não comprovada/i);
+    expect(acceptEntry!.problem).toMatch(/COM RESSALVA/i);
+    expect(acceptEntry!.problem).toMatch(/nunca Verified|sem selo verified/i);
+    expect(acceptEntry!.status).toBe('pendente');
+  });
+});
+
+describe('R2 actor: retry operacional ≠ accept (gates vs ressalva)', () => {
+  async function runReportLocal(plan: unknown, snap: unknown, evidence: unknown, jobs: unknown) {
+    const planStateMod = await import('../../src/lib/plan-state');
+    const jobStateMod = await import('../../src/lib/job-state');
+    const reportsMod = await import('../../src/lib/reports');
+    const restore: Array<() => void> = [];
+    try {
+      restore.push(spyOn(planStateMod, 'loadPlan').mockResolvedValue(plan as never));
+      restore.push(spyOn(jobStateMod, 'loadJobState').mockResolvedValue({
+        version: 3, jobs: jobs as never, updatedAt: new Date().toISOString(),
+      } as never));
+      restore.push(spyOn(reportsMod, 'readAllReports').mockResolvedValue([]));
+      let captured = '';
+      restore.push(spyOn(reportsMod, 'writeFinalReport').mockImplementation(async (_id: string, md: string) => {
+        captured = md;
+        return '/tmp/final-r2.md';
+      }));
+      const durable = await import('../../src/lib/durable-state');
+      restore.push(spyOn(durable, 'loadRuntimeSnapshot').mockResolvedValue(snap as never));
+      restore.push(spyOn(durable, 'loadMergeEvidence').mockResolvedValue(evidence as never));
+      const { mc_report_final } = await import('../../src/tools/report');
+      await mc_report_final.execute({}, {} as never);
+      return captured;
+    } finally {
+      mock.restore();
+      for (const fn of restore) try { fn(); } catch {}
+    }
+  }
+
+  const basePlanLocal = (jobs: unknown) => ({
+    id: 'p-r2', name: 'R2 work', mode: 'autopilot', status: 'completed',
+    jobs, integrationBranch: 'mc/integration-1', baseCommit: 'abc',
+    createdAt: new Date().toISOString(),
+  });
+  const baseSnapLocal = (decisions: string[]) => ({
+    autoIntake: { id: 'i1', request: 'r', decisions, questions: [] },
+    pendingQuestions: [],
+  });
+
+  it('retry (sem reviewApproval, task-scoped pass) PODE verificar; accept (mesma evidência) NUNCA', async () => {
+    const commit = 'c'.repeat(40);
+    const taskEvidence = {
+      stats: { jobName: 'stats', testStatus: 'passed', testCommand: 'bun test', reviewedCommit: commit, scope: 'task' },
+    };
+    const retryCaptured = await runReportLocal(
+      basePlanLocal([{ id: 'j1', name: 'stats', prompt: '- [ ] works', status: 'merged', branch: 'mc/stats', mergedAt: new Date().toISOString() }]),
+      baseSnapLocal(['review stats: pass (functional, scoped bun test @ cccccccc)', 'approve --retry "stats" --actor agent-operator por ator agent-operator (não-humano): job reset to ready_to_merge; merge segue via review+merge gates']),
+      taskEvidence,
+      [],
+    );
+    const retryVerified = retryCaptured.split('## Verified')[1].split('## Gaps')[0];
+    expect(retryVerified).toContain('stats');
+
+    const acceptCaptured = await runReportLocal(
+      basePlanLocal([{
+        id: 'j1', name: 'stats', prompt: '- [ ] works', status: 'merged',
+        branch: 'mc/stats', mergedAt: new Date().toISOString(),
+        reviewApproval: {
+          reviewedCommit: commit, reviewedBase: 'b'.repeat(40),
+          reason: 'operator accept', at: new Date().toISOString(), kind: 'accept',
+          actor: 'agent-operator', actorEvidence: 'CLI approve',
+        },
+      }]),
+      baseSnapLocal(['approve accept: "stats" pinned at cccccccc — ator agent-operator (não-humano) — COM RESSALVA']),
+      taskEvidence,
+      [],
+    );
+    const acceptVerified = acceptCaptured.split('## Verified')[1].split('## Gaps')[0];
+    expect(acceptVerified).not.toContain('stats');
+    const acceptGaps = acceptCaptured.split('## Gaps')[1];
+    expect(acceptGaps).toMatch(/stats/i);
+    expect(acceptGaps).toMatch(/COM RESSALVA/i);
+  });
+
+  it('Problems distingue retry operacional de accept com ressalva', async () => {
+    const { deriveProblemsFromRecords } = await import('../../src/lib/reports');
+    const problems = deriveProblemsFromRecords({
+      title: 'R2',
+      decisions: [
+        'approve --retry "gooddocs" --actor agent-operator por ator agent-operator (não-humano): job reset to ready_to_merge; merge segue via review+merge gates',
+        'approve accept: "dancedocs" pinned at abc12345 — ator agent-operator (não-humano) — COM RESSALVA',
+      ],
+      verified: [],
+      unmet: [],
+      unverified: ['gooddocs [running] — outcome not verified', 'dancedocs [merged] — covered only by global integration smoke, no task-scoped verification'],
+      integration: { branch: 'mc/i', merged: ['dancedocs'] },
+      contributions: [],
+    } as never);
+    const retryEntry = problems.find((p) => /intervenção do operador/i.test(p.problem) && /retry/i.test(p.problem));
+    const acceptEntry = problems.find((p) => /aceite explícito/i.test(p.problem));
+    expect(retryEntry).toBeDefined();
+    expect(acceptEntry).toBeDefined();
+    expect(retryEntry!.problem).not.toMatch(/COM RESSALVA/);
+    expect(acceptEntry!.problem).toMatch(/COM RESSALVA/);
+    expect(acceptEntry!.status).toBe('pendente');
+  });
+});
+
+describe('R2 actor: aceite nunca Verified em task/report/gaps (todos os escopos)', () => {
+  async function runReportLocal2(plan: unknown, snap: unknown, evidence: unknown, jobs: unknown) {
+    const planStateMod = await import('../../src/lib/plan-state');
+    const jobStateMod = await import('../../src/lib/job-state');
+    const reportsMod = await import('../../src/lib/reports');
+    const restore: Array<() => void> = [];
+    try {
+      restore.push(spyOn(planStateMod, 'loadPlan').mockResolvedValue(plan as never));
+      restore.push(spyOn(jobStateMod, 'loadJobState').mockResolvedValue({
+        version: 3, jobs: jobs as never, updatedAt: new Date().toISOString(),
+      } as never));
+      restore.push(spyOn(reportsMod, 'readAllReports').mockResolvedValue([]));
+      let captured = '';
+      restore.push(spyOn(reportsMod, 'writeFinalReport').mockImplementation(async (_id: string, md: string) => {
+        captured = md;
+        return '/tmp/final-r2b.md';
+      }));
+      const durable = await import('../../src/lib/durable-state');
+      restore.push(spyOn(durable, 'loadRuntimeSnapshot').mockResolvedValue(snap as never));
+      restore.push(spyOn(durable, 'loadMergeEvidence').mockResolvedValue(evidence as never));
+      const { mc_report_final } = await import('../../src/tools/report');
+      await mc_report_final.execute({}, {} as never);
+      return captured;
+    } finally {
+      mock.restore();
+      for (const fn of restore) try { fn(); } catch {}
+    }
+  }
+
+  it('aceite human + evidência task-scoped NÃO verifica; task/report/gaps com ressalva', async () => {
+    const commit = 'd'.repeat(40);
+    const captured = await runReportLocal2(
+      {
+        id: 'p-r2', name: 'R2 work', mode: 'autopilot', status: 'completed',
+        jobs: [{
+          id: 'j1', name: 'stats', prompt: '- [ ] works', status: 'merged',
+          branch: 'mc/stats', mergedAt: new Date().toISOString(),
+          reviewApproval: {
+            reviewedCommit: commit, reviewedBase: 'b'.repeat(40),
+            reason: 'operator accept', at: new Date().toISOString(), kind: 'accept',
+            actor: 'human', actorEvidence: 'actor human (auto-declarado via --actor)',
+          },
+        }],
+        integrationBranch: 'mc/integration-1', baseCommit: 'abc',
+        createdAt: new Date().toISOString(),
+      },
+      {
+        autoIntake: { id: 'i1', request: 'r', decisions: ['approve accept: "stats" pinned at dddddddd — ator human (auto-declarado) — COM RESSALVA'], questions: [] },
+        pendingQuestions: [],
+      },
+      { stats: { jobName: 'stats', testStatus: 'passed', testCommand: 'bun test', reviewedCommit: commit, scope: 'task' } },
+      [],
+    );
+    const tasksSection = captured.split('## Plan & Tasks')[1].split('## Per-Instance')[0];
+    expect(tasksSection).toMatch(/stats/);
+    expect(tasksSection).toMatch(/COM RESSALVA/);
+    expect(tasksSection).toMatch(/auto-declarado/);
+    expect(tasksSection).toMatch(/origem não comprovada|--actor human não comprova/i);
+    const evidenceSection = captured.split('## Real Evidence')[1].split('## Problems')[0];
+    expect(evidenceSection).toMatch(/COM RESSALVA/);
+    expect(evidenceSection).toMatch(/auto-declarado/);
+    const verifiedSection = captured.split('## Verified')[1].split('## Gaps')[0];
+    expect(verifiedSection).not.toContain('stats');
+    const gapsSection = captured.split('## Gaps')[1].split('## Environment')[0];
+    expect(gapsSection).toMatch(/stats/);
+    expect(gapsSection).toMatch(/COM RESSALVA/);
+  });
+
+  it('aceite merged sem evidência task-scoped aparece em gaps (nunca silencioso)', async () => {
+    const commit = 'e'.repeat(40);
+    const captured = await runReportLocal2(
+      {
+        id: 'p-r2', name: 'R2 work', mode: 'autopilot', status: 'completed',
+        jobs: [{
+          id: 'j1', name: 'quiet', prompt: '- [ ] works', status: 'merged',
+          branch: 'mc/quiet', mergedAt: new Date().toISOString(),
+          reviewApproval: {
+            reviewedCommit: commit, reviewedBase: 'b'.repeat(40),
+            reason: 'operator accept', at: new Date().toISOString(), kind: 'accept',
+            actor: 'agent-operator', actorEvidence: 'CLI approve',
+          },
+        }],
+        integrationBranch: 'mc/integration-1', baseCommit: 'abc',
+        createdAt: new Date().toISOString(),
+      },
+      {
+        autoIntake: { id: 'i1', request: 'r', decisions: ['approve accept: "quiet" pinned at eeeeeeee — ator agent-operator (não-humano) — COM RESSALVA'], questions: [] },
+        pendingQuestions: [],
+      },
+      {},
+      [],
+    );
+    const verifiedSection = captured.split('## Verified')[1].split('## Gaps')[0];
+    expect(verifiedSection).not.toContain('quiet');
+    const gapsSection = captured.split('## Gaps')[1].split('## Environment')[0];
+    expect(gapsSection).toMatch(/quiet/);
+    expect(gapsSection).toMatch(/COM RESSALVA/);
+    expect(gapsSection).toMatch(/aceite|Unverified/i);
+  });
+});

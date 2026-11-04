@@ -9,6 +9,8 @@ import {
   describeOmoLimitation,
   deriveProblemsFromRecords,
   formatActorLabel,
+  formatAcceptGap,
+  excludeAcceptedFromVerified,
   type ReportStatus,
 } from '../lib/reports';
 import { writeReport } from '../lib/reports';
@@ -121,7 +123,7 @@ export const mc_report_final: ToolDefinition = tool({
       // Lane F cav-2.1: human é auto-declaração não atestada — nunca afirmar como fato.
       // M6: rótulo canônico via formatActorLabel (human/com-ressalva vs não-humano vs desconhecido).
       if (appr) {
-        const extra = `aceite ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+        const extra = `aceite ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified)`;
         return { name: job.name, status: job.status, detail: baseDetail ? `${baseDetail}; ${extra}` : extra };
       }
       return {
@@ -142,18 +144,41 @@ export const mc_report_final: ToolDefinition = tool({
     //   under Gaps. Unknown work stays under Gaps, never under Verified.
     const evidenceRecs = Object.values(mergeEvidence as Record<string, { testStatus?: string; testCommand?: string; reviewedCommit?: string; scope?: string; acceptanceLess?: boolean }>);
     const { isTaskVerified } = await import('../lib/verification.js');
-    const verified = merged
+    // R2: retry operacional (sem reviewApproval) pode verificar via gates;
+    // accept (com reviewApproval) nunca — fail-closed mesmo com task-scoped pass
+    // (ex.: pass anterior + aceite posterior). retry ≠ accept em todos os escopos.
+    const acceptedByJob = new Map(
+      plan.jobs
+        .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
+        .map((job) => [job.name, (job as unknown as { reviewApproval: { actor?: string } }).reviewApproval.actor] as const),
+    );
+    const verifiedCandidates = merged
       .filter((name) => isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never))
       .map((name) => {
         const rec = (mergeEvidence as Record<string, { testCommand?: string; reviewedCommit?: string }>)[name];
         return `${name} [merged, task-scoped]${rec?.testCommand ? ` ${rec.testCommand} passed` : ''}${rec?.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
       });
+    const verified = excludeAcceptedFromVerified(verifiedCandidates, [...acceptedByJob.keys()]);
     const integrationCovered = merged
       .filter((name) => !isTaskVerified((mergeEvidence as Record<string, Record<string, unknown>>)[name] as never) && (mergeEvidence as Record<string, { testStatus?: string }>)[name]?.testStatus === 'passed')
       .map((name) => {
         const rec = (mergeEvidence as Record<string, { testCommand?: string }>)[name];
         return `${name} [merged] — covered only by global integration smoke${rec?.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
       });
+    // R2: todo aceite merged rende gap explícito com ressalva (nunca silencioso,
+    // nunca Verified) — inclusive sem evidência task-scoped (invisível antes).
+    const verifiedNames = new Set(
+      verified.map((entry) => merged.find((name) => entry === name || entry.startsWith(`${name} `) || entry.startsWith(`${name} [`)) ?? entry),
+    );
+    const integrationNames = new Set(
+      integrationCovered.map((entry) => merged.find((name) => entry.startsWith(`${name} `) || entry.startsWith(`${name} [`)) ?? entry),
+    );
+    const acceptGaps = [...acceptedByJob.entries()]
+      .filter(([name]) => merged.includes(name) && !verifiedNames.has(name))
+      .map(([name, actor]) => formatAcceptGap(name, actor));
+    const silentMergedGaps = merged
+      .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name))
+      .map((name) => `${name} [merged] — sem evidência task-scoped, outcome not verified`);
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
       .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
@@ -185,6 +210,8 @@ export const mc_report_final: ToolDefinition = tool({
         .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
         .map((job) => `${job.name} [${job.status}] — outcome not verified`),
       ...integrationCovered.map((entry) => `${entry}`),
+      ...acceptGaps,
+      ...silentMergedGaps,
       ...pendingGaps,
     ];
     // Operator notes are labeled as such under Real Evidence — they are
@@ -332,7 +359,7 @@ export const mc_report_final: ToolDefinition = tool({
           .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
           .map((job) => {
             const appr = (job as unknown as { reviewApproval: { actor?: string; reviewedCommit?: string; reason?: string } }).reviewApproval;
-            return `accept "${job.name}" por ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified)`;
+            return `accept "${job.name}" por ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified)`;
           }),
         ...notes,
         `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
@@ -368,7 +395,7 @@ export const mc_report_final: ToolDefinition = tool({
       unmet,
       unverified,
       environment,
-      limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine, autoFixLine, fixRollbackLine, permissionLogLine],
+      limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine, autoFixLine, fixRollbackLine, permissionLogLine, '--actor human é auto-declaração não verificada (origem não comprovada; humano necessário nunca simulado pelo agente — --actor human não comprova humano)'],
       nextSteps: unverified.length > 0 || unmet.length > 0
         ? ['Resolve the Gaps above, then re-run this report']
         : [],

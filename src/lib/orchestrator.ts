@@ -7,13 +7,13 @@ import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, typ
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit, matchesTouchPattern } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, needsReReview, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
-import { isDocsOnlyChange, assessDocsCoverage } from './docs-review';
-import { reviewFunctionallyViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput } from './opencode-reviewer';
+import { isDocsOnlyChange, assessDocsCoverage, assessDocsCoverageWithSemantics } from './docs-review';
+import { reviewFunctionallyViaOpenCode, reviewDocsViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput, type DocsCriterionResult } from './opencode-reviewer';
 import { runTestsOnImmutableSnapshot } from './candidate-identity';
 import { getBranchHead, listChangedFiles } from './git';
 import { addJob, getRunningJobs, updateJob, loadJobState, removeJob, resolveJobPassword, type Job } from './job-state';
 import { JobMonitor } from './monitor';
-import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport, describeOmoLimitation } from './reports';
+import { removeReport, readAllReports, buildFinalReportMarkdown, writeFinalReport, describeOmoLimitation, formatAcceptGap, excludeAcceptedFromVerified } from './reports';
 import { getXdgDataDir, getProjectId } from './paths';
 import { resolvePostCreateHook } from './worktree-setup';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, resolveServePassword, describeTuiModelPin } from './prompt-file';
@@ -918,6 +918,18 @@ export class Orchestrator {
    * auto-fix relaunch (a functional correction prompt would be contradictory
    * for docs) — the operator fixes the docs or adjusts criteria via the
    * public touchset/approve paths and retries.
+   * R2 verified path: heuristic (`assessDocsCoverage`) is auxiliary only —
+   * a plausible but factually wrong instruction passes it. Every criterion
+   * also requires an OpenCode semantic verdict (`reviewDocsViaOpenCode` on
+   * the authorized effective model, same pattern as
+   * `reviewFunctionallyViaOpenCode`), folded via
+   * `assessDocsCoverageWithSemantics`: heuristic not-covered/contradiction
+   * never overridden; missing/malformed/fail/inconclusive/empty-evidence/
+   * uncertainty/contradiction never covered; pass with evidence → covered.
+   * Same scope convention as the functional gate: unit scope (bun test)
+   * stays deterministic with the heuristic only (real entries refuse
+   * generic test env at the CLI boundary, so real missions always require
+   * the semantic verdict).
    */
   private async reviewDocsOnly(
     job: JobSpec,
@@ -956,8 +968,33 @@ export class Orchestrator {
       ? tree.stdout.split('\n').map((l) => l.trim()).filter((l) => l !== '')
       : Object.keys(contents);
     const reasons: string[] = [];
+    // R2 verified path (same model-pin pattern as reviewFunctionallyViaOpenCode
+    // above): heuristic auxiliary + OpenCode semantic verdict, fail-closed.
+    // Same scope convention as the functional gate (`requireExternal` below):
+    // unit scope (bun test) stays deterministic with the heuristic only;
+    // real entries refuse generic test env at the CLI boundary, so a real
+    // mission always reaches here with production scope (semantic required).
+    const requireExternal = !isTestScope() && requirements.length > 0;
+    let semanticById = new Map<string, DocsCriterionResult>();
+    let effectiveArgv = '';
+    if (requireExternal) {
+      const timeoutMs = Number(process.env.MC_REVIEW_TIMEOUT_MS ?? 120000);
+      effectiveArgv = formatModelRefForArgv(this.ensureEffectiveModel());
+      try {
+        const semanticResults = await reviewDocsViaOpenCode({
+          requirements: requirements.map((r) => ({ id: r.id, description: r.description })),
+          docsFiles: contents,
+          ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
+        }, effectiveArgv);
+        for (const s of semanticResults) semanticById.set(s.id, s);
+      } catch {
+        semanticById = new Map();
+      }
+    }
     for (const req of requirements) {
-      const assessment = assessDocsCoverage(req, contents, { existingPaths });
+      const assessment = requireExternal
+        ? assessDocsCoverageWithSemantics(req, contents, semanticById.get(req.id), { existingPaths })
+        : assessDocsCoverage(req, contents, { existingPaths });
       // Lane docs3: dedicated inconclusive state is fail-closed — never auto-pass,
       // never testStatus passed; requires external reviewer or explicit human accept.
       if (assessment.status === 'inconclusive' || !assessment.covered) reasons.push(assessment.reason);
@@ -976,7 +1013,9 @@ export class Orchestrator {
         reviewedBase: pins.baseHead,
         changedFiles: pins.changedFiles,
         testStatus: 'passed',
-        testOutput: `docs-only verification (no function test demanded): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`,
+        testOutput: requireExternal
+          ? `docs-only verification (heuristic + OpenCode semantic pass with evidence, model ${effectiveArgv}): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`
+          : `docs-only verification, unit scope (heuristic only, deterministic): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`,
         scope: 'task',
       }).catch(() => {});
     } catch {}
@@ -984,7 +1023,9 @@ export class Orchestrator {
       const snap = await loadRuntimeSnapshot().catch(() => null);
       const intakeId = snap?.autoIntake?.id;
       if (intakeId) {
-        await appendAutoDecision(intakeId, `review ${job.name}: pass (docs-only, criteria verified in docs @ ${pins.jobHead.slice(0, 8)}, no external reviewer demanded)`).catch(() => {});
+        await appendAutoDecision(intakeId, requireExternal
+          ? `review ${job.name}: pass (docs-only, heuristic + OpenCode semantic pass with evidence, model ${effectiveArgv} @ ${pins.jobHead.slice(0, 8)})`
+          : `review ${job.name}: pass (docs-only, unit scope heuristic @ ${pins.jobHead.slice(0, 8)})`).catch(() => {});
       }
     } catch {}
     return {
@@ -994,7 +1035,9 @@ export class Orchestrator {
       jobName: job.name,
       reviewedCommit: pins.jobHead,
       reviewedBase: pins.baseHead,
-      audit: ['docs-only task: judged by docs criteria (content, literals, links); functional classifier not applicable'],
+      audit: [requireExternal
+        ? 'docs-only task: heuristic auxiliary + OpenCode semantic pass with evidence (fail-closed); functional classifier not applicable'
+        : 'docs-only task: unit scope, heuristic only (deterministic); production requires OpenCode semantic pass with evidence; functional classifier not applicable'],
     };
   }
 
@@ -1886,18 +1929,40 @@ export class Orchestrator {
       const acceptanceLessEntries = merged
         .filter((name) => evOf(name).acceptanceLess)
         .map((name) => `${name} [merged] — no acceptance criteria defined, outcome not verified by criterion`);
-      const verified = merged
+      const verifiedCandidates = merged
         .filter(taskVerified)
         .map((name) => {
           const rec = evOf(name);
           return `${name} [merged, task-scoped]${rec.testCommand ? ` ${rec.testCommand} passed` : ''}${rec.reviewedCommit ? ` @ ${rec.reviewedCommit.slice(0, 8)}` : ''}`;
         });
+      // R2 (mesma brecha accept→Verified do lane actor, corrigida aqui no
+      // auto-report): retry operacional (sem reviewApproval) pode verificar
+      // via gates; accept (com reviewApproval) nunca — fail-closed mesmo com
+      // task-scoped pass. Helpers cobertos por m6-report-actors.test.ts.
+      const acceptedByJob = new Map(
+        plan.jobs
+          .filter((job) => (job as unknown as { reviewApproval?: unknown }).reviewApproval)
+          .map((job) => [job.name, (job as unknown as { reviewApproval: { actor?: string } }).reviewApproval.actor] as const),
+      );
+      const verified = excludeAcceptedFromVerified(verifiedCandidates, [...acceptedByJob.keys()]);
       const integrationCovered = merged
         .filter((name) => !taskVerified(name) && evOf(name).testStatus === 'passed')
         .map((name) => {
           const rec = evOf(name);
           return `${name} [merged] — covered only by global integration smoke${rec.testCommand ? ` (${rec.testCommand})` : ''}, no task-scoped verification`;
         });
+      const verifiedNames = new Set(
+        verified.map((entry) => merged.find((name) => entry === name || entry.startsWith(`${name} `) || entry.startsWith(`${name} [`)) ?? entry),
+      );
+      const integrationNames = new Set(
+        integrationCovered.map((entry) => merged.find((name) => entry.startsWith(`${name} `) || entry.startsWith(`${name} [`)) ?? entry),
+      );
+      const acceptGaps = [...acceptedByJob.entries()]
+        .filter(([name]) => merged.includes(name) && !verifiedNames.has(name))
+        .map(([name, actor]) => formatAcceptGap(name, actor));
+      const silentMergedGaps = merged
+        .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && !evOf(name).acceptanceLess)
+        .map((name) => `${name} [merged] — sem evidência task-scoped, outcome not verified`);
       const unmet = plan.jobs
         .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
         .map((job) => `${job.name} [${job.status}]${job.error ? `: ${job.error}` : ''}`);
@@ -1936,6 +2001,8 @@ export class Orchestrator {
           .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
           .map((job) => `${job.name} [${job.status}] — outcome not verified`),
         ...integrationCovered.map((entry) => `${entry}`),
+        ...acceptGaps.map((entry) => `${entry}`),
+        ...silentMergedGaps.map((entry) => `${entry}`),
         ...acceptanceLessEntries.map((entry) => `${entry}`),
         ...unmetRequirements.map((entry) => `${entry}`),
         ...pendingGaps,

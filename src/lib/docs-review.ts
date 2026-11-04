@@ -1,5 +1,5 @@
 /**
- * Docs-only review criteria (lane docs2).
+ * Docs-only review criteria (lane docs2; lane r2-docs: heuristic auxiliary).
  *
  * Tarefas cuja entrega é só documentação nunca produzem "implementation
  * candidates" para o classificador funcional (src/lib/reviewer.ts, ramo 2b):
@@ -13,7 +13,18 @@
  * (este caminho só é alcançado quando TODOS os arquivos do diff são
  * documentação). Docs inexistente, fora de escopo ou que não atende os
  * critérios é REJEITADA (fail fechado).
+ *
+ * Lane r2-docs: `assessDocsCoverage` abaixo é EVIDÊNCIA AUXILIAR apenas —
+ * nunca base única para declarar `verified` um requisito que exige julgamento
+ * semântico (correção factual). Uma instrução plausível porém errada passa na
+ * heurística textual; o caminho público verificado é
+ * `assessDocsCoverageWithSemantics` (heurística + veredito OpenCode com
+ * razões e citações, fail-closed). O gate `reviewDocsOnly`
+ * (src/lib/orchestrator.ts) exige o veredito semântico via esta função
+ * (heurística sozinha nunca verifica julgamento semântico).
  */
+
+import type { DocsCriterionResult } from './opencode-reviewer';
 
 export interface DocsRequirement {
   id: string;
@@ -381,13 +392,16 @@ function qualifyingInstructionSentences(combined: string, keywords: string[], li
 
 /**
  * Judge one acceptance requirement against examined docs content.
- * Fail-closed: no content, trivial content, explicit denial/disclaimer,
- * missing literals/keywords, broken links, or missing explanatory substance
- * all reject. Literals/titles/links/keywords are auxiliary evidence only —
- * coverage requires affirmative explanatory substance about the criterion.
- * When substance is absent without explicit denial, the result is
- * `inconclusive` (uncertainty, fail-closed: external reviewer or explicit
- * human accept required, never auto-pass).
+ * HEURISTIC AUXILIARY ONLY (lane r2-docs): never the sole basis for
+ * `verified` when semantic judgment is required — a plausible but factually
+ * wrong instruction passes here. The verified public path is
+ * `assessDocsCoverageWithSemantics` below. Fail-closed: no content, trivial
+ * content, explicit denial/disclaimer, missing literals/keywords, broken
+ * links, or missing explanatory substance all reject. Literals/titles/links/
+ * keywords are auxiliary evidence only — coverage requires affirmative
+ * explanatory substance about the criterion. When substance is absent without
+ * explicit denial, the result is `inconclusive` (uncertainty, fail-closed:
+ * external reviewer or explicit human accept required, never auto-pass).
  */
 export function assessDocsCoverage(
   requirement: DocsRequirement,
@@ -521,4 +535,104 @@ export function assessDocsCoverage(
     reason: `requirement "${requirement.id}" covered by docs: ${paths.join(', ')}`,
   };
   return covered;
+}
+
+/** Semantic input for the verified path: reviewer verdict + reasons + doc citations. */
+export type DocsSemanticInput = Pick<DocsCriterionResult, 'verdict' | 'reason' | 'evidence'> & {
+  demonstrated?: boolean;
+};
+
+const VERIFIED_UNCERTAINTY_RE =
+  /\b(unclear|uncertain|unknown|cannot\s+(determine|verify|confirm)|insufficient\s+evidence|not\s+sure|ambiguous|possibly|might\s+be)\b/i;
+
+const VERIFIED_CONTRADICTS_PASS_RE =
+  /\b(incorrect|wrong|false|missing|fails?\s+to|contradicts?|destructive|harmful|does\s+not\s+(satisfy|meet|cover|explain|describe))\b/i;
+
+/**
+ * Verified public path (lane r2-docs): heuristic auxiliary + semantic verdict.
+ *
+ * Heuristic (`assessDocsCoverage`) rejects definitively on `not-covered`
+ * (denial, missing literals, broken links, trivial/empty) — semantic never
+ * overrides those. Otherwise verified (`covered`) requires ALL of:
+ * semantic present, verdict `pass`, `demonstrated` true when present,
+ * non-empty `evidence` (verbatim doc quotes), reason with no uncertainty
+ * (`unclear`, …) and no self-contradiction (pass + “incorrect/wrong/…”).
+ * Anything else — missing/malformed reviewer output, `fail`,
+ * `inconclusive`, empty evidence, uncertainty, contradiction, or a heuristic
+ * internal contradiction — resolves to `not-covered` (explicit semantic
+ * fail) or `inconclusive` (uncertainty, fail-closed: external re-review or
+ * explicit human accept, never auto-pass). Never throws.
+ *
+ * Ligado em `reviewDocsOnly` (src/lib/orchestrator.ts), que chama esta
+ * função com o resultado de `reviewDocsViaOpenCode`
+ * (src/lib/opencode-reviewer.ts) no modelo efetivo autorizado
+ * (`opencode-go/muse-spark-1.3-contributor` por padrão). `covered` da
+ * heurística sozinha NUNCA é `verified`.
+ */
+export function assessDocsCoverageWithSemantics(
+  requirement: DocsRequirement,
+  docsContents: Record<string, string>,
+  semantic: DocsSemanticInput | null | undefined,
+  opts?: { existingPaths?: string[] | Set<string> },
+): DocsAssessment {
+  const heuristic = assessDocsCoverage(requirement, docsContents, opts);
+  const failNotCovered = (reason: string): DocsAssessment => ({
+    covered: false,
+    status: 'not-covered',
+    reason: `docs do not cover requirement "${requirement.id}" (${requirement.description}): ${reason}`,
+  });
+  const failInconclusive = (reason: string): DocsAssessment => ({
+    covered: false,
+    status: 'inconclusive',
+    reason: `docs assessment inconclusive for requirement "${requirement.id}" (${requirement.description}): ${reason} — fail-closed: requires external reviewer or explicit human accept, never auto-pass`,
+  });
+  // Heuristic definitive rejects stand (auxiliary evidence against coverage).
+  if (heuristic.status === 'not-covered') return heuristic;
+  // Heuristic internal contradiction needs a human — semantic alone cannot settle it.
+  if (heuristic.status === 'inconclusive' && /contradict/i.test(heuristic.reason)) {
+    return failInconclusive(
+      `${heuristic.reason} — semantic review cannot override an internal contradiction alone`,
+    );
+  }
+  if (!semantic || typeof semantic !== 'object') {
+    return failInconclusive(
+      `heuristic is ${heuristic.status} but no semantic review was provided (heuristic alone never verifies semantic judgment)`,
+    );
+  }
+  const verdict = (semantic as { verdict?: unknown }).verdict;
+  const reasonRaw = (semantic as { reason?: unknown }).reason;
+  const evidenceRaw = (semantic as { evidence?: unknown }).evidence;
+  if (verdict !== 'pass' && verdict !== 'fail' && verdict !== 'inconclusive') {
+    return failInconclusive('semantic review is malformed (unknown verdict)');
+  }
+  const reason = typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw.trim().slice(0, 500) : '';
+  if (!reason) return failInconclusive('semantic review carries no reason');
+  const evidence = Array.isArray(evidenceRaw)
+    ? evidenceRaw.map(String).map((s) => s.trim()).filter((s) => s.length > 0).slice(0, 8)
+    : [];
+  if (verdict === 'fail') {
+    return failNotCovered(`semantic review rejects: ${reason} — evidence: ${evidence.slice(0, 2).join(' | ') || '(cited passages in review)'}`);
+  }
+  if (verdict === 'inconclusive') {
+    return failInconclusive(`semantic review is inconclusive: ${reason}`);
+  }
+  // verdict === 'pass': fail-closed downgrades (never verified on doubt).
+  const demonstrated = (semantic as { demonstrated?: unknown }).demonstrated;
+  if (demonstrated !== undefined && demonstrated !== true) {
+    return failInconclusive(`semantic pass without demonstrated=true (${reason})`);
+  }
+  if (evidence.length === 0) {
+    return failInconclusive(`semantic pass without doc evidence (${reason}) — citations required, never verified on assertion alone`);
+  }
+  if (VERIFIED_UNCERTAINTY_RE.test(reason)) {
+    return failInconclusive(`semantic pass expresses uncertainty (${reason})`);
+  }
+  if (VERIFIED_CONTRADICTS_PASS_RE.test(reason)) {
+    return failInconclusive(`semantic pass contradicts its own reason (${reason})`);
+  }
+  return {
+    covered: true,
+    status: 'covered',
+    reason: `requirement "${requirement.id}" verified by docs + semantic review: ${reason} — evidence: ${evidence.slice(0, 2).join(' | ')}`,
+  };
 }

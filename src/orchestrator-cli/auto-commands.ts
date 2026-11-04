@@ -42,13 +42,14 @@ import {
   getDataDir,
   getXdgDataDir,
 } from '../lib/paths';
-import { formatActorLabel } from '../lib/reports';
+import { formatActorLabel, describeActorSource } from '../lib/reports';
 
 /**
  * M6: ator auditável do CLI (takeover/retry/resume/accept exibem e logam o
  * ator). Padrão fail-closed = agent-operator (não-humano); --actor human é
- * auto-declaração não atestada (nunca afirma humano como fato); ausente nos
- * registros = desconhecido (nunca presumir — ver extractActorMention).
+ * auto-declaração não atestada (nunca afirma humano como fato — flag CLI não
+ * comprova humano, origem não comprovada sem conferência externa).
+ * Ausente nos registros = desconhecido (nunca presumir — ver extractActorMention).
  */
 export type CliActor = 'human' | 'agent-operator' | 'system';
 
@@ -63,7 +64,7 @@ export function resolveCliActor(flags: Map<string, string>, command: string): { 
   }
   const evidence =
     actor === 'human'
-      ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
+      ? `actor human (auto-declarado via flag --actor CLI, sem atestação fora de banda — não verificado, origem não comprovada; --actor human não comprova humano, pid ${process.pid})`
       : actor === 'system'
         ? `sistema (automação do produto, pid ${process.pid})`
         : `CLI ${command} sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`;
@@ -1101,7 +1102,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctlIdem as never, record, (() => { try { return curModelIdem(); } catch { return undefined; } })());
         let idemHandoff: string;
         try {
-          idemHandoff = await recordConductorHandoff(ctlIdem as never, record, repoRoot, `approve/repeat ${targetJobName ?? 'resume'}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          idemHandoff = await recordConductorHandoff(ctlIdem as never, record, repoRoot, `approve/repeat ${targetJobName ?? 'resume'}${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           try { ctlIdem.shutdown?.(); } catch {}
           throw error;
@@ -1124,7 +1125,18 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         throw new Error(`Job "${targetJobName}" not found in plan`);
       }
       if (job.status !== 'failed' && job.status !== 'conflict' && job.status !== 'needs_rebase') {
-        throw new Error(`Job "${targetJobName}" is not in a retryable state (current: ${job.status}). Only failed, conflict, or needs_rebase jobs can be retried.`);
+        // R2: scoped resume — ready_to_merge bloqueado pela pausa on_error de
+        // outro job pode ser re-driven sem aceitar a falha (só --retry).
+        const isScopedResume =
+          retry !== undefined && retry !== '' && (relaunch === undefined || relaunch === '') &&
+          job.status === 'ready_to_merge' &&
+          plan.status === 'paused' &&
+          plan.checkpoint === 'on_error' &&
+          !!plan.checkpointContext?.jobName &&
+          plan.checkpointContext.jobName !== targetJobName;
+        if (!isScopedResume) {
+          throw new Error(`Job "${targetJobName}" is not in a retryable state (current: ${job.status}). Only failed, conflict, or needs_rebase jobs can be retried.`);
+        }
       }
     }
 
@@ -1136,7 +1148,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       // auto-reaped; --takeover bumps the epoch with audit.
       const approveFencing = await ensureApproveFencing(plan.id, repoRoot, {
         ...(wantTakeover ? { takeover: true as const } : {}),
-        command: `approve${wantTakeover ? ' --takeover' : ''}${retry ? ` --retry ${retry}` : ''}${relaunch ? ` --relaunch ${relaunch}` : ''}${approveActorSuffix}`,
+        command: `approve${wantTakeover ? ' --takeover' : ''}${retry ? ` --retry ${retry}` : ''}${relaunch ? ` --relaunch ${relaunch}` : ''}${approveActorSuffix} por ${approveActorLabel}`,
       });
       if (wantTakeover && approveFencing) {
         try {
@@ -1176,7 +1188,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         await ctl.relaunchJobForCorrection(relaunch, ctx.touchSetViolations ?? [], ctx.touchSetPatterns ?? []);
         let handoff: string;
         try {
-          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          handoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/relaunch ${relaunch}${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
@@ -1198,6 +1210,51 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       if (retry !== undefined && retry !== '') {
         const job = plan.jobs.find((j) => j.name === retry)!;
         const ctx = plan.checkpointContext;
+        // R2 scoped resume: ready bloqueado pela pausa de outro job — mantém o
+        // falho como failed (sem aceite), só limpa a pausa global p/ o merge
+        // train conduzir o independente. Destino segue atômico (allMerged).
+        const isScopedResume =
+          job.status === 'ready_to_merge' && !!ctx?.jobName && ctx.jobName !== retry;
+        if (isScopedResume) {
+          const failingJob = ctx!.jobName!;
+          plan.status = 'running';
+          plan.checkpoint = null;
+          plan.checkpointContext = null;
+          await savePlan(plan, repoRoot, approveFencing);
+          const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+            import('../lib/orchestrator'),
+            import('../lib/monitor'),
+            import('../lib/model-tracker'),
+          ]);
+          const orchestrator = new Orchestrator(new JobMonitor(), config);
+          const ctl = orchestrator as unknown as {
+            setRepoRoot: (r: string) => void;
+            applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+            setPlanModelSnapshot: (m: unknown) => void;
+            resumePlan: (r?: string) => Promise<void>;
+            shutdown: () => void;
+          };
+          ctl.setRepoRoot(repoRoot);
+          applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+          let scopedHandoff: string;
+          try {
+            scopedHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          } catch (error) {
+            ctl.shutdown();
+            throw error;
+          }
+          ctl.shutdown();
+          await appendAutoDecision(record.id, `approve --retry "${retry}"${approveActorSuffix} por ${approveActorLabel}: scoped resume (job ready re-driven; "${failingJob}" stays failed, no violations accepted); merge segue via review+merge gates`).catch(() => {});
+          return [
+            `Checkpoint "${checkpoint}" cleared. Job "${retry}" re-driven (scoped resume; "${failingJob}" stays failed, no violations accepted).`,
+            scopedHandoff,
+            '',
+            `  ID:   ${plan.id}`,
+            `  Mode: ${plan.mode}`,
+            '',
+            'Use follow to monitor progress.',
+          ].join('\n');
+        }
         if (ctx?.failureKind === 'touchset' && ctx.jobName === retry) {
           if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
             // Lane docs2: validate in the intake's repo — the process cwd is the
@@ -1238,7 +1295,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
         applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
         let retryHandoff: string;
         try {
-          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          retryHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
         } catch (error) {
           ctl.shutdown();
           throw error;
@@ -1293,14 +1350,13 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       plan.checkpointContext = null;
       await savePlan(plan, repoRoot, approveFencing);
       if (acceptRecorded) {
-        // Lane F cav-2.1: human é auto-declaração não atestada — nunca afirmar como fato.
-        const actorLabel =
-          acceptRecorded.actor === 'human'
-            ? 'ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado)'
-            : `ator ${acceptRecorded.actor} (não-humano)`;
+        // R2: rótulo canônico (human auto-declarado com origem não comprovada;
+        // --actor human não comprova humano) + COM RESSALVA, nunca Verified.
+        // Retry operacional (ready_to_merge sem approval, via gates) ≠ accept.
+        const actorLabel = formatActorLabel(acceptRecorded.actor);
         await appendAutoDecision(
           record.id,
-          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — ${actorLabel} — COM RESSALVA (permanece Unverified, sem selo verified); re-review honored while pins match, any new commit/base re-reviews`,
+          `approve accept: "${acceptRecorded.job}" pinned at ${acceptRecorded.commit.slice(0, 8)} on base ${acceptRecorded.base.slice(0, 8)} — ${actorLabel} (${describeActorSource(`--actor ${acceptRecorded.actor}`)}) — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified); re-review honored while pins match, any new commit/base re-reviews`,
         ).catch(() => {});
       }
       const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
@@ -1320,7 +1376,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
       let clearHandoff: string;
       try {
-        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/clear${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+        clearHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/clear${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
       } catch (error) {
         ctl.shutdown();
         throw error;
@@ -1329,9 +1385,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
       const acceptMsg = ctx?.failureKind === 'touchset' ? ` TouchSet violations for job "${ctx.jobName}" accepted.` : '';
       const acceptRessalva =
         acceptRecorded != null
-          ? acceptRecorded.actor === 'human'
-            ? ` Aceite por ator human (auto-declarado via --actor, sem atestação fora de banda — não verificado) — COM RESSALVA (permanece Unverified, sem selo verified).`
-            : ` Aceite por ator ${acceptRecorded.actor} (não-humano) — COM RESSALVA (permanece Unverified, sem selo verified).`
+          ? ` Aceite por ${formatActorLabel(acceptRecorded.actor)} — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified).`
           : '';
       return [
         `Checkpoint "${checkpoint}" cleared.${acceptMsg}${acceptRessalva} Plan "${plan.name}" resuming (intake ${record.id}).`,
@@ -1345,6 +1399,96 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     }
 
     if (plan.status !== 'pending') {
+      // R2 follow-up: failed left without a pause by a scoped resume (independent
+      // merged past it, B4) stalls running with no checkpoint to clear — plain
+      // approve cannot name it and retry was paused-only. Allow explicit
+      // --retry of a failed/conflict/needs_rebase job while running as a
+      // scoped per-job accept (touchSet re-validated, version-bound approval
+      // with ressalva Unverified, never a blanket pass). Relaunch stays
+      // paused-only (needs checkpoint context).
+      if (plan.status === 'running' && !plan.checkpoint) {
+        if (relaunch !== undefined && relaunch !== '') {
+          throw new Error(`Plan "${plan.name}" is not paused (current status: ${plan.status}) — relaunch needs an on_error checkpoint with touchSet context.`);
+        }
+        if (retry !== undefined && retry !== '') {
+          const job = plan.jobs.find((j) => j.name === retry);
+          if (!job) throw new Error(`Job "${retry}" not found in plan`);
+          if (job.status !== 'failed' && job.status !== 'conflict' && job.status !== 'needs_rebase') {
+            throw new Error(`Job "${retry}" is not in a retryable state (current: ${job.status}). Only failed, conflict, or needs_rebase jobs can be retried.`);
+          }
+          const config = await loadConfig();
+          const runningFencing = await ensureApproveFencing(plan.id, repoRoot, {
+            ...(wantTakeover ? { takeover: true as const } : {}),
+            command: `approve${wantTakeover ? ' --takeover' : ''} --retry ${retry}${approveActorSuffix} por ${approveActorLabel}`,
+          });
+          // Fail-closed scope: never accept out-of-scope files via running retry.
+          if (job.touchSet && job.touchSet.length > 0 && job.branch && plan.integrationBranch) {
+            const { validateTouchSet: validateTS } = await import('../lib/merge-train');
+            const validation = await validateTS(job.branch, plan.integrationBranch, job.touchSet, { cwd: repoRoot });
+            if (!validation.valid && validation.violations) {
+              throw new Error(
+                `Job "${retry}" still has touchSet violations:\n` +
+                `  Violations: ${validation.violations.join(', ')}\n` +
+                `  Allowed: ${job.touchSet.join(', ')}\n` +
+                `Fix the remaining violations and retry again.`,
+              );
+            }
+          }
+          let runningAccept: { job: string; commit: string; base: string; actor: string } | null = null;
+          if (job.branch) {
+            try {
+              const approval = await bindReviewApproval(
+                job.branch,
+                plan.integrationBranch,
+                repoRoot,
+                `operator accept (running scoped retry) for "${job.name}"`,
+                { actor: approveActor, actorEvidence: approveActorEvidence },
+              );
+              job.reviewApproval = approval;
+              runningAccept = { job: job.name, commit: approval.reviewedCommit, base: approval.reviewedBase, actor: approval.actor };
+            } catch {}
+          }
+          job.status = 'ready_to_merge';
+          job.error = undefined;
+          await savePlan(plan, repoRoot, runningFencing);
+          const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
+            import('../lib/orchestrator'),
+            import('../lib/monitor'),
+            import('../lib/model-tracker'),
+          ]);
+          const orchestrator = new Orchestrator(new JobMonitor(), config);
+          const ctl = orchestrator as unknown as {
+            setRepoRoot: (r: string) => void;
+            applyCeiling: (c: { maxParallel?: number; testCommand?: string }) => void;
+            setPlanModelSnapshot: (m: unknown) => void;
+            resumePlan: (r?: string) => Promise<void>;
+            shutdown: () => void;
+          };
+          ctl.setRepoRoot(repoRoot);
+          applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
+          let runningHandoff: string;
+          try {
+            runningHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/retry ${retry}${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+          } catch (error) {
+            ctl.shutdown();
+            throw error;
+          }
+          ctl.shutdown();
+          const ressalva = runningAccept
+            ? ` Aceite por ${formatActorLabel(runningAccept.actor)} — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified).`
+            : '';
+          await appendAutoDecision(record.id, `approve --retry "${retry}"${approveActorSuffix} por ${approveActorLabel}: running scoped retry (failed→ready${runningAccept ? `, pinned ${runningAccept.commit.slice(0, 8)} on base ${runningAccept.base.slice(0, 8)} COM RESSALVA Unverified` : ', re-review'}); merge segue via gates`).catch(() => {});
+          return [
+            `Job "${retry}" reset to ready_to_merge (running scoped retry; no global pause to clear).${ressalva}`,
+            runningHandoff,
+            '',
+            `  ID:   ${plan.id}`,
+            `  Mode: ${plan.mode}`,
+            '',
+            'Use follow to monitor progress.',
+          ].join('\n');
+        }
+      }
       throw new Error(`Plan "${plan.name}" is not pending or paused (current status: ${plan.status})`);
     }
 
@@ -1364,7 +1508,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     // G2: pending start also respects an existing lease (stale holder fenced).
     const startFencing = await ensureApproveFencing(plan.id, repoRoot, {
       ...(wantTakeover ? { takeover: true as const } : {}),
-      command: `approve${wantTakeover ? ' --takeover' : ''} --start${approveActorSuffix}`,
+      command: `approve${wantTakeover ? ' --takeover' : ''} --start${approveActorSuffix} por ${approveActorLabel}`,
     });
     await savePlan(plan, repoRoot, startFencing);
     const [{ Orchestrator }, { JobMonitor }, { getCurrentModel }] = await Promise.all([
@@ -1384,7 +1528,7 @@ export async function approveIntake(args: string[], deps?: AutoCommandDeps): Pro
     applyEffectiveConfig(ctl, record, (() => { try { return getCurrentModel(); } catch { return undefined; } })());
     let startHandoff: string;
     try {
-      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/start${approveActorSuffix}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
+      startHandoff = await recordConductorHandoff(ctl, record, repoRoot, `approve/start${approveActorSuffix} por ${approveActorLabel}`, { verifyWorkers: deps?.verifyWorkers, spawnConductor: deps?.spawnConductor });
     } catch (error) {
       ctl.shutdown();
       throw error;
@@ -1439,7 +1583,7 @@ export async function bindReviewApproval(
     actor: opts?.actor ?? 'agent-operator',
     actorEvidence:
       (opts?.actor ?? 'agent-operator') === 'human'
-        ? `actor human (auto-declarado via --actor, sem atestação fora de banda — não verificado, pid ${process.pid})`
+        ? `actor human (auto-declarado via flag --actor CLI, sem atestação fora de banda — não verificado, origem não comprovada; --actor human não comprova humano, pid ${process.pid})`
         : (opts?.actorEvidence ??
           `CLI approve sem --actor explícito — registrado como agent-operator (não-humano, pid ${process.pid})`),
   };
@@ -1458,6 +1602,11 @@ export async function bindReviewApproval(
  */
 export async function touchsetIntake(args: string[]): Promise<string> {
   const { positional, flags } = parseFlags(args);
+  // R2: intervenção do operador também registra ator (padrão agent-operator;
+  // human só via --actor explícito, sempre auto-declarado com ressalva).
+  const { actor: touchActor } = resolveCliActor(flags, 'touchset');
+  const touchActorSuffix = ` --actor ${touchActor}`;
+  const touchActorLabel = formatActorLabel(touchActor);
   const record = await resolveIntake(flags);
   const repoRoot = resolveRepoRoot((record as unknown as { repo?: string }).repo ?? getActiveRepoRoot() ?? undefined);
   return await withRepoRoot(repoRoot, async () => {
@@ -1519,16 +1668,16 @@ export async function touchsetIntake(args: string[]): Promise<string> {
     }
     const fencing = await ensureApproveFencing(plan.id, repoRoot, {
       ...(flags.has('takeover') ? { takeover: true as const } : {}),
-      command: `touchset ${jobName} ${patterns.join(' ')}`,
+      command: `touchset ${jobName} ${patterns.join(' ')}${touchActorSuffix} por ${touchActorLabel}`,
     });
     job.touchSet = [...patterns];
     await savePlan(plan, repoRoot, fencing);
     await appendAutoDecision(
       record.id,
-      `touchset: "${jobName}" scope now [${patterns.join(', ')}] (edited via public path, pause/checkpoint preserved)`,
+      `touchset: "${jobName}" scope now [${patterns.join(', ')}]${touchActorSuffix} por ${touchActorLabel} (${describeActorSource(touchActorSuffix)}) (edited via public path, pause/checkpoint preserved)`,
     ).catch(() => {});
     return [
-      `touchSet of job "${jobName}" updated to [${patterns.join(', ')}] (plan "${plan.name}", pause/checkpoint preserved).`,
+      `touchSet of job "${jobName}" updated to [${patterns.join(', ')}] (plan "${plan.name}", pause/checkpoint preserved) — por ${touchActorLabel}.`,
       `Next: approve --retry ${jobName} (re-validates scope) or approve --relaunch ${jobName} (agent fixes within the new scope).`,
     ].join('\n');
   });
@@ -1544,6 +1693,8 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
   const { flags } = parseFlags(args);
   // M6: resume também registra ator (padrão agent-operator; human só via
   // --actor explícito, sempre auto-declarado com ressalva).
+  // R2: identidade declarada sem confirmação nunca lê-se como humano
+  // confirmado — CLI output também carrega o rótulo com ressalva + origem.
   const { actor: resumeActor } = resolveCliActor(flags, 'resume');
   const resumeActorSuffix = ` --actor ${resumeActor}`;
   const resumeActorLabel = formatActorLabel(resumeActor);
@@ -1611,7 +1762,9 @@ export async function resumeIntake(args: string[], deps?: AutoCommandDeps): Prom
       }
     }
     await appendAutoDecision(record.id, `handoff: resume --intake ${record.id}${resumeActorSuffix} por ${resumeActorLabel} — ${line}`).catch(() => {});
-    return line;
+    // R2: CLI output carrega o ator com ressalva (nunca flag --actor human
+    // nua, que poderia ler-se como humano confirmado).
+    return `por ${resumeActorLabel} — ${line}`;
   }).catch(() => '');
   return [
     `Resumed intake ${record.id} without new JSON (no duplicated workers, no reintegration).`,

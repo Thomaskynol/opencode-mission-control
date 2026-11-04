@@ -71,12 +71,17 @@ describe('mc_report_final integrated-vs-verified (static fixes)', () => {
     // A merge alone does not prove functioning: merged jobs are
     // integration, not verification.
     expect(result).toContain('Integrated: 1');
-    expect(result).toContain('Unverified: 1');
+    // R2 actor: merged without task-scoped evidence renders an explicit gap
+    // (never silent, never Verified) — so Unverified counts both the
+    // completed-without-merge claim and the evidence-less merge.
+    expect(result).toContain('Unverified: 2');
     const markdown = (mockWriteFinalReport as any).lastMarkdown as string;
     const verifiedSection = markdown.split('## Verified')[1].split('## Gaps')[0];
     expect(verifiedSection).toContain('Nothing verified yet');
     expect(verifiedSection).not.toContain('merged-job');
     expect(markdown).toContain('Merged: merged-job');
+    // R2 actor: the evidence-less merge has its own explicit gap line.
+    expect(markdown).toContain('merged-job [merged] — sem evidência task-scoped, outcome not verified');
     // A "completed" worker claim without a merge is not evidence: it lands
     // under Gaps as unverified, never under Verified.
     expect(markdown).toContain('done-job [completed] — outcome not verified');
