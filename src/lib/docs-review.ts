@@ -22,8 +22,12 @@ export interface DocsRequirement {
 
 export interface DocsAssessment {
   covered: boolean;
+  /** Dedicated outcome: covered | not-covered (explicit denial) | inconclusive (insufficient evidence, fail-closed). */
+  status: DocsCoverageStatus;
   reason: string;
 }
+
+export type DocsCoverageStatus = 'covered' | 'not-covered' | 'inconclusive';
 
 const DOCS_EXTENSION_RE = /\.(md|mdx|markdown|txt|rst|adoc)$/i;
 const DOCS_DIR_RE = /^(docs|doc|wiki|manual)(\/|$)/i;
@@ -120,9 +124,112 @@ function resolveLinkTarget(docPath: string, target: string): string | null {
 const LINK_RE = /\[[^\]]*\]\(([^)\s]+)\)/g;
 
 /**
+ * General denial/disclaimer signals (EN+PT, linguistic patterns — never tied
+ * to a single example wording). Literals/titles/links/keywords are auxiliary
+ * evidence only: a doc that mentions the topic while denying it, disclaiming
+ * utility, or carrying only placeholders does NOT cover the criterion.
+ * Targeted denials (negated explanatory verb + criterion term in the same
+ * sentence) contradict the criterion; global disclaimers (futility about the
+ * instructions themselves, TODO/TBD/placeholder) void the whole doc.
+ */
+
+// Negated explanatory verbs: "does not explain/cover/describe/..." (EN, general).
+const EN_NEGATED_VERB_RE =
+  /\b(does\s+not|do\s+not|doesn'?t|don'?t|did\s+not|didn'?t|will\s+not|won'?t|can\s+not|cannot|can'?t|could\s+not|couldn'?t|would\s+not|wouldn'?t|has\s+not|have\s+not|hasn'?t|haven'?t|never|fails?\s+to|failed\s+to|unable\s+to|not\s+yet|no\s+longer)\b[^.!?\n]{0,120}\b(explain|explains|explained|explaining|cover|covers|covered|covering|coverage|describe|describes|described|describing|document|documents|documented|documenting|detail|details|detailed|detailing|include|includes|included|including|provide|provides|provided|providing|contain|contains|contained|containing|address|addresses|addressed|show|shows|shown|demonstrate|demonstrates|guide|guides|instruct|instructs|tell|tells)\b/i;
+
+// Same shape in PT: "não explica/cobre/descreve/documenta/..." (general).
+const PT_NEGATED_VERB_RE =
+  /\bn[ãa]o\b[^.!?\n]{0,120}\b(explica|explicam|explicar|explicado|explicada|cobre|cobrem|cobrir|coberto|coberta|descreve|descrevem|descrever|descrito|descrita|documenta|documentam|documentar|documentado|detalha|detalham|detalhar|detalhado|detalhada|inclui|incluem|incluir|inclu[íi]do|inclu[íi]da|cont[ée]m|conter|contido|aborda|abordam|abordar|abordado|apresenta|apresentam|apresentar|apresentado|ensina|ensinam|ensinar|mostra|mostram|mostrar|traz|trazem|trazer)\b/i;
+
+// Placeholders void the doc wherever they appear (general list, EN+PT).
+const GLOBAL_PLACEHOLDER_RE =
+  /\b(todo|tbd|t\.b\.d\.|fixme|xxx|placeholder|lorem\s+ipsum|under\s+construction|coming\s+soon|to\s+be\s+written|work\s+in\s+progress|not\s+yet\s+written|a\s+ser\s+definido|a\s+definir|por\s+definir|em\s+constru[çc][ãa]o|em\s+breve|pendente|rascunho|por\s+fazer)\b/i;
+
+// Futility about the instructions themselves (general, EN+PT): nobody can use
+// them, no/ missing instructions, out of scope — the doc disclaims its own utility.
+const GLOBAL_FUTILITY_RES: RegExp[] = [
+  /\b(nobody|no\s+one)\b[^.!?\n]{0,100}\b(recover|restore|use|using|follow|following|instructions?|steps?|guide)\b/i,
+  /\b(no\s+instructions?|without\s+instructions?|missing\s+instructions?|instructions?\s+missing|out\s+of\s+scope|not\s+included|not\s+provided)\b/i,
+  /\b(cannot|can'?t|won'?t|will\s+not|unable|impossible|not\s+possible)\b[^.!?\n]{0,60}\b(recover|restore|use|using|follow)\b/i,
+  /\bningu[ée]m\b[^.!?\n]{0,80}\b(consegue|pode|recupera|restaura|usar|seguir|instru)/i,
+  /\bn[ãa]o\s+[ée]\s+poss[íi]vel\b[^.!?\n]{0,60}\b(recuperar|restaurar|usar|seguir)\b/i,
+  /\bsem\s+instru[çc][oõ]es\b/i,
+  /\bsem\s+detalhes\b/i,
+  /\bfora\s+do\s+escopo\b/i,
+  /\bn[ãa]o\s+inclu[íi]do/i,
+];
+
+// Procedural/instructional verbs (EN+PT, general): an explanatory doc tells the
+// reader to DO something or adds informative content beyond the criterion terms.
+const PROCEDURAL_VERB_RE =
+  /\b(run|runs|running|execute|executes|executing|open|opens|click|clicks|type|types|enter|enters|install|installs|configure|configures|create|creates|copy|copies|paste|save|saves|restore|restores|restoring|recover|recovers|recovering|select|selects|choose|chooses|follow|follows|following|use|uses|using|set|sets|add|adds|remove|removes|delete|deletes|update|updates|verify|verifies|check|checks|ensure|ensures|restart|reboot|connect|connects|download|downloads|upload|uploads|extract|extracts|mount|start|starts|stop|stops|enable|enables|disable|disables|navigate|press|invoke|call|calls|edit|modify|fetch|fetches|perform|see|sees|refer|refers|rode|rodar|abra|abre|abrir|clique|clica|clicar|digite|digita|digitar|instale|instala|instalar|configura|configurar|crie|cria|criar|copie|copia|copiar|cole|cola|colar|salve|salva|salvar|restaure|restaura|restaurar|recupere|recupera|recuperar|selecione|seleciona|selecionar|escolha|escolhe|escolher|siga|segue|seguir|usar|defina|define|definir|adicione|adiciona|adicionar|remova|remover|exclua|exclui|excluir|atualize|atualiza|atualizar|verifique|verifica|verificar|reinicie|reinicia|reiniciar|conecte|conecta|conectar|baixe|baixa|baixar|extraia|extrai|extrair|inicie|inicia|iniciar|habilite|desabilite|navegue|pressione|edite|modifique|consulte|veja|acesse)\b/i;
+
+function splitSentences(text: string): string[] {
+  return text
+    .split(/[.!?\n;]+/)
+    .map((s) => s.trim().replace(/^#+\s*/, ''))
+    .filter((s) => s.length > 0);
+}
+
+function sentenceMentionsCriterion(sentenceLower: string, keywords: string[], literals: string[]): boolean {
+  for (const k of keywords) {
+    if (k.length >= 4 && sentenceLower.includes(k)) return true;
+  }
+  for (const lit of literals) {
+    const l = lit.toLowerCase();
+    if (l.length >= 4 && sentenceLower.includes(l)) return true;
+  }
+  return false;
+}
+
+function isNegatedSentence(sentence: string): boolean {
+  return EN_NEGATED_VERB_RE.test(sentence) || PT_NEGATED_VERB_RE.test(sentence);
+}
+
+function isGlobalDisclaimerSentence(sentence: string): boolean {
+  if (GLOBAL_PLACEHOLDER_RE.test(sentence)) return true;
+  return GLOBAL_FUTILITY_RES.some((re) => re.test(sentence));
+}
+
+/**
+ * Affirmative explanatory substance (general): at least one non-disclaimed
+ * sentence that either instructs (procedural verb + new informative words) or
+ * adds descriptive content beyond mere repetition of the criterion terms.
+ * A doc that only repeats the topic words without explaining fails here.
+ */
+function hasAffirmativeSubstance(combined: string, keywords: string[], literals: string[]): boolean {
+  const kwLower = keywords.map((k) => k.toLowerCase());
+  const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
+  for (const raw of splitSentences(combined)) {
+    const s = raw.trim();
+    if (s.length < 20) continue; // titles/fragments alone prove nothing
+    if (isGlobalDisclaimerSentence(s)) continue;
+    if (isNegatedSentence(s)) continue;
+    const words3 = s.toLowerCase().match(/[a-zà-ú0-9]{3,}/g) ?? [];
+    if (words3.length < 5) continue;
+    const hasVerb = PROCEDURAL_VERB_RE.test(s);
+    const extras = new Set<string>();
+    for (const w of s.toLowerCase().match(/[a-zà-ú0-9]{4,}/g) ?? []) {
+      if (DOCS_STOPWORDS.has(w)) continue;
+      if (kwLower.includes(w)) continue;
+      if (litLower.some((l) => l.includes(w))) continue;
+      extras.add(w);
+    }
+    if (hasVerb && extras.size >= 2) return true;
+    if (!hasVerb && extras.size >= 3 && words3.length >= 8) return true;
+  }
+  return false;
+}
+
+/**
  * Judge one acceptance requirement against examined docs content.
- * Fail-closed: no content, trivial content, missing literals/keywords or a
- * broken relative link (when the repo tree is provided) all reject.
+ * Fail-closed: no content, trivial content, explicit denial/disclaimer,
+ * missing literals/keywords, broken links, or missing explanatory substance
+ * all reject. Literals/titles/links/keywords are auxiliary evidence only —
+ * coverage requires affirmative explanatory substance about the criterion.
+ * When substance is absent without explicit denial, the result is
+ * `inconclusive` (uncertainty, fail-closed: external reviewer or explicit
+ * human accept required, never auto-pass).
  */
 export function assessDocsCoverage(
   requirement: DocsRequirement,
@@ -130,42 +237,69 @@ export function assessDocsCoverage(
   opts?: { existingPaths?: string[] | Set<string> },
 ): DocsAssessment {
   const paths = Object.keys(docsContents);
-  const fail = (reason: string): DocsAssessment => ({
+  const failNotCovered = (reason: string): DocsAssessment => ({
     covered: false,
+    status: 'not-covered',
     reason: `docs do not cover requirement "${requirement.id}" (${requirement.description}): ${reason}`,
   });
+  const failInconclusive = (reason: string): DocsAssessment => ({
+    covered: false,
+    status: 'inconclusive',
+    reason: `docs assessment inconclusive for requirement "${requirement.id}" (${requirement.description}): ${reason} — fail-closed: requires external reviewer or explicit human accept, never auto-pass`,
+  });
   if (paths.length === 0) {
-    return fail('no documentation content examined (missing functional evidence — stdout text alone never verifies)');
+    return failNotCovered('no documentation content examined (missing functional evidence — stdout text alone never verifies)');
   }
   // Every changed docs file must carry real content — a placeholder diff proves nothing.
   for (const p of paths) {
     const nonWs = (docsContents[p] ?? '').replace(/\s/g, '');
     if (nonWs.length < MIN_DOCS_CHARS) {
-      return fail(`"${p}" is empty or trivial (${nonWs.length} non-whitespace chars, minimum ${MIN_DOCS_CHARS}) — write the required content`);
+      return failNotCovered(`"${p}" is empty or trivial (${nonWs.length} non-whitespace chars, minimum ${MIN_DOCS_CHARS}) — write the required content`);
     }
   }
   const combined = paths.map((p) => docsContents[p] ?? '').join('\n');
   const lowered = combined.toLowerCase();
+  const literals = extractLiterals(requirement.description);
+  const keywords = extractKeywords(requirement.description).filter(
+    (k) => !literals.some((l) => l.toLowerCase().includes(k)),
+  );
+  // Global disclaimers void the whole doc (general patterns, EN+PT).
+  for (const raw of splitSentences(combined)) {
+    if (isGlobalDisclaimerSentence(raw)) {
+      return failNotCovered(
+        `docs disclaim their own utility ("${raw.slice(0, 120)}") — placeholder or futility disclaimer voids coverage, write real instructions or accept explicitly`,
+      );
+    }
+  }
+  // Targeted denial: a negated explanatory sentence about the criterion itself
+  // contradicts it (general linguistic shape + criterion-term overlap, never an
+  // example-specific string). Negations about unrelated topics do not block.
+  for (const raw of splitSentences(combined)) {
+    if (isNegatedSentence(raw) && sentenceMentionsCriterion(raw.toLowerCase(), keywords, literals)) {
+      return failNotCovered(
+        `docs deny coverage ("${raw.slice(0, 140)}") — content contradicts the criterion, fix the docs or accept explicitly`,
+      );
+    }
+  }
   // Required literals (commands, file names, numbers, quoted spans) must appear verbatim.
-  for (const lit of extractLiterals(requirement.description)) {
+  // Auxiliary only: presence never proves coverage, absence rejects.
+  for (const lit of literals) {
     if (!lowered.includes(lit.toLowerCase())) {
-      return fail(`required literal "${lit}" not found in the examined docs — document it verbatim`);
+      return failNotCovered(`required literal "${lit}" not found in the examined docs — document it verbatim`);
     }
   }
   // Keyword majority: the prose must be about the requirement, not another topic.
-  const keywords = extractKeywords(requirement.description).filter(
-    (k) => !extractLiterals(requirement.description).some((l) => l.toLowerCase().includes(k)),
-  );
+  // Auxiliary only: mention without explanation never passes (see substance below).
   if (keywords.length > 0) {
     const hits = keywords.filter((k) => lowered.includes(k));
     const need = Math.max(1, Math.ceil(keywords.length / 2));
     if (hits.length < need) {
-      return fail(
+      return failNotCovered(
         `docs mention ${hits.length}/${keywords.length} required topic(s) (need ${need}: ${keywords.join('/')}) — the content is about something else`,
       );
     }
-  } else if (extractLiterals(requirement.description).length === 0) {
-    return fail('no checkable criterion (no literals or topic words) — refine the acceptance or accept explicitly');
+  } else if (literals.length === 0) {
+    return failInconclusive('no checkable criterion (no literals or topic words) — refine the acceptance or accept explicitly');
   }
   // Relative links must resolve inside the reviewed tree (external/anchor links ignored).
   if (opts?.existingPaths) {
@@ -177,13 +311,22 @@ export function assessDocsCoverage(
         const resolved = resolveLinkTarget(p, m[1]!);
         if (resolved === null) continue;
         if (!existing.has(resolved)) {
-          return fail(`broken relative link in "${p}": "${m[1]}" resolves to "${resolved}" which is absent from the reviewed tree`);
+          return failNotCovered(`broken relative link in "${p}": "${m[1]}" resolves to "${resolved}" which is absent from the reviewed tree`);
         }
       }
     }
   }
+  // Substance gate: mention is not explanation. Without an affirmative
+  // instructional/explanatory sentence about the topic, coverage cannot be
+  // established — return the dedicated inconclusive state (fail-closed).
+  if (!hasAffirmativeSubstance(combined, keywords, literals)) {
+    return failInconclusive(
+      `docs mention the topic but provide no affirmative explanatory substance (no instructive sentence with new informative content — only repetition, titles, or disclaimed text found)`,
+    );
+  }
   const covered: DocsAssessment = {
     covered: true,
+    status: 'covered',
     reason: `requirement "${requirement.id}" covered by docs: ${paths.join(', ')}`,
   };
   return covered;
