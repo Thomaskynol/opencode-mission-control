@@ -1241,16 +1241,24 @@ export function assessFunctionalCoverage(
 /**
  * P2: task tests named by the product (explicit testPaths, else test-like
  * files in scope). A global suite only satisfies an anchored per-file
- * command when the observed records prove THOSE tests ran — a runner lists
- * the files it executes; bare counts ("4 pass") and requirement names alone
- * never prove it.
+ * command when the observed records prove THOSE tests ran AND passed — a
+ * runner lists the files it executes; bare counts ("4 pass") and requirement
+ * names alone never prove it.
  * P2-general: the file must be named in the product-OBSERVED output (runner
  * record) together with a runner pass signal — a filename appearing only as
  * text (requirement prose, or the command string echoing it without runner
- * results) never proves execution. Real `bun test` output always lists the
- * files it runs, so legitimate evidence keeps passing; anything weaker
- * stays fail-closed (see reviewJob).
- * shortcut: path/basename substring on observed records — upgrade if a runner stops listing files.
+ * results) never proves execution.
+ * Achado B (exec-proof): filename + ANY global pass signal is NOT proof.
+ * bun 1.3.14 default output is condensed (no per-file listing), so a task
+ * file mentioned anywhere (log header, junit skip entry, prose) next to an
+ * unrelated "N pass" summary satisfied the old predicate. Execution proof
+ * must be LINKED: structured per-file/per-case status extracted from the
+ * output (console `path:` sections with `(pass)` lines, or junit
+ * `<testsuite>`/`<testcase>` records). Skip/todo/filtered-out/failed cases
+ * and zero-test runs are never evidence; same basenames in different
+ * directories match by full path only; unattributed or ambiguous output is
+ * lack of evidence (fail-closed). shortcut: regex section/XML scan — upgrade
+ * if a runner stops emitting file-attributed records.
  */
 function taskTestFiles(input: ReviewInput): string[] {
   const explicit = input.testPaths ?? [];
@@ -1258,17 +1266,152 @@ function taskTestFiles(input: ReviewInput): string[] {
   return [...new Set([...explicit, ...like])];
 }
 
-/** True when the observed output records at least one task test file passing. */
+/** Structured per-file execution evidence extracted from runner output. */
+export interface TaskFileExecution {
+  /** File path as listed in the output (section header or suite file). */
+  file: string;
+  pass: number;
+  fail: number;
+  /** Never-executed cases: skip, todo, filtered-out (all `<skipped/>`). */
+  skip: number;
+  total: number;
+}
+
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/g;
+
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_ESCAPE_RE, '');
+}
+
+/** Console sections: `path/to/x.test.ts:` header + `(pass|fail|skip|todo)` lines. */
+function parseConsoleSections(output: string): TaskFileExecution[] {
+  const out: TaskFileExecution[] = [];
+  let current: TaskFileExecution | null = null;
+  const close = () => {
+    if (current) {
+      current.total = current.pass + current.fail + current.skip;
+      out.push(current);
+      current = null;
+    }
+  };
+  for (const rawLine of stripAnsi(output).split('\n')) {
+    const line = rawLine;
+    const header = /^([^\s].*?):\s*$/.exec(line);
+    if (header) {
+      const name = (header[1] ?? '').trim();
+      // Only test-file sections open evidence scope: prose lines ending in
+      // `:` (e.g. `SUMMARY:`) never attribute cases to a task file.
+      if (/\.(test|spec)\.[A-Za-z0-9]+$/.test(name)) {
+        close();
+        current = { file: name, pass: 0, fail: 0, skip: 0, total: 0 };
+        continue;
+      }
+    }
+    if (/^Ran \d+ tests?\b/.test(line.trim())) {
+      close();
+      continue;
+    }
+    const counted = /^\s*\((pass|fail|skip|todo)\)(?![A-Za-z0-9_])/.exec(line);
+    if (counted && current) {
+      const status = counted[1];
+      if (status === 'pass') current.pass++;
+      else if (status === 'fail') current.fail++;
+      else current.skip++;
+    }
+  }
+  close();
+  return out;
+}
+
+/** JUnit suites: `<testsuite file="...">` + `<testcase>` with `<skipped/>`/`<failure/>`. */
+function parseJUnitSuites(output: string): TaskFileExecution[] {
+  const out: TaskFileExecution[] = [];
+  const clean = stripAnsi(output);
+  const openRe = /<testsuite\b((?:"[^"]*"|[^>"'])*)>/g;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(clean)) !== null) {
+    const tag = m[0]!;
+    const attrs = m[1] ?? '';
+    const selfClosing = /\/\s*>$/.test(tag);
+    const fileAttr = /file="([^"]*)"/.exec(attrs)?.[1] ?? '';
+    const nameAttr = /name="([^"]*)"/.exec(attrs)?.[1] ?? '';
+    const file = [fileAttr, nameAttr].find((v) => /\.(test|spec)\.[A-Za-z0-9]+/.test(v)) ?? '';
+    if (!file) {
+      if (!selfClosing) {
+        const end = clean.indexOf('</testsuite>', m.index + tag.length);
+        openRe.lastIndex = end < 0 ? clean.length : end + '</testsuite>'.length;
+      }
+      continue;
+    }
+    const entry: TaskFileExecution = { file, pass: 0, fail: 0, skip: 0, total: 0 };
+    if (!selfClosing) {
+      const end = clean.indexOf('</testsuite>', m.index + tag.length);
+      const body = end < 0 ? '' : clean.slice(m.index + tag.length, end);
+      if (end >= 0) openRe.lastIndex = end + '</testsuite>'.length;
+      const caseRe = /<testcase\b[^>]*\/>|<testcase\b[^>]*>([\s\S]*?)<\/testcase>/g;
+      let c: RegExpExecArray | null;
+      while ((c = caseRe.exec(body)) !== null) {
+        const inner = c[1] ?? '';
+        if (/<skipped[\s>/]/.test(inner) || /<skipped[\s>/]/.test(c[0]!)) entry.skip++;
+        else if (/<(failure|error)[\s>/]/.test(inner)) entry.fail++;
+        else entry.pass++;
+      }
+    }
+    entry.total = entry.pass + entry.fail + entry.skip;
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Structured per-file/per-case execution evidence from runner output.
+ * Console sections and junit suites are unioned (a run captured in both
+ * shapes still attributes each case once per shape — aggregation below
+ * treats any non-executed record as taint, so double-listing never inflates
+ * proof into a pass).
+ */
+export function parseTaskFileExecution(output: string): TaskFileExecution[] {
+  if (!output || output.trim().length === 0) return [];
+  return [...parseConsoleSections(output), ...parseJUnitSuites(output)];
+}
+
+/**
+ * Full-path link: same basenames in different directories never match.
+ * A bare task filename matches a unique listed path only (ambiguous when
+ * several distinct listed paths share the basename — fail-closed).
+ */
+function sectionMatchesTaskFile(taskFile: string, header: string): boolean {
+  const t = taskFile.trim();
+  const h = header.trim();
+  if (!t || !h) return false;
+  if (h === t) return true;
+  return h.endsWith(`/${t}`) || t.endsWith(`/${h}`);
+}
+
+/** True when the output proves the task file(s) executed with passing cases. */
 function taskTestExecuted(input: ReviewInput): boolean {
-  const files = taskTestFiles(input);
-  if (files.length === 0) return false;
   const output = input.evidence?.output ?? '';
   if (!hasPassSignal(output)) return false;
-  return files.some((f) => {
-    if (output.includes(f)) return true;
-    const base = f.split('/').pop() ?? '';
-    return base.length >= 3 && output.includes(base);
-  });
+  const parsed = parseTaskFileExecution(output);
+  if (parsed.length === 0) return false;
+  const explicit = input.testPaths ?? [];
+  // Explicit task files (testPaths): EVERY one must show linked clean
+  // passes — an unrelated file passing never vouches for a skipped task.
+  // Fallback (no testPaths): the task file is unknown, keep the historical
+  // `some` over in-scope test files.
+  const targets = explicit.length > 0 ? explicit : taskTestFiles(input);
+  if (targets.length === 0) return false;
+  const check = (f: string): boolean => {
+    const matched = parsed.filter((e) => sectionMatchesTaskFile(f, e.file));
+    if (matched.length === 0) return false;
+    if (!f.includes('/') && new Set(matched.map((e) => e.file)).size > 1) return false;
+    const pass = matched.reduce((n, e) => n + e.pass, 0);
+    const notExecuted = matched.reduce((n, e) => n + e.fail + e.skip, 0);
+    // ≥1 linked pass AND zero skip/todo/fail: a skipped task case (or a
+    // filtered-out / zero-test file) is lack of evidence, never proof.
+    return pass >= 1 && notExecuted === 0;
+  };
+  return explicit.length > 0 ? targets.every(check) : targets.some(check);
 }
 
 /**
@@ -1396,7 +1539,7 @@ export function reviewJob(input: ReviewInput): ReviewVerdict {
           discountedCommandScope = commandScope;
         } else {
           reasons.push(
-            `external functional review (opencode) did not pass: ${commandScope.join('; ') || 'no reason recorded'} — fail-closed (no proof the task tests executed: observed command/output do not list ${taskTestFiles(input).join(', ') || 'any task test file'})`,
+            `external functional review (opencode) did not pass: ${commandScope.join('; ') || 'no reason recorded'} — fail-closed (no proof of linked passing execution for the task tests: observed output attributes no clean pass to ${taskTestFiles(input).join(', ') || 'any task test file'})`,
           );
         }
       } else {
