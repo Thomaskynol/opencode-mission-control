@@ -3,6 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import * as paths from '../../src/lib/paths';
 import { addPendingQuestion, clearPendingQuestionsForJob } from '../../src/lib/question-relay';
+import { ensureBaseReady } from '../../src/lib/auto-plan';
 import { answerQuestion } from '../../src/orchestrator-cli/forms';
 import { dispatchCommand, type HumanControls } from '../../src/orchestrator-cli/commands';
 import { loadAutoIntake } from '../../src/lib/durable-state';
@@ -199,5 +200,63 @@ describe('answer routing: free-text content is never an approve/deny', () => {
     ).rejects.toThrow(/clarification/i);
     expect(prompted).toBe(0);
     expect(calls.filter((c) => c.url.includes('/permission/'))).toHaveLength(0);
+  });
+});
+
+describe('ensureBaseReady detached-HEAD fallback (lane worktrees)', () => {
+  async function git(cwd: string, ...args: string[]): Promise<void> {
+    const proc = Bun.spawn(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+    await proc.exited;
+  }
+
+  /** Isolated fixture: git init tmp + commit + branch -M main, then detach. */
+  async function makeDetachedRepo(): Promise<string> {
+    const fs = await import('fs');
+    const dir = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-detached-'));
+    await git(dir, 'init', '-q');
+    await git(
+      dir,
+      '-c',
+      'user.email=t@t',
+      '-c',
+      'user.name=t',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'init',
+    );
+    await git(dir, 'branch', '-M', 'main');
+    await git(dir, 'checkout', '--detach', 'HEAD');
+    return dir;
+  }
+
+  it('falls back to main/master instead of throwing "has no current branch"', async () => {
+    const fs = await import('fs');
+    const dir = await makeDetachedRepo();
+    try {
+      const ready = await ensureBaseReady(dir);
+      expect(ready.baseBranch).toBe('main');
+      expect(ready.createdBranch).toBe(false);
+      expect(ready.baseCommit).toMatch(/^[0-9a-f]+$/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stays fail-closed: no commits still throws, invalid branch still throws', async () => {
+    const fs = await import('fs');
+    const empty = await fs.promises.mkdtemp(join(tmpdir(), 'mc-auto-empty-'));
+    try {
+      await git(empty, 'init', '-q');
+      await expect(ensureBaseReady(empty)).rejects.toThrow(/no commits|minimal preparation/i);
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
+    const dir = await makeDetachedRepo();
+    try {
+      await expect(ensureBaseReady(dir, 'bad name')).rejects.toThrow(/invalid destination/i);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -14,7 +14,7 @@ import { randomUUID } from 'crypto';
 import type { JobSpec } from './plan-types';
 import { isGitPushText } from './permission-policy';
 import { matchesTouchPattern, touchPatternsOverlap } from './merge-train';
-import { gitCommand } from './git';
+import { gitCommand, getDefaultBranch } from './git';
 import { getCurrentModel, getCurrentModelRef } from './model-tracker';
 
 export interface AutoCeiling {
@@ -697,12 +697,20 @@ export async function ensureBaseReady(
   if (!targetBranch) {
     const current = await gitCommand(['branch', '--show-current'], { cwd: repo });
     const baseBranch = current.stdout.trim();
-    if (current.exitCode !== 0 || !baseBranch) {
-      throw new Error(
-        `Repo at "${repo}" has no current branch — minimal preparation: git branch -m main, then retry.`,
-      );
+    if (current.exitCode === 0 && baseBranch) {
+      return { baseCommit, baseBranch, createdBranch: false };
     }
-    return { baseCommit, baseBranch, createdBranch: false };
+    // Detached HEAD (lane worktrees): show-current exits 0 with empty output.
+    // Fall back to the repo default (main/master) instead of failing, but stay
+    // fail-closed when even the fallback ref does not exist.
+    const fallback = await getDefaultBranch(repo);
+    const verify = await gitCommand(['rev-parse', '--verify', fallback], { cwd: repo });
+    if (verify.exitCode === 0) {
+      return { baseCommit, baseBranch: fallback, createdBranch: false };
+    }
+    throw new Error(
+      `Repo at "${repo}" has no current branch — minimal preparation: git branch -m main, then retry.`,
+    );
   }
 
   const exists = await gitCommand(['rev-parse', '--verify', targetBranch], { cwd: repo });
