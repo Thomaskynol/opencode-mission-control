@@ -958,7 +958,9 @@ export class Orchestrator {
     const reasons: string[] = [];
     for (const req of requirements) {
       const assessment = assessDocsCoverage(req, contents, { existingPaths });
-      if (!assessment.covered) reasons.push(assessment.reason);
+      // Lane docs3: dedicated inconclusive state is fail-closed — never auto-pass,
+      // never testStatus passed; requires external reviewer or explicit human accept.
+      if (assessment.status === 'inconclusive' || !assessment.covered) reasons.push(assessment.reason);
     }
     if (reasons.length > 0) {
       return fail([
