@@ -130,11 +130,15 @@ describe('v2 representative operation depending on host session (R06)', () => {
     const configMod = await import('../src/lib/config');
     const promptFile = await import('../src/lib/prompt-file');
     const worktreeSetup = await import('../src/lib/worktree-setup');
+    const portAllocator = await import('../src/lib/port-allocator');
+    const sdkClient = await import('../src/lib/sdk-client');
+    const modelTracker = await import('../src/lib/model-tracker');
 
     const probeDir = mkdtempSync(join(tmpdir(), 'mc-v2-launch-'));
     try {
       vi.spyOn(jobState, 'getJobByName').mockResolvedValue(undefined);
       const addJob = vi.spyOn(jobState, 'addJob').mockResolvedValue(undefined);
+      vi.spyOn(jobState, 'getRunningJobs').mockResolvedValue([]);
       vi.spyOn(worktreeMod, 'createWorktree').mockResolvedValue(probeDir);
       vi.spyOn(worktreeMod, 'removeWorktree').mockResolvedValue(undefined);
       vi.spyOn(tmux, 'isTmuxAvailable').mockResolvedValue(true);
@@ -145,15 +149,30 @@ describe('v2 representative operation depending on host session (R06)', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
-        // TUI intent: this test probes launchSessionID persistence, not routing.
-        useServeMode: false,
+        // Serve is the enforced path: TUI (useServeMode:false) is refused
+        // fail-closed. This test probes launchSessionID persistence, not routing.
+        useServeMode: true,
+        portRangeStart: 14100,
+        portRangeEnd: 14199,
         omo: { enabled: false, defaultMode: 'vanilla' },
       } as never);
-      vi.spyOn(promptFile, 'writePromptFile').mockResolvedValue(join(probeDir, '.mc-prompt.txt'));
-      vi.spyOn(promptFile, 'cleanupPromptFile').mockImplementation(() => {});
-      vi.spyOn(promptFile, 'writeLauncherScript').mockResolvedValue(join(probeDir, '.mc-launch.sh'));
+      vi.spyOn(promptFile, 'writeServeLauncherScript').mockResolvedValue(join(probeDir, '.mc-launch.sh'));
       vi.spyOn(promptFile, 'cleanupLauncherScript').mockImplementation(() => {});
       vi.spyOn(worktreeSetup, 'resolvePostCreateHook').mockReturnValue({ symlinkDirs: ['.opencode'] } as never);
+      vi.spyOn(portAllocator, 'allocatePort').mockResolvedValue(14100);
+      vi.spyOn(portAllocator, 'releasePort').mockResolvedValue(undefined);
+      vi.spyOn(modelTracker, 'getCurrentModelInfo').mockReturnValue({
+        providerID: 'opencode-go',
+        modelID: 'muse-spark-1.3-contributor',
+        variant: 'xhigh',
+      } as never);
+      const fakeClient = { baseUrl: 'http://127.0.0.1:14100/api', headers: {} };
+      vi.spyOn(sdkClient, 'v2WaitForServer').mockResolvedValue(fakeClient as never);
+      vi.spyOn(sdkClient, 'v2CreateSession').mockResolvedValue({
+        id: 'ses-v2-1',
+        model: { providerID: 'opencode-go', id: 'muse-spark-1.3-contributor', variant: 'xhigh' },
+      } as never);
+      vi.spyOn(sdkClient, 'v2Prompt').mockResolvedValue({} as never);
 
       const { mc_launch } = await import('../src/tools/launch');
       const { host } = makeHost(probeDir);

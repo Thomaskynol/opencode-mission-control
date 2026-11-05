@@ -100,6 +100,9 @@ mock.module('../../src/lib/worktree', () => ({
     return `/tmp/mc-worktrees/${sanitized}`;
   }),
   removeWorktree: vi.fn(async () => {}),
+  // launch.ts pre-flight resolves the main worktree to vet inherited
+  // `.opencode` configs — point it at a stable fake (no blanket allow).
+  getMainWorktree: vi.fn(async () => '/tmp/mc-main'),
   isInManagedWorktree: vi.fn(async (path: string) => ({
     isManaged: path.startsWith('/tmp/mc-worktrees'),
     worktreePath: path,
@@ -134,11 +137,77 @@ mock.module('../../src/lib/config', () => ({
     pollInterval: 10000,
     idleThreshold: 300000,
     worktreeBasePath: '/tmp/mc-worktrees',
-    // TUI intent: this suite probes workflows, not serve routing.
-    useServeMode: false,
+    // Serve is the enforced path (TUI is refused fail-closed by the
+    // policy lane): this suite probes workflows, not TUI routing.
+    useServeMode: true,
+    portRangeStart: 14100,
+    portRangeEnd: 14199,
     omo: { enabled: false, defaultMode: 'vanilla' },
   })),
 }));
+
+// Serve-path seams: launch.ts allocates a port, waits for the v2 surface,
+// pins the tracked model, and delivers the prompt via launchWorkerViaServe.
+mock.module('../../src/lib/port-allocator', () => ({
+  allocatePort: vi.fn(async () => 14100),
+  releasePort: vi.fn(async () => {}),
+}));
+
+mock.module('../../src/lib/model-tracker', () => ({
+  getCurrentModel: vi.fn(() => undefined),
+  getCurrentModelInfo: vi.fn(() => ({
+    providerID: 'opencode-go',
+    modelID: 'muse-spark-1.3-contributor',
+    variant: 'xhigh',
+  })),
+}));
+
+mock.module('../../src/lib/sdk-client', () => {
+  const notUsed = (name: string) => async () => {
+    throw new Error(`stub: ${name} not expected in workflow suite`);
+  };
+  return {
+    quoteShellPath: vi.fn((p: string) => `'${p.replace(/'/g, `'\\''`)}'`),
+    v2WaitForServer: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:14100/api', headers: {} })),
+    launchWorkerViaServe: vi.fn(async (client: unknown, input: any) => ({
+      sessionId: 'ses_mock9',
+      tmuxTarget: input.tmuxTarget,
+      requestedModel: input.model,
+      observedModel: input.model,
+    })),
+    // Runtime stubs for the rest of the surface (transitive closure imports
+    // them via question-relay/monitor; only the three seams above run here).
+    createJobClient: vi.fn(() => ({})),
+    waitForServer: vi.fn(notUsed('waitForServer')),
+    sendPrompt: vi.fn(notUsed('sendPrompt')),
+    createSessionAndPrompt: vi.fn(notUsed('createSessionAndPrompt')),
+    forkJobSession: vi.fn(notUsed('forkJobSession')),
+    createV2Client: vi.fn((port: number) => ({ baseUrl: `http://127.0.0.1:${port}/api`, headers: {} })),
+    v2CreateSession: vi.fn(notUsed('v2CreateSession')),
+    v2GetSession: vi.fn(notUsed('v2GetSession')),
+    assertServeSessionModelEcho: vi.fn(() => {}),
+    v2CreateSessionWithVerifiedModel: vi.fn(notUsed('v2CreateSessionWithVerifiedModel')),
+    v2ActiveSessions: vi.fn(async () => []),
+    v2Prompt: vi.fn(async () => ({})),
+    v2RunCommand: vi.fn(async () => ({})),
+    v2Generate: vi.fn(notUsed('v2Generate')),
+    v2Interrupt: vi.fn(async () => ({})),
+    v2Background: vi.fn(async () => ({})),
+    v2Wait: vi.fn(notUsed('v2Wait')),
+    v2SessionLog: vi.fn(async () => ''),
+    v2Messages: vi.fn(async () => []),
+    v2GetMessage: vi.fn(notUsed('v2GetMessage')),
+    v2ForkSession: vi.fn(notUsed('v2ForkSession')),
+    v2MoveSession: vi.fn(notUsed('v2MoveSession')),
+    v2CompactSession: vi.fn(notUsed('v2CompactSession')),
+    v2ListForms: vi.fn(async () => []),
+    v2GetForm: vi.fn(notUsed('v2GetForm')),
+    v2CreateForm: vi.fn(notUsed('v2CreateForm')),
+    v2ReplyForm: vi.fn(async () => ({})),
+    v2ListPermissions: vi.fn(async () => []),
+    v2ReplyPermission: vi.fn(async () => ({})),
+  };
+});
 
 mock.module('../../src/lib/omo', () => ({
   detectOMO: vi.fn(async () => ({
@@ -170,6 +239,18 @@ mock.module('../../src/lib/worktree-setup', () => ({
     copyFiles: perJob?.copyFiles ?? [],
     commands: perJob?.commands ?? [],
   })),
+  // Pre-flight vet is covered by dedicated policy suites; the fake
+  // main worktree above carries no permissive config.
+  assertNoPermissiveOpencodeConfig: vi.fn(() => {}),
+}));
+
+// Serve-mode capture/status read monitor event accumulators (not the tmux
+// pane). The fake monitor below serves staged accumulators per job id.
+mock.module('../../src/lib/orchestrator-singleton', () => ({
+  getSharedMonitor: vi.fn(() => ({ getEventAccumulator: () => undefined })),
+  setSharedNotifyCallback: vi.fn(() => {}),
+  getSharedNotifyCallback: vi.fn(() => undefined),
+  setSharedOrchestrator: vi.fn(() => {}),
 }));
 
 mock.module('crypto', () => {
@@ -189,6 +270,8 @@ const worktree = await import('../../src/lib/worktree');
 const planCopier = await import('../../src/lib/plan-copier');
 const omoMod = await import('../../src/lib/omo');
 const configMod = await import('../../src/lib/config');
+const sdkMod = await import('../../src/lib/sdk-client');
+const orchSingleton = await import('../../src/lib/orchestrator-singleton');
 
 const { mc_launch } = await import('../../src/tools/launch');
 const { mc_status } = await import('../../src/tools/status');
@@ -215,6 +298,28 @@ const mockRemoveWorktree = worktree.removeWorktree as Mock;
 const mockCopyPlans = planCopier.copyPlansToWorktree as Mock;
 const mockDetectOMO = omoMod.detectOMO as Mock;
 const mockLoadConfig = configMod.loadConfig as Mock;
+const mockLaunchWorkerViaServe = sdkMod.launchWorkerViaServe as Mock;
+const mockGetSharedMonitor = orchSingleton.getSharedMonitor as Mock;
+
+// Serve-mode capture staging: accumulators keyed by job id.
+const accumulatorByJobId = new Map<string, any>();
+const fakeMonitor = {
+  getEventAccumulator: (id: string) => accumulatorByJobId.get(id),
+};
+function stageAccumulatorForJob(name: string, acc: any) {
+  const job = getJobs().find((j) => j.name === name);
+  if (!job) throw new Error(`no such job staged: ${name}`);
+  accumulatorByJobId.set(job.id, acc);
+}
+function makeAccumulator(filesEdited: string[], currentTool = 'edit') {
+  return {
+    filesEdited,
+    currentTool,
+    currentFile: filesEdited[0] ?? '(none)',
+    lastActivityAt: Date.now(),
+    eventCount: filesEdited.length,
+  };
+}
 const resetJobs = (jobState as any)._resetJobs as () => void;
 const getJobs = (jobState as any)._getJobs as () => Job[];
 
@@ -238,6 +343,8 @@ describe('Workflow 1: Basic lifecycle (Launch -> Status -> Capture -> Kill -> Cl
   beforeEach(() => {
     vi.clearAllMocks();
     resetJobs();
+    accumulatorByJobId.clear();
+    mockGetSharedMonitor.mockReturnValue(fakeMonitor);
 
     // Re-setup default mock implementations after clearAllMocks
     mockCreateWorktree.mockImplementation(async (opts: { branch: string }) => {
@@ -257,7 +364,9 @@ describe('Workflow 1: Basic lifecycle (Launch -> Status -> Capture -> Kill -> Cl
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
-      useServeMode: false,
+      useServeMode: true,
+      portRangeStart: 14100,
+      portRangeEnd: 14199,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
     (worktree.isInManagedWorktree as Mock).mockResolvedValue({
@@ -304,15 +413,15 @@ describe('Workflow 1: Basic lifecycle (Launch -> Status -> Capture -> Kill -> Cl
     expect(statusResult).toContain('Branch: mc/auth-job');
     expect(statusResult).toContain('Mode: vanilla');
 
-    // ---- Step 3: Capture output ----
+    // ---- Step 3: Capture output (serve mode: staged monitor events) ----
+    stageAccumulatorForJob('auth-job', makeAccumulator(['src/auth.ts']));
     const captureResult = await mc_capture.execute(
       { name: 'auth-job', lines: 50 },
       mockContext,
     );
 
-    expect(captureResult).toContain('Working on task');
-    expect(captureResult).toContain('Tests passing');
-    expect(mockCapturePane).toHaveBeenCalledWith('mc-auth-job', 50);
+    expect(captureResult).toContain('src/auth.ts');
+    expect(captureResult).toContain('"mode": "serve"');
 
     // ---- Step 4: Kill the job ----
     const killResult = await mc_kill.execute(
@@ -417,6 +526,8 @@ describe('Workflow 2: OMO mode launch with plans', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetJobs();
+    accumulatorByJobId.clear();
+    mockGetSharedMonitor.mockReturnValue(fakeMonitor);
 
     mockCreateWorktree.mockImplementation(async (opts: { branch: string }) => {
       const sanitized = opts.branch.replace(/\//g, '-');
@@ -438,7 +549,9 @@ describe('Workflow 2: OMO mode launch with plans', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
-      useServeMode: false,
+      useServeMode: true,
+      portRangeStart: 14100,
+      portRangeEnd: 14199,
       omo: { enabled: true, defaultMode: 'plan' },
     });
   });
@@ -466,10 +579,13 @@ describe('Workflow 2: OMO mode launch with plans', () => {
       '/tmp/mc-worktrees/mc-plan-job/.sisyphus/plans',
     );
 
-     // Verify /start-work command was sent for plan mode
-     expect(mockSendKeys).toHaveBeenCalledWith(
-       'mc-plan-job',
-       expect.stringContaining('/start-work'),
+     // Serve mode delivers the plan inside the prompt text (no TUI sendKeys).
+     expect(mockSendKeys).not.toHaveBeenCalled();
+     expect(mockLaunchWorkerViaServe).toHaveBeenCalledWith(
+       expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+       expect.objectContaining({
+         prompt: expect.stringContaining('my-plan.md'),
+       }),
      );
 
     // Verify job state has plan mode
@@ -488,10 +604,13 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     expect(mockDetectOMO).toHaveBeenCalled();
     expect(mockCopyPlans).toHaveBeenCalled();
 
-    // Verify ralph-loop command in sendKeys
-    expect(mockSendKeys).toHaveBeenCalledWith(
-      'mc-ralph-job',
-      expect.stringContaining('/ralph-loop'),
+    // Serve mode delivers the loop command inside the prompt text.
+    expect(mockSendKeys).not.toHaveBeenCalled();
+    expect(mockLaunchWorkerViaServe).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        prompt: expect.stringContaining('/ralph-loop'),
+      }),
     );
 
     const jobs = getJobs();
@@ -508,9 +627,12 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     expect(mockDetectOMO).toHaveBeenCalled();
     expect(mockCopyPlans).toHaveBeenCalled();
 
-    expect(mockSendKeys).toHaveBeenCalledWith(
-      'mc-ulw-job',
-      expect.stringContaining('/ulw-loop'),
+    expect(mockSendKeys).not.toHaveBeenCalled();
+    expect(mockLaunchWorkerViaServe).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        prompt: expect.stringContaining('/ulw-loop'),
+      }),
     );
 
     const jobs = getJobs();
@@ -606,6 +728,8 @@ describe('Workflow 3: Launch -> PR -> Cleanup', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetJobs();
+    accumulatorByJobId.clear();
+    mockGetSharedMonitor.mockReturnValue(fakeMonitor);
 
     mockCreateWorktree.mockImplementation(async (opts: { branch: string }) => {
       const sanitized = opts.branch.replace(/\//g, '-');
@@ -621,7 +745,9 @@ describe('Workflow 3: Launch -> PR -> Cleanup', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
-      useServeMode: false,
+      useServeMode: true,
+      portRangeStart: 14100,
+      portRangeEnd: 14199,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
   });
@@ -733,6 +859,8 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetJobs();
+    accumulatorByJobId.clear();
+    mockGetSharedMonitor.mockReturnValue(fakeMonitor);
 
     mockCreateWorktree.mockImplementation(async (opts: { branch: string }) => {
       const sanitized = opts.branch.replace(/\//g, '-');
@@ -749,7 +877,9 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
       pollInterval: 10000,
       idleThreshold: 300000,
       worktreeBasePath: '/tmp/mc-worktrees',
-      useServeMode: false,
+      useServeMode: true,
+      portRangeStart: 14100,
+      portRangeEnd: 14199,
       omo: { enabled: false, defaultMode: 'vanilla' },
     });
     (worktree.isInManagedWorktree as Mock).mockResolvedValue({
@@ -861,13 +991,7 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
   });
 
   it('should capture output from specific jobs', async () => {
-    // Set up different output for different targets
-    mockCapturePane.mockImplementation(async (target: string) => {
-      if (target.includes('capture-a')) return 'Output from job A';
-      if (target.includes('capture-b')) return 'Output from job B';
-      return 'Unknown';
-    });
-
+    // Serve mode: per-job monitor events, staged per job id.
     await mc_launch.execute(
       { name: 'capture-a', prompt: 'Job A' },
       mockContext,
@@ -876,6 +1000,8 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
       { name: 'capture-b', prompt: 'Job B' },
       mockContext,
     );
+    stageAccumulatorForJob('capture-a', makeAccumulator(['output-from-job-a.ts']));
+    stageAccumulatorForJob('capture-b', makeAccumulator(['output-from-job-b.ts']));
 
     const outputA = await mc_capture.execute(
       { name: 'capture-a' },
@@ -886,8 +1012,8 @@ describe('Workflow 4: Multiple jobs in parallel', () => {
       mockContext,
     );
 
-    expect(outputA).toContain('Output from job A');
-    expect(outputB).toContain('Output from job B');
+    expect(outputA).toContain('output-from-job-a');
+    expect(outputB).toContain('output-from-job-b');
   });
 
   it('should cleanup all non-running jobs at once', async () => {

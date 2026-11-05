@@ -285,6 +285,7 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
         worktree: '/tmp/mc-w',
         prompt: 'do the work',
         model: { ...WANT },
+        profile: { permissions: [{ action: 'read', resource: '/tmp/mc-w/**', effect: 'allow' }] },
       }),
     ).rejects.toThrow(/model mismatch/);
     // Only the session POST happened; the prompt was never delivered.
@@ -307,6 +308,7 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
       prompt: 'hi',
       model: { ...WANT },
       verify: 'get',
+      profile: { permissions: [{ action: 'read', resource: '/tmp/mc-w/**', effect: 'allow' }] },
     });
     expect(handle.sessionId).toBe('ses_9');
     // POST session + GET session/:id + POST prompt, nothing more.
@@ -329,6 +331,7 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
     const handle = await launchWorkerViaServe(createV2Client(17891), {
       worktree: '/tmp/mc-w',
       prompt: 'hi',
+      profile: { permissions: [{ action: 'read', resource: '/tmp/mc-w/**', effect: 'allow' }] },
     });
     expect(handle.sessionId).toBe('ses_9');
     expect(handle.requestedModel).toBeUndefined();
@@ -350,6 +353,7 @@ describe('launchWorkerViaServe (reusable autonomous entry, integrador)', () => {
         worktree: '/tmp/mc-w',
         prompt: 'do the work',
         model: { ...WANT },
+        profile: { permissions: [{ action: 'read', resource: '/tmp/mc-w/**', effect: 'allow' }] },
       }),
     ).rejects.toThrow(/model absent/);
     expect(seen).toHaveLength(1);

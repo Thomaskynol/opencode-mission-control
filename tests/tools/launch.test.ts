@@ -64,9 +64,11 @@ function setupDefaultMocks() {
     pollInterval: 10000,
     idleThreshold: 300000,
     worktreeBasePath: '/tmp/mc-worktrees',
-    // Legacy-path default for the pre-serve TUI suites: explicit opt-out.
-    // Default-serve (absent key → serve) is covered in the serve describe.
-    useServeMode: false,
+    // Serve is the enforced path: TUI (useServeMode:false) is refused
+    // fail-closed by the policy lane, so suites exercise serve by default.
+    useServeMode: true,
+    portRangeStart: 14100,
+    portRangeEnd: 14199,
     omo: { enabled: false, defaultMode: 'vanilla' },
   });
   mockCreateWorktree.mockResolvedValue('/tmp/mc-worktrees/test-job');
@@ -101,7 +103,7 @@ describe('mc_launch', () => {
     mockGetCurrentSession = vi.spyOn(tmux, 'getCurrentSession').mockImplementation(() => 'main-session' as any);
     mockIsInsideTmux = vi.spyOn(tmux, 'isInsideTmux').mockImplementation(() => true as any);
     vi.spyOn(tmux, 'isTmuxAvailable').mockImplementation(() => Promise.resolve(true) as any);
-    mockLoadConfig = vi.spyOn(configMod, 'loadConfig').mockImplementation(() => ({ defaultPlacement: 'session', pollInterval: 10000, idleThreshold: 300000, worktreeBasePath: '/tmp/mc-worktrees', omo: { enabled: false, defaultMode: 'vanilla' } } as any));
+    mockLoadConfig = vi.spyOn(configMod, 'loadConfig').mockImplementation(() => ({ defaultPlacement: 'session', pollInterval: 10000, idleThreshold: 300000, worktreeBasePath: '/tmp/mc-worktrees', useServeMode: true, portRangeStart: 14100, portRangeEnd: 14199, omo: { enabled: false, defaultMode: 'vanilla' } } as any));
     mockWritePromptFile = vi.spyOn(promptFile, 'writePromptFile').mockImplementation(() => Promise.resolve('/tmp/mc-worktrees/test-job/.mc-prompt.txt') as any);
     vi.spyOn(promptFile, 'cleanupPromptFile').mockImplementation(() => undefined as any);
     mockWriteLauncherScript = vi.spyOn(promptFile, 'writeLauncherScript').mockImplementation(() => Promise.resolve('/tmp/mc-worktrees/test-job/.mc-launch.sh') as any);
@@ -117,6 +119,12 @@ describe('mc_launch', () => {
     mockV2Prompt = vi.spyOn(sdkClient, 'v2Prompt').mockImplementation(() => Promise.resolve({}) as any);
     mockWriteServeLauncherScript = vi.spyOn(promptFile, 'writeServeLauncherScript').mockImplementation(() => Promise.resolve('/tmp/mc-worktrees/test-job/.mc-launch.sh') as any);
     mockGetRunningJobs = vi.spyOn(jobState, 'getRunningJobs').mockImplementation(() => Promise.resolve([]) as any);
+    // Production always pins via the tracker; the mocked v2 seam echoes it.
+    mockGetCurrentModelInfo = vi.spyOn(modelTracker, 'getCurrentModelInfo').mockReturnValue({
+      providerID: 'opencode-go',
+      modelID: 'muse-spark-1.3-contributor',
+      variant: 'xhigh',
+    } as any);
     vi.spyOn(tmux, 'killSession').mockImplementation(() => Promise.resolve(undefined) as any);
     vi.spyOn(tmux, 'killWindow').mockImplementation(() => Promise.resolve(undefined) as any);
     setupDefaultMocks();
@@ -259,21 +267,19 @@ describe('mc_launch', () => {
       );
     });
 
-    it('should write launcher script and prompt file', async () => {
+    it('should write serve launcher script (never the TUI prompt/launcher pair)', async () => {
       await mc_launch.execute(
         { name: 'feature-auth', prompt: 'Add auth' },
         mockContext,
       );
 
-      expect(mockWritePromptFile).toHaveBeenCalledWith(
+      expect(mockWriteServeLauncherScript).toHaveBeenCalledWith(
         '/tmp/mc-worktrees/test-job',
-        expect.stringContaining('Add auth'),
-      );
-      expect(mockWriteLauncherScript).toHaveBeenCalledWith(
-        '/tmp/mc-worktrees/test-job',
-        '/tmp/mc-worktrees/test-job/.mc-prompt.txt',
+        14100,
         undefined,
       );
+      expect(mockWritePromptFile).not.toHaveBeenCalled();
+      expect(mockWriteLauncherScript).not.toHaveBeenCalled();
     });
 
     it('should add job to state', async () => {
@@ -380,18 +386,21 @@ describe('mc_launch', () => {
       });
     });
 
-    it('should pass model from getCurrentModel to writeLauncherScript', async () => {
-      vi.spyOn(modelTracker, 'getCurrentModel').mockReturnValue('anthropic/claude-sonnet-4-20250514');
-
+    it('should pin the tracked model triple on the serve session', async () => {
       await mc_launch.execute(
         { name: 'feature-auth', prompt: 'Add auth' },
         mockContext,
       );
 
-      expect(mockWriteLauncherScript).toHaveBeenCalledWith(
-        '/tmp/mc-worktrees/test-job',
-        '/tmp/mc-worktrees/test-job/.mc-prompt.txt',
-        'anthropic/claude-sonnet-4-20250514',
+      expect(mockV2CreateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        expect.objectContaining({
+          model: {
+            providerID: 'opencode-go',
+            id: 'muse-spark-1.3-contributor',
+            variant: 'xhigh',
+          },
+        }),
       );
     });
   });
@@ -414,10 +423,13 @@ describe('mc_launch', () => {
         mockContext,
       );
 
-      expect(mockSendKeys).toHaveBeenCalledWith(
-        'mc-test',
+      // Serve mode delivers loop commands inside the prompt text (no sendKeys).
+      expect(mockV2Prompt).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        'ses-v2-1',
         expect.stringContaining('/ralph-loop'),
       );
+      expect(mockSendKeys).not.toHaveBeenCalled();
     });
 
     it('should send ulw-loop command for ulw mode', async () => {
@@ -426,10 +438,12 @@ describe('mc_launch', () => {
         mockContext,
       );
 
-      expect(mockSendKeys).toHaveBeenCalledWith(
-        'mc-test',
+      expect(mockV2Prompt).toHaveBeenCalledWith(
+        expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+        'ses-v2-1',
         expect.stringContaining('/ulw-loop'),
       );
+      expect(mockSendKeys).not.toHaveBeenCalled();
     });
 
      it('should include plan file reference for plan mode', async () => {
@@ -443,8 +457,9 @@ describe('mc_launch', () => {
          mockContext,
        );
 
-       expect(mockWritePromptFile).toHaveBeenCalledWith(
-         '/tmp/mc-worktrees/test-job',
+       expect(mockV2Prompt).toHaveBeenCalledWith(
+         expect.objectContaining({ baseUrl: 'http://127.0.0.1:14100/api' }),
+         'ses-v2-1',
          expect.stringContaining('my-plan.md'),
        );
      });
@@ -473,7 +488,9 @@ describe('mc_launch', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
-        useServeMode: false,
+        useServeMode: true,
+        portRangeStart: 14100,
+        portRangeEnd: 14199,
         omo: { enabled: false, defaultMode: 'vanilla' },
       });
 
@@ -492,7 +509,9 @@ describe('mc_launch', () => {
         pollInterval: 10000,
         idleThreshold: 300000,
         worktreeBasePath: '/tmp/mc-worktrees',
-        useServeMode: false,
+        useServeMode: true,
+        portRangeStart: 14100,
+        portRangeEnd: 14199,
         omo: { enabled: true, defaultMode: 'ralph' },
       });
 
@@ -560,12 +579,12 @@ describe('mc_launch', () => {
       );
     });
 
-    it('should cleanup worktree when launch file creation fails', async () => {
-      mockWritePromptFile.mockRejectedValue(new Error('write failed'));
+    it('should cleanup worktree when serve launcher creation fails', async () => {
+      mockWriteServeLauncherScript.mockRejectedValue(new Error('write failed'));
 
       await expect(
         mc_launch.execute({ name: 'test', prompt: 'stuff' }, mockContext),
-      ).rejects.toThrow('Failed to write launch files');
+      ).rejects.toThrow('Failed to write serve launcher');
 
       expect(mockKillSession).not.toHaveBeenCalled();
       expect(mockRemoveWorktree).toHaveBeenCalledWith(
@@ -869,8 +888,8 @@ describe('mc_launch', () => {
     });
   });
 
-  describe('TUI mode fallback', () => {
-    it('should use TUI path when useServeMode is false', async () => {
+  describe('TUI mode blockade (policy floor)', () => {
+    it('should refuse the TUI path when useServeMode is false', async () => {
       mockLoadConfig.mockResolvedValue({
         defaultPlacement: 'session',
         pollInterval: 10000,
@@ -880,19 +899,23 @@ describe('mc_launch', () => {
         omo: { enabled: false, defaultMode: 'vanilla' },
       });
 
-      await mc_launch.execute(
-        { name: 'tui-job', prompt: 'Do task' },
-        mockContext,
-      );
+      await expect(
+        mc_launch.execute(
+          { name: 'tui-job', prompt: 'Do task' },
+          mockContext,
+        ),
+      ).rejects.toThrow(/TUI mode.*cannot enforce the permission policy/);
 
       expect(mockAllocatePort).not.toHaveBeenCalled();
       expect(mockWriteServeLauncherScript).not.toHaveBeenCalled();
       expect(mockV2WaitForServer).not.toHaveBeenCalled();
-      expect(mockWritePromptFile).toHaveBeenCalled();
-      expect(mockWriteLauncherScript).toHaveBeenCalled();
+      expect(mockWritePromptFile).not.toHaveBeenCalled();
+      expect(mockWriteLauncherScript).not.toHaveBeenCalled();
+      expect(mockCreateWorktree).not.toHaveBeenCalled();
+      expect(mockAddJob).not.toHaveBeenCalled();
     });
 
-    it('should not store port on job when in TUI mode', async () => {
+    it('should not store a job when the TUI path is refused', async () => {
       mockLoadConfig.mockResolvedValue({
         defaultPlacement: 'session',
         pollInterval: 10000,
@@ -902,17 +925,14 @@ describe('mc_launch', () => {
         omo: { enabled: false, defaultMode: 'vanilla' },
       });
 
-      await mc_launch.execute(
-        { name: 'tui-job', prompt: 'Do task' },
-        mockContext,
-      );
+      await expect(
+        mc_launch.execute(
+          { name: 'tui-job', prompt: 'Do task' },
+          mockContext,
+        ),
+      ).rejects.toThrow(/Use serve mode/);
 
-      expect(mockAddJob).toHaveBeenCalledWith(
-        expect.objectContaining({
-          port: undefined,
-          serverUrl: undefined,
-        }),
-      );
+      expect(mockAddJob).not.toHaveBeenCalled();
     });
   });
 });
