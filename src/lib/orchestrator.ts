@@ -3840,11 +3840,45 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
         `Cannot relaunch correction for job "${jobName}": cannot inspect worktree (${dirtyProbe.stderr || 'unknown'}) — refusing to reuse an unknown tree state`,
       );
     }
-    if (filterRelevantDirtyEntries(parsePorcelainEntries(dirtyProbe.stdout)).length > 0) {
-      const addRes = await gitCommand(['-C', worktreePath, 'add', '-A']);
-      if (addRes.exitCode !== 0) {
+    // gitCommand trims stdout, eating the leading status space of the first
+    // porcelain line (" M f" -> "M f"); restore the worktree-status column
+    // before parsing, or scope matching (and `git add --`) corrupts it.
+    const repairedPorcelain = dirtyProbe.stdout.replace(/^([MADRCUT?!]) (?=\S)/, ' $1 ');
+    const relevantDirty = filterRelevantDirtyEntries(parsePorcelainEntries(repairedPorcelain));
+    if (relevantDirty.length > 0) {
+      // Checkpoint scope: never absorb out-of-scope files. The old `git add
+      // -A` committed everything dirty — including `.opencode/**` (serve
+      // plugin, gitignored but stageable once tracked) and files outside the
+      // job touchSet. Only touchSet-matching files are staged; `.opencode/**`
+      // and outsiders refuse fail-closed with no commit.
+      const isOpencodePath = (p: string): boolean => p === '.opencode' || p.startsWith('.opencode/');
+      const blockedOpencode = relevantDirty.filter(isOpencodePath);
+      const inScope = relevantDirty.filter((p) => {
+        if (isOpencodePath(p)) return false;
+        if (touchSetPatterns.length === 0) return true;
+        return touchSetPatterns.some((pattern) => matchesTouchPattern(pattern, p));
+      });
+      const outOfScope = relevantDirty.filter((p) => !isOpencodePath(p) && !inScope.includes(p));
+      if (inScope.length > 0) {
+        const addRes = await gitCommand(['-C', worktreePath, 'add', '--', ...inScope]);
+        if (addRes.exitCode !== 0) {
+          throw new Error(
+            `Cannot relaunch correction for job "${jobName}": worktree has uncommitted changes and staging failed (${addRes.stderr || addRes.stdout}) — refusing to reuse a dirty worktree silently`,
+          );
+        }
+      }
+      if (blockedOpencode.length > 0 || outOfScope.length > 0) {
+        const parts: string[] = [];
+        if (blockedOpencode.length > 0) {
+          parts.push(`.opencode files (never committed by a checkpoint): ${blockedOpencode.join(', ')}`);
+        }
+        if (outOfScope.length > 0) {
+          parts.push(
+            `outside touchSet [${touchSetPatterns.join(', ') || 'no scope declared'}]: ${outOfScope.join(', ')}`,
+          );
+        }
         throw new Error(
-          `Cannot relaunch correction for job "${jobName}": worktree has uncommitted changes and staging failed (${addRes.stderr || addRes.stdout}) — refusing to reuse a dirty worktree silently`,
+          `Cannot relaunch correction for job "${jobName}": worktree has uncommitted changes outside the checkpoint scope — ${parts.join('; ')}. Revert them or widen the touchSet via the public path (human decision) and retry — refusing to commit out-of-scope files`,
         );
       }
       const checkpointRes = await gitCommand(
