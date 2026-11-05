@@ -1,4 +1,4 @@
-import { resolve, dirname, relative, join } from 'path';
+import { resolve, dirname, relative, join, isAbsolute } from 'path';
 import { realpathSync, lstatSync } from 'fs';
 import type { V2PermissionRule } from './sdk-client.js';
 
@@ -95,12 +95,17 @@ function resolveThroughExistingPrefix(absolutePath: string): string | null {
 
 /**
  * Real worktree containment shared by the policy and the relay.
- * Lexical normalization (`..`, `.`, separators, separator boundary) gates
- * first, then the longest existing prefix is resolved through realpath so a
- * symlink escaping the worktree is detected. Brand-new paths inside an
- * existing worktree resolve through their nearest existing ancestor and
- * stay inside (pre-authorized allowlist keeps working without asking);
- * unresolvable paths (broken symlinks, dead roots) return false.
+ * Relative inputs anchor at the WORKTREE (never at the caller cwd): the
+ * v2 server reports edit resources relative to the session cwd, which IS
+ * the worktree (e.g. "probe-out2.txt" — observed live on 2.2.5), and
+ * resolving them against a monitor/relay cwd misclassifies every
+ * in-worktree request as outside. Lexical normalization (`..`, `.`,
+ * separators, separator boundary) gates first, then the longest existing
+ * prefix is resolved through realpath so a symlink escaping the worktree
+ * is detected. Brand-new paths inside an existing worktree resolve through
+ * their nearest existing ancestor and stay inside (pre-authorized
+ * allowlist keeps working without asking); unresolvable paths (broken
+ * symlinks, dead roots) return false.
  */
 export function isPathContainedIn(path: string, worktreePath: string): boolean {
   if (typeof path !== 'string' || typeof worktreePath !== 'string') return false;
@@ -108,8 +113,12 @@ export function isPathContainedIn(path: string, worktreePath: string): boolean {
   let normalizedPath: string;
   let normalizedWorktree: string;
   try {
-    normalizedPath = normalizePathForComparison(path);
     normalizedWorktree = normalizePathForComparison(worktreePath);
+    // Session-relative input (v2 edit resources, shell command text):
+    // anchor at the worktree the session runs in.
+    normalizedPath = normalizePathForComparison(
+      isAbsolute(path) ? path : join(normalizedWorktree, path),
+    );
   } catch {
     return false;
   }
@@ -247,6 +256,38 @@ export function isGitPushText(haystack: string): boolean {
   return false;
 }
 
+/**
+ * Explicit worktree escapes inside shell command text. The v2 server runs
+ * shell in the session cwd (the worktree) and reports the COMMAND TEXT as
+ * the permission resource, so a bare command is worktree-scoped — but a
+ * command that names an outside location (`cat /etc/passwd`, `cd /tmp`,
+ * `../x`, `~/x`, `curl https://…`) is not. Anything flagged here keeps
+ * outside handling (ask, never silent allow); everything else is session
+ * scoped. Conservative: unknown shapes fail toward ask, never approve.
+ */
+export function referencesOutsideWorktree(commandText: string, worktreePath: string): boolean {
+  for (const rawToken of splitShellWords(commandText)) {
+    const candidates = [stripPushQuotes(rawToken)];
+    // `KEY=/abs/path` assignments (e.g. GIT_DIR=/x): inspect the value too.
+    const eq = rawToken.indexOf('=');
+    if (eq >= 0) candidates.push(stripPushQuotes(rawToken.slice(eq + 1)));
+    for (let token of candidates) {
+      if (!token || token === '.') continue;
+      token = token.replace(/^[()"']+|[()"']+$/g, '');
+      if (!token) continue;
+      if (token === '~' || token.startsWith('~/')) return true;
+      if (token === '..' || token.startsWith('../') || token.includes('/../') || token.endsWith('/..')) {
+        return true;
+      }
+      // Remote targets are never worktree-local (fetch/exfil shapes).
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(token)) return true;
+      if (/^[^/\s]+@[^/\s]+:/.test(token)) return true; // scp-like user@host:path
+      if (token.startsWith('/') && !isInsideWorktree(token, worktreePath)) return true;
+    }
+  }
+  return false;
+}
+
 export function requiresHumanAuth(permissionRequest: PermissionPolicyRequest): boolean {
   if (permissionRequest.type === 'file_operation') {
     return false;
@@ -264,8 +305,17 @@ export function requiresHumanAuth(permissionRequest: PermissionPolicyRequest): b
  * worktree so internal paths never ask; anything outside stays under the
  * default policy (ask-user/deny via the monitor). Pass to
  * `session.create` as `permissions`.
+ *
+ * Action names are the v2 canonical tool names: the server emits
+ * `action: "shell"` for shell calls (observed live on 2.2.5) — `bash` is
+ * only an alias for settings-file keys and never matches a session
+ * permission request. (The server matches `resource` against command text
+ * for shell and against session-relative paths for edits, so these
+ * path-scoped rules cover path-resource requests; command-text and
+ * relative-resource requests are scoped worktree-side by the policy
+ * evaluation below instead of stalling headless workers.)
  */
-const WORKTREE_RULE_ACTIONS = ['read', 'edit', 'write', 'bash'] as const;
+const WORKTREE_RULE_ACTIONS = ['read', 'edit', 'write', 'shell'] as const;
 
 export function buildWorktreePermissions(worktreePath: string): V2PermissionRule[] {
   const base = worktreePath.endsWith('/') ? worktreePath.slice(0, -1) : worktreePath;
@@ -357,8 +407,16 @@ export class PermissionPolicy {
       }
 
       case 'shellCommand': {
-        const targetPath = permissionRequest.path ?? jobContext.worktreePath;
-        const inWorktree = isInsideWorktree(targetPath, jobContext.worktreePath);
+        const rawPath = permissionRequest.path ?? jobContext.worktreePath;
+        // Shell permission resources carry COMMAND TEXT (v2 `resources`,
+        // e.g. "cat probe-secret.txt" — observed live on 2.2.5), not a
+        // path. The server runs shell in the session cwd (the worktree),
+        // so bare commands are worktree-scoped — but the whole command
+        // string always joins inside the worktree lexically, so explicit
+        // escapes (absolute outside paths, `..`, `~`, remote targets) must
+        // veto FIRST. Publishing already forced ask-user above.
+        const inWorktree = !referencesOutsideWorktree(rawPath, jobContext.worktreePath)
+          && isInsideWorktree(rawPath, jobContext.worktreePath);
         policyDecision = inWorktree
           ? this.policy.permissions.shellCommand.insideWorktree
           : this.policy.permissions.shellCommand.outsideWorktree;

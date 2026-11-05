@@ -697,7 +697,7 @@ describe('mc_launch', () => {
         permissions: Array<{ action: string; resource: string; effect: string }>;
       };
       const actions = body.permissions.map((p) => p.action);
-      for (const needed of ['read', 'edit', 'write', 'bash']) {
+      for (const needed of ['read', 'edit', 'write', 'shell']) {
         expect(actions).toContain(needed);
       }
       for (const p of body.permissions) {

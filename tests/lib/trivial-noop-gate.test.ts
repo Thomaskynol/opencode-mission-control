@@ -123,3 +123,118 @@ describe('trivial no-op test command gate (RED)', () => {
     expect(md).toMatch(/Nothing verified yet/);
   });
 });
+
+describe('TCMD compound proof gate (GREEN)', () => {
+  async function makeDir(): Promise<string> {
+    const { mkdtempSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    return mkdtempSync(join(tmpdir(), 'mc-tcmd-proof-'));
+  }
+
+  it('split respeita single quotes (&& dentro de quotes não separa)', async () => {
+    const { splitTestCommandSegments } = await import('../../src/lib/verification');
+    expect(splitTestCommandSegments(`echo 'a && b' && bun test`)).toEqual([`echo 'a && b'`, 'bun test']);
+    expect(splitTestCommandSegments(`true && node --test`)).toEqual(['true', 'node --test']);
+    expect(splitTestCommandSegments(`node --test || true`)).toEqual(['node --test', 'true']);
+    expect(splitTestCommandSegments(`bun test; echo done`)).toEqual(['bun test', 'echo done']);
+  });
+
+  it('true sozinho nunca é prova (fail-closed mesmo com exit 0)', async () => {
+    const { runTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const r = await runTestCommand(dir, 'true', 10000);
+      expect(r.success).toBe(false);
+      expect(r.output).toMatch(/trivial|no-op|nunca.*prova/i);
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('echo hi nunca é prova', async () => {
+    const { runTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const r = await runTestCommand(dir, 'echo hi', 10000);
+      expect(r.success).toBe(false);
+      expect(r.output).toMatch(/trivial|no-op|nunca.*prova/i);
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('true && true (só trivial) nunca é prova', async () => {
+    const { runTestCommand, detectTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const { writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'true && true' } }));
+      expect(await detectTestCommand(dir)).toBeNull();
+      const r = await runTestCommand(dir, 'true && true', 10000);
+      expect(r.success).toBe(false);
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('true && node --test (pass real) é prova via segmento real', async () => {
+    const { runTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const { writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      // Fixture sem import de runner (convenção: só bun:test/vitest nos .test.ts):
+      // node --test conta o arquivo como teste (pass 1) via exit code.
+      writeFileSync(join(dir, 'ok.cjs'), 'process.exit(0);\n');
+      const r = await runTestCommand(dir, 'true && node --test ok.cjs', 30000);
+      expect(r.success).toBe(true);
+      expect(r.output).toMatch(/prova via/i);
+      expect(r.output).toContain('node --test ok.cjs');
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('node --test (fail) || true mascara falha → deve FAIL', async () => {
+    const { runTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const { writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      writeFileSync(join(dir, 'bad.cjs'), 'process.exit(1);\n');
+      const r = await runTestCommand(dir, 'node --test bad.cjs || true', 30000);
+      // shell puro daria exit 0; gate não pode aceitar máscara
+      expect(r.success).toBe(false);
+      expect(r.output).toMatch(/máscara|mask|falha real|real.*falh/i);
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('comando real sem contagem declara evidência parcial (sem inventar cobertura)', async () => {
+    const { runTestCommand } = await import('../../src/lib/merge-train');
+    const dir = await makeDir();
+    try {
+      const r = await runTestCommand(dir, 'test -f package.json && test -d .', 10000);
+      // sem runner conhecido: exit 0 mas sem quantificação → parcial, ainda prova via execução real
+      // aqui o dir não tem package.json → falha real → FAIL (não inventa pass)
+      expect(r.success).toBe(false);
+      const { writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      writeFileSync(join(dir, 'package.json'), '{}');
+      const r2 = await runTestCommand(dir, 'test -f package.json', 10000);
+      expect(r2.success).toBe(true);
+      expect(r2.output).toMatch(/parcial|não quantificad/i);
+    } finally {
+      const { rmSync } = await import('fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

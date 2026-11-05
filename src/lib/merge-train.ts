@@ -6,8 +6,8 @@ import { getIntegrationWorktree, withIntegrationLock } from './integration';
 import { extractConflicts } from './utils';
 import { createV2Client, v2Prompt } from './sdk-client';
 import type { ReviewVerdict } from './reviewer';
-import { isTrivialTestCommand } from './verification';
-export { isTrivialTestCommand } from './verification';
+import { isTrivialTestCommand, parseCompoundTestCommand, isAllTrivialCompound, parseTestCounts } from './verification';
+export { isTrivialTestCommand, parseCompoundTestCommand, splitTestCommandSegments, hasRealTestSegment, isAllTrivialCompound, parseTestCounts } from './verification';
 import {
   verifyMergeFencing,
   type MergeFencingIdentity,
@@ -375,7 +375,10 @@ export async function detectTestCommand(worktreePath: string): Promise<string | 
     const testScript = packageJson.scripts?.test;
     if (typeof testScript !== 'string' || testScript.trim() === '') return null;
     // `true`/no-op nunca é verificação funcional — sem comando executável.
+    // TCMD: composto só-trivial (`true && true`, `echo hi; true`) também
+    // nunca prova, mesmo com exit 0 — retorna null (fail-closed a montante).
     if (isTrivialTestCommand(testScript)) return null;
+    if (isAllTrivialCompound(testScript)) return null;
     return testScript;
   } catch {
     return null;
@@ -419,6 +422,15 @@ export async function detectInstallCommand(worktreePath: string): Promise<string
 /**
  * Execute a test command in a worktree directory.
  *
+ * TCMD proof gate: um comando só é prova quando ≥1 segmento REAL executou
+ * com sucesso (rode de verdade, nunca invente). Trivial sozinho (`true`,
+ * `echo hi`) ou composto só-trivial (`true && true`) nunca prova, mesmo
+ * com exit 0. Composto misto com real OK anota a prova
+ * (`prova via "bun test" (3 pass)`); sem contagem no output marca parcial
+ * (`passed (evidência parcial: exit 0, testes não quantificados)`).
+ * `|| true` (ou outro trivial) NUNCA mascara falha real — falha real
+ * executada sempre FAIL, mesmo que o shell puro saísse 0.
+ *
  * Scope protection lives in the orchestrator (gatherScopeEvidence runs the
  * command on an immutable snapshot via runTestsOnImmutableSnapshot:
  * git archive → tmpdir, cwd=snapshot, original attested hash+mtime+ctime).
@@ -431,8 +443,155 @@ export async function runTestCommand(
   worktreePath: string,
   command: string,
   timeoutMs: number,
-): Promise<{ success: boolean; output: string; timedOut: boolean }> {
-  const proc = Bun.spawn(['sh', '-c', command], {
+): Promise<{ success: boolean; output: string; timedOut: boolean; proved?: boolean; proofVia?: string[]; proofNote?: string }> {
+  const { segments, operators } = parseCompoundTestCommand(command);
+  if (segments.length === 0) {
+    return {
+      success: false,
+      output: `[TCMD] comando vazio nunca é prova funcional (não é verificação funcional) — sem verificação funcional`,
+      timedOut: false,
+      proved: false,
+    };
+  }
+  const triviality = segments.map((seg) => isTrivialTestCommand(seg));
+
+  // Caminho rápido: tudo trivial → executa de verdade para evidência, mas
+  // nunca prova (fail-closed, mesmo com exit 0).
+  if (triviality.every(Boolean)) {
+    const single = await runSingleSegment(worktreePath, command, timeoutMs);
+    const note = `[TCMD] comando trivial "${command.trim()}" (no-op, não é verificação funcional) — nunca é prova, mesmo com exit 0`;
+    return {
+      success: false,
+      output: [single.output, note].filter(Boolean).join('\n'),
+      timedOut: single.timedOut,
+      proved: false,
+      proofNote: note,
+    };
+  }
+
+  // Execução segmentada respeitando ;/&&/|| (short-circuit real do shell).
+  const deadline = Date.now() + timeoutMs;
+  type SegResult = { segment: string; trivial: boolean; executed: boolean; success?: boolean; output?: string; timedOut?: boolean; exitCode?: number };
+  const results: SegResult[] = [];
+  let lastSuccess: boolean | null = null;
+  let timedOut = false;
+
+  for (let idx = 0; idx < segments.length; idx++) {
+    const seg = segments[idx]!;
+    const trivial = triviality[idx]!;
+    if (idx > 0) {
+      const op = operators[idx - 1]!;
+      if (op === '&&' && lastSuccess !== true) {
+        results.push({ segment: seg, trivial, executed: false });
+        continue;
+      }
+      if (op === '||' && lastSuccess !== false) {
+        results.push({ segment: seg, trivial, executed: false });
+        continue;
+      }
+      // ';' sempre executa.
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      timedOut = true;
+      results.push({ segment: seg, trivial, executed: false });
+      break;
+    }
+    const r = await runSingleSegment(worktreePath, seg, remaining);
+    if (r.timedOut) timedOut = true;
+    results.push({ segment: seg, trivial, executed: true, success: r.success, output: r.output, timedOut: r.timedOut, exitCode: r.exitCode });
+    lastSuccess = r.success && !r.timedOut;
+    if (timedOut) break;
+  }
+
+  const executedReal = results.filter((r) => r.executed && !r.trivial);
+  const succeededReal = executedReal.filter((r) => r.success && !r.timedOut);
+  const failedReal = executedReal.filter((r) => !r.success || r.timedOut);
+
+  const combined = results
+    .filter((r) => r.executed)
+    .map((r) => [`$ ${r.segment}`, r.output ?? ''].filter(Boolean).join('\n'))
+    .filter(Boolean)
+    .join('\n');
+
+  if (timedOut) {
+    return { success: false, output: combined, timedOut: true, proved: false };
+  }
+
+  // Falha real executada sempre FAIL — `|| true` (ou outro trivial) mascara
+  // o exit do shell, mas não a prova. Fail-closed.
+  if (failedReal.length > 0) {
+    const names = failedReal.map((r) => `"${r.segment}"`).join(', ');
+    const masked = operators.includes('||')
+      ? ' (máscara com `||` não aceita: falha real não é apagada por fallback trivial)'
+      : '';
+    const note = `[TCMD] falha real em ${names}${masked} — FAIL`;
+    return {
+      success: false,
+      output: [combined, note].filter(Boolean).join('\n'),
+      timedOut: false,
+      proved: false,
+      proofNote: note,
+    };
+  }
+
+  if (succeededReal.length > 0) {
+    const proofVia = succeededReal.map((r) => r.segment);
+    const realOutput = succeededReal.map((r) => r.output ?? '').join('\n');
+    const counts = parseTestCounts(realOutput);
+    // Runner reportou falhas na contagem mas saiu 0: não confie no exit.
+    if (counts && counts.fail > 0) {
+      const note = `[TCMD] falha real segundo contagem (${counts.pass} pass, ${counts.fail} fail em ${proofVia.map((s) => `"${s}"`).join(', ')}) — FAIL`;
+      return {
+        success: false,
+        output: [combined, note].filter(Boolean).join('\n'),
+        timedOut: false,
+        proved: false,
+        proofVia,
+        proofNote: note,
+      };
+    }
+    if (counts && counts.pass > 0) {
+      const note = `prova via ${proofVia.map((s) => `"${s}"`).join(', ')} (${counts.pass} pass${counts.fail > 0 ? `, ${counts.fail} fail` : ''})`;
+      return {
+        success: true,
+        output: [combined, `[TCMD] ${note}`].filter(Boolean).join('\n'),
+        timedOut: false,
+        proved: true,
+        proofVia,
+        proofNote: note,
+      };
+    }
+    // shortcut: sem contagem no output, sem inventar cobertura.
+    const note = `passed (evidência parcial: exit 0, testes não quantificados) via ${proofVia.map((s) => `"${s}"`).join(', ')}`;
+    return {
+      success: true,
+      output: [combined, `[TCMD] ${note}`].filter(Boolean).join('\n'),
+      timedOut: false,
+      proved: true,
+      proofVia,
+      proofNote: note,
+    };
+  }
+
+  // Nenhum real executado (short-circuit impediu, ex. `true || bun test`):
+  // nunca prova.
+  const note = `[TCMD] nenhum segmento real executou em "${command.trim()}" (só no-op ou short-circuit) — nunca é prova, mesmo com exit 0`;
+  return {
+    success: false,
+    output: [combined, note].filter(Boolean).join('\n'),
+    timedOut: false,
+    proved: false,
+    proofNote: note,
+  };
+}
+
+async function runSingleSegment(
+  worktreePath: string,
+  segment: string,
+  timeoutMs: number,
+): Promise<{ success: boolean; output: string; timedOut: boolean; exitCode: number }> {
+  const proc = Bun.spawn(['sh', '-c', segment], {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -457,6 +616,7 @@ export async function runTestCommand(
     success: !timedOut && exitCode === 0,
     output,
     timedOut,
+    exitCode,
   };
 }
 

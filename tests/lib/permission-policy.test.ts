@@ -233,13 +233,74 @@ describe('PermissionPolicy', () => {
       expect(rule.resource.startsWith('/tmp/mc-worktrees/test-job')).toBe(true);
     }
     const actions = rules.map((r) => r.action);
-    for (const needed of ['read', 'edit', 'write', 'bash']) {
+    // v2 canonical tool action: the server emits `action: "shell"` for
+    // shell calls (observed live on 2.2.5) — `bash` is only an alias for
+    // settings-file keys and never matches a session permission request.
+    for (const needed of ['read', 'edit', 'write', 'shell']) {
       expect(actions).toContain(needed);
     }
+    expect(actions).not.toContain('bash');
     // No blanket allow: nothing outside the worktree is covered.
     for (const rule of rules) {
       expect(rule.resource).not.toBe('/**');
       expect(rule.resource).not.toBe('*');
     }
+  });
+
+  it('auto-approves file edits addressed relative to the worktree', () => {
+    // The v2 server reports edit resources relative to the session cwd
+    // (the worktree, e.g. "probe-out2.txt" — observed live on 2.2.5), so
+    // relative paths anchor at the worktree, never at the monitor cwd.
+    const policy = PermissionPolicy.resolvePolicy({});
+    expect(
+      policy.evaluate(
+        { type: 'file_operation', path: 'src/a.ts', description: 'edit a file' },
+        { worktreePath: WORKTREE },
+      ),
+    ).toBe('auto-approve');
+    expect(
+      policy.evaluate(
+        { type: 'file_operation', path: '../escape.ts', description: 'escape' },
+        { worktreePath: WORKTREE },
+      ),
+    ).toBe('deny');
+  });
+
+  it('scopes shell command text to the session worktree', () => {
+    // v2 shell permission `resources` carry the COMMAND TEXT (e.g. "cat
+    // probe-secret.txt" — observed live on 2.2.5), not a path. The server
+    // runs shell in the session cwd (the worktree), so command text with
+    // no explicit outside reference is inside-worktree traffic.
+    const policy = PermissionPolicy.resolvePolicy({});
+    for (const command of ['cat probe-secret.txt', 'echo hello', 'rtk ls', 'npm test']) {
+      expect(
+        policy.evaluate(
+          { type: 'shell_command', path: command, description: command },
+          { worktreePath: WORKTREE },
+        ),
+      ).toBe('auto-approve');
+    }
+    // Explicit escapes keep outside handling (ask, never silent allow).
+    for (const command of [
+      'cat /etc/passwd',
+      '/etc/passwd',
+      'cat ../escape.txt',
+      'cd /tmp && ls',
+      'cat ~/secret',
+    ]) {
+      expect(
+        policy.evaluate(
+          { type: 'shell_command', path: command, description: command },
+          { worktreePath: WORKTREE },
+        ),
+      ).toBe('ask-user');
+    }
+    // Publishing still requires a human even inside the worktree.
+    expect(
+      policy.evaluate(
+        { type: 'shell_command', path: 'git push origin main', description: 'git push origin main' },
+        { worktreePath: WORKTREE },
+      ),
+    ).toBe('ask-user');
   });
 });
