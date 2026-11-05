@@ -76,6 +76,12 @@ const DOCS_STOPWORDS = new Set([
   'when', 'what', 'which', 'will', 'would', 'there', 'their', 'they', 'them',
   'como', 'para', 'com', 'uma', 'este', 'esta', 'isto', 'isso', 'aquele',
   'seja', 'sejam', 'deve', 'devem', 'cada', 'sobre', 'entre', 'pela', 'pelo',
+  // M7: PT doc-act boilerplate (like EN contains/contain/containing above).
+  // "doc contém ..." describes the criterion's own shape, not a topic — the
+  // doc never needs to repeat it. Without this, "contém" fragments to "cont"
+  // (ASCII regex) and a correct doc without that word fails the keyword
+  // majority. The literal (BK-M7) + substance/semantic still decide.
+  'contém', 'contem', 'contendo', 'conter', 'contido', 'contida', 'contidos', 'contidas',
   // F2: doc-meta vocabulary is never evidence. A requirement demanding a
   // *relative link* is satisfied by a real markdown link to the named file;
   // a *verbatim* demand by the literal itself; a *describes* demand by
@@ -142,10 +148,12 @@ function extractLiterals(text: string): string[] {
   return out.slice(0, 20);
 }
 
-/** Salient keywords: lowercase words (len>=4) minus literals and stopwords. */
+/** Salient keywords: lowercase words (len>=4) minus literals and stopwords.
+ * Unicode-aware ([a-zà-ú0-9]): ASCII-only splits PT words ("contém"→"cont",
+ * "saída"→"sa"+"da", "execução"→"execu"), faking a topic the doc must repeat. */
 function extractKeywords(description: string): string[] {
   const deliteraled = description.replace(/`[^`]*`/g, ' ').replace(/"[^"]*"/g, ' ');
-  const words = deliteraled.toLowerCase().match(/[a-z0-9]{4,}/g) ?? [];
+  const words = deliteraled.toLowerCase().match(/[a-zà-ú0-9]{4,}/g) ?? [];
   const uniq: string[] = [];
   for (const w of words) {
     if (DOCS_STOPWORDS.has(w)) continue;
@@ -951,14 +959,16 @@ export function assessDocsCoverageWithSemantics(
   }
   // Execution criteria (k2/req-4): prose alone never proves a run. Valid
   // product-executed evidence is required; docs correctness still required.
+  // M7: heuristic `not-covered` (denial, missing literal, broken link) already
+  // returned above and evidence never rescues it. Heuristic `inconclusive`
+  // (descriptive without an instructional verb, e.g. API tables + pasted
+  // output) proceeds to the semantic verdict with valid evidence — same as
+  // non-exec (retention 4a). Incomplete still fails (not-covered or semantic
+  // non-pass); wrong content fails via semantic fail; missing/stale evidence
+  // fails above.
   if (execRequired) {
     const check = validateDocsExecutedEvidence(opts?.executedEvidence, opts?.jobHead ?? '');
     if (!check.ok) return failNotCovered(check.reason);
-    if (heuristic.status !== 'covered') {
-      return failNotCovered(
-        `${heuristic.reason} — fix the docs content (correction) and re-review (executed evidence valid but docs substance still required)`,
-      );
-    }
   }
   if (!semantic || typeof semantic !== 'object') {
     return failInconclusive(
