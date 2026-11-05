@@ -7,7 +7,7 @@ import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, typ
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
 import { MergeTrain, checkMergeability, detectTestCommand, detectInstallCommand, type MergeTestReport, validateTouchSet, isSameCommit, matchesTouchPattern } from './merge-train';
 import { type ReviewVerdict, reviewJob, runReviewFixLoop, requirementsFromAcceptance, hasAcceptanceCriteria, needsReReview, type EssentialRequirement, type ReviewInput, type SufficiencyDecision, type TestEvidence } from './reviewer';
-import { isDocsOnlyChange, assessDocsCoverage, assessDocsCoverageWithSemantics } from './docs-review';
+import { isDocsOnlyChange, assessDocsCoverage, assessDocsCoverageWithSemantics, isExecutionRequirement, inferExecutionCommand, type DocsExecutedEvidence } from './docs-review';
 import { isTrivialTestCommand } from './verification';
 import { reviewFunctionallyViaOpenCode, reviewDocsViaOpenCode, toSufficiencyDecision, type FunctionalCriterionInput, type DocsCriterionResult } from './opencode-reviewer';
 import { runTestsOnImmutableSnapshot } from './candidate-identity';
@@ -999,6 +999,68 @@ export class Orchestrator {
     const requireExternal = !isTestScope() && requirements.length > 0;
     let semanticById = new Map<string, DocsCriterionResult>();
     let effectiveArgv = '';
+    // k2/req-4: execution criteria need product-executed proof (never worker claim).
+    // Gather once per job via the same immutable-snapshot path as the functional
+    // gate; fallback runs the runner named by the criterion (e.g. `node --test`)
+    // when no package script exists. Unit scope stays deterministic (no runs).
+    const execNeeded = requirements.some((r) => isExecutionRequirement(r.description));
+    let docsEvidence: DocsExecutedEvidence | null = null;
+    if (execNeeded && !isTestScope()) {
+      try {
+        const gathered = await this.gatherScopeEvidence(job, pins.jobHead, plan.integrationBranch, pins.changedFiles);
+        const e = gathered?.evidence;
+        if (e) {
+          docsEvidence = {
+            command: e.command,
+            exitCode: e.exitCode,
+            output: e.output,
+            testedCommit: e.testedCommit,
+            ...(e.environment ? { environment: e.environment } : {}),
+            ...(e.dirty !== undefined ? { dirty: e.dirty } : {}),
+            ...(e.taskHead ? { taskHead: e.taskHead } : {}),
+            ...(e.candidateBase ? { candidateBase: e.candidateBase } : {}),
+            ...(e.candidateHead ? { candidateHead: e.candidateHead } : {}),
+          };
+        }
+      } catch {
+        docsEvidence = null;
+      }
+      if (!docsEvidence) {
+        const hint = requirements.map((r) => inferExecutionCommand(r.description)).find((c) => c);
+        if (hint) {
+          const { mkdtempSync } = await import('fs');
+          const { tmpdir } = await import('os');
+          const { join } = await import('path');
+          let dir = '';
+          try {
+            dir = mkdtempSync(join(tmpdir(), 'mc-docs-exec-'));
+            const add = await gitCommand(['worktree', 'add', '--detach', dir, pins.jobHead], { cwd: repoRoot });
+            if (add.exitCode === 0) {
+              const observed = await this.observeCandidateState(dir);
+              if (!observed.dirty && observed.head === pins.jobHead) {
+                const scopePaths = await this.collectScopePaths(dir, pins.changedFiles, hint);
+                const isTracked = await this.buildIsTracked(dir);
+                const timeout = (this.config as MCConfig & { testTimeout?: number }).testTimeout ?? 600000;
+                const snap = await this.runScopeSnapshot(dir, scopePaths, hint, timeout, pins.jobHead, isTracked);
+                const after = await this.observeCandidateState(dir);
+                const success = snap.verdict === 'pass' && snap.success && !after.dirty && after.head === pins.jobHead;
+                docsEvidence = this.toScopeEvidence(
+                  hint,
+                  { success, output: snap.output, timedOut: snap.timedOut },
+                  { testedCommit: after.head ?? pins.jobHead, dirty: after.dirty || snap.verdict === 'fail' },
+                  `immutable-snapshot:${dir} (docs-only execution proof, base ${pins.jobHead.slice(0, 8)}, product-executed, ${process.platform})`,
+                  snap.verdict === 'fail' ? (snap.reason ?? 'identity refused: input changed during run') : undefined,
+                );
+              }
+            }
+          } catch {
+            docsEvidence = null;
+          } finally {
+            if (dir) await gitCommand(['worktree', 'remove', '--force', dir], { cwd: repoRoot }).catch(() => {});
+          }
+        }
+      }
+    }
     if (requireExternal) {
       const timeoutMs = Number(process.env.MC_REVIEW_TIMEOUT_MS ?? 120000);
       effectiveArgv = formatModelRefForArgv(this.ensureEffectiveModel());
@@ -1014,8 +1076,10 @@ export class Orchestrator {
       }
     }
     for (const req of requirements) {
+      const execOpts =
+        execNeeded && !isTestScope() ? { executedEvidence: docsEvidence, jobHead: pins.jobHead } : {};
       const assessment = requireExternal
-        ? assessDocsCoverageWithSemantics(req, contents, semanticById.get(req.id), { existingPaths, ...auxOpts })
+        ? assessDocsCoverageWithSemantics(req, contents, semanticById.get(req.id), { existingPaths, ...auxOpts, ...execOpts })
         : assessDocsCoverage(req, contents, { existingPaths, ...auxOpts });
       // Lane docs3: dedicated inconclusive state is fail-closed — never auto-pass,
       // never testStatus passed; requires external reviewer or explicit human accept.
@@ -1036,7 +1100,7 @@ export class Orchestrator {
         changedFiles: pins.changedFiles,
         testStatus: 'passed',
         testOutput: requireExternal
-          ? `docs-only verification (heuristic + OpenCode semantic pass with evidence, model ${effectiveArgv}): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`
+          ? `docs-only verification (heuristic + OpenCode semantic pass with evidence, model ${effectiveArgv}${docsEvidence ? `, executed "${docsEvidence.command}" exit ${docsEvidence.exitCode} @ ${docsEvidence.testedCommit.slice(0, 8)}` : ', no execution criterion'}): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`
           : `docs-only verification, unit scope (heuristic only, deterministic): ${requirements.map((r) => r.id).join(', ')} covered in ${Object.keys(contents).join(', ')}`,
         scope: 'task',
       }).catch(() => {});

@@ -768,6 +768,115 @@ const VERIFIED_UNCERTAINTY_RE =
 const VERIFIED_CONTRADICTS_PASS_RE =
   /\b(incorrect|wrong|false|missing|fails?\s+to|contradicts?|destructive|harmful|does\s+not\s+(satisfy|meet|cover|explain|describe))\b/i;
 
+// ---------------------------------------------------------------------------
+// Docs executed evidence (k2/req-4): docs-only gate never executes the suite,
+// so a criterion demanding proof of execution ("node --test passes") can never
+// be satisfied by prose alone — even correct docs fail without a linked
+// product-executed run. Optional channel, captured by the product (never
+// alleged by the worker), validated with the functional gate identity rules.
+// shortcut: keyword/runner heuristic — upgrade to a structured parser if it misfires.
+
+/** Product-captured execution proof linked to a docs-only requirement. */
+export interface DocsExecutedEvidence {
+  command: string;
+  exitCode: number;
+  output: string;
+  testedCommit: string;
+  environment?: string;
+  dirty?: boolean;
+  taskHead?: string;
+  candidateBase?: string;
+  candidateHead?: string;
+}
+
+/** True when the criterion demands proof of test execution (not docs about it). */
+export function isExecutionRequirement(description: string): boolean {
+  const d = description.toLowerCase();
+  // Docs framing ("documents/explains ... running tests") is never execution proof.
+  if (/\b(documents?|documenting|explains?|describes?|contains?|body|guide|readme)\b/.test(d)) return false;
+  const runner = /(node\s+--test|bun\s+test|npm\s+(test|run)|yarn\s+test|pnpm\s+test|pytest|go\s+test|cargo\s+test|vitest|jest)/i.test(
+    description,
+  );
+  const passSignal = /\bpass(es|ed)?\b|\bgreen\b|\bexit\s*0\b|\bsucceeds?\b|\bsuccessful/i.test(description);
+  if (runner && passSignal) return true;
+  if (/\btests?\s+pass|\bsuite\s+pass(es|ed)?\b/i.test(d)) return true;
+  return false;
+}
+
+/** Best-effort runner command named by an execution criterion (for product re-run). */
+export function inferExecutionCommand(description: string): string | null {
+  const m = description.match(/(node\s+--test\b|bun\s+test\b|npm\s+test\b|yarn\s+test\b|pnpm\s+test\b|pytest\b|go\s+test\b|cargo\s+test\b)/i);
+  return m ? m[1]!.trim() : null;
+}
+
+export function validateDocsExecutedEvidence(
+  evidence: DocsExecutedEvidence | null | undefined,
+  jobHead: string,
+): { ok: boolean; reason: string } {
+  const head = (jobHead ?? '').trim();
+  if (!evidence) {
+    return {
+      ok: false,
+      reason:
+        'missing executed evidence: no product-executed test run linked to this execution criterion — execute e reapresente (docs content alone does not prove execution; no docs rewrite requested for this failure)',
+    };
+  }
+  if (!head) {
+    return { ok: false, reason: 'missing executed evidence: job HEAD unknown — execute e reapresente' };
+  }
+  if (!evidence.command || !evidence.command.trim()) {
+    return { ok: false, reason: 'invalid executed evidence: missing test command — re-execute e re-review' };
+  }
+  if (evidence.exitCode !== 0) {
+    return {
+      ok: false,
+      reason: `executed evidence reports failure (exit ${evidence.exitCode} for "${evidence.command}") — re-execute e re-review`,
+    };
+  }
+  if (!evidence.output || !evidence.output.trim()) {
+    return { ok: false, reason: 'invalid executed evidence: missing observable test output — re-execute e re-review' };
+  }
+  if (!evidence.environment || !evidence.environment.trim()) {
+    return {
+      ok: false,
+      reason: 'invalid executed evidence: missing execution environment (cannot tell observed product execution from declared text) — re-execute e re-review',
+    };
+  }
+  if (!evidence.testedCommit || !evidence.testedCommit.trim()) {
+    return { ok: false, reason: 'invalid executed evidence: missing tested commit — re-execute e re-review' };
+  }
+  if (evidence.taskHead !== undefined || evidence.candidateBase !== undefined || evidence.candidateHead !== undefined) {
+    if (!evidence.candidateHead || !evidence.candidateHead.trim()) {
+      return { ok: false, reason: 'invalid executed evidence: missing candidate identity (observed candidate HEAD) — re-execute e re-review' };
+    }
+    if (evidence.testedCommit !== evidence.candidateHead) {
+      return {
+        ok: false,
+        reason: `stale executed evidence: testedCommit ${evidence.testedCommit} is not the observed candidate ${evidence.candidateHead} — re-execute e re-review`,
+      };
+    }
+    if (!evidence.taskHead || evidence.taskHead !== head) {
+      return {
+        ok: false,
+        reason: `stale executed evidence: candidate does not contain the reviewed job (taskHead ${evidence.taskHead ?? '(missing)'} vs job HEAD ${head}) — re-execute e re-review`,
+      };
+    }
+  } else if (evidence.testedCommit !== head) {
+    return {
+      ok: false,
+      reason: `stale executed evidence: tested code diverges (evidence covers ${evidence.testedCommit} but job HEAD is ${head}) — re-execute e re-review`,
+    };
+  }
+  if (evidence.dirty) {
+    return { ok: false, reason: 'dirty executed evidence: tested tree was dirty (uncommitted changes) — re-execute e re-review' };
+  }
+  return { ok: true, reason: '' };
+}
+
+/** Semantic fail solely about missing output/result proof in the docs (execution supplied by evidence). */
+const EXEC_OUTPUT_LACK_RE =
+  /no test execution output|without .*output|missing .*output|contains no .*output|contains no .*result|no .*result.*prov|execution .*proof|proving .*pass/i;
+
 /**
  * Verified public path (lane r2-docs): heuristic auxiliary + semantic verdict.
  *
@@ -793,7 +902,12 @@ export function assessDocsCoverageWithSemantics(
   requirement: DocsRequirement,
   docsContents: Record<string, string>,
   semantic: DocsSemanticInput | null | undefined,
-  opts?: { existingPaths?: string[] | Set<string>; auxContents?: Record<string, string> },
+  opts?: {
+    existingPaths?: string[] | Set<string>;
+    auxContents?: Record<string, string>;
+    executedEvidence?: DocsExecutedEvidence | null;
+    jobHead?: string;
+  },
 ): DocsAssessment {
   const heuristic = assessDocsCoverage(requirement, docsContents, opts);
   const failNotCovered = (reason: string): DocsAssessment => ({
@@ -806,13 +920,32 @@ export function assessDocsCoverageWithSemantics(
     status: 'inconclusive',
     reason: `docs assessment inconclusive for requirement "${requirement.id}" (${requirement.description}): ${reason} — fail-closed: requires external reviewer or explicit human accept, never auto-pass`,
   });
-  // Heuristic definitive rejects stand (auxiliary evidence against coverage).
-  if (heuristic.status === 'not-covered') return heuristic;
+  const execRequired = isExecutionRequirement(requirement.description);
+  // (c) doc incorreto precede evidência: heurística definitiva rejeita sozinha.
+  if (heuristic.status === 'not-covered') {
+    if (execRequired) {
+      return failNotCovered(
+        `${heuristic.reason} — fix the docs content (correction) and re-review${opts?.executedEvidence ? ' (executed evidence does not rescue incorrect docs)' : ''}`,
+      );
+    }
+    return heuristic;
+  }
   // Heuristic internal contradiction needs a human — semantic alone cannot settle it.
   if (heuristic.status === 'inconclusive' && /contradict/i.test(heuristic.reason)) {
     return failInconclusive(
       `${heuristic.reason} — semantic review cannot override an internal contradiction alone`,
     );
+  }
+  // Execution criteria (k2/req-4): prose alone never proves a run. Valid
+  // product-executed evidence is required; docs correctness still required.
+  if (execRequired) {
+    const check = validateDocsExecutedEvidence(opts?.executedEvidence, opts?.jobHead ?? '');
+    if (!check.ok) return failNotCovered(check.reason);
+    if (heuristic.status !== 'covered') {
+      return failNotCovered(
+        `${heuristic.reason} — fix the docs content (correction) and re-review (executed evidence valid but docs substance still required)`,
+      );
+    }
   }
   if (!semantic || typeof semantic !== 'object') {
     return failInconclusive(
@@ -831,6 +964,19 @@ export function assessDocsCoverageWithSemantics(
     ? evidenceRaw.map(String).map((s) => s.trim()).filter((s) => s.length > 0).slice(0, 8)
     : [];
   if (verdict === 'fail') {
+    if (execRequired && EXEC_OUTPUT_LACK_RE.test(reason)) {
+      const ev = opts?.executedEvidence!;
+      return {
+        covered: true,
+        status: 'covered',
+        reason: `requirement "${requirement.id}" verified by docs + executed evidence: product-executed "${ev.command}" exit 0 at ${ev.testedCommit.slice(0, 8)} with observable output — execution proof supplied by evidence, docs correctly document the command (semantic output-in-docs complaint set aside: ${reason} — evidence: ${evidence.slice(0, 2).join(' | ') || '(cited passages in review)'})`,
+      };
+    }
+    if (execRequired) {
+      return failNotCovered(
+        `semantic review rejects: ${reason} — evidence: ${evidence.slice(0, 2).join(' | ') || '(cited passages in review)'} — fix the docs content (correction) and re-review`,
+      );
+    }
     return failNotCovered(`semantic review rejects: ${reason} — evidence: ${evidence.slice(0, 2).join(' | ') || '(cited passages in review)'}`);
   }
   if (verdict === 'inconclusive') {
