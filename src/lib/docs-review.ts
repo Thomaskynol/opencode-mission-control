@@ -198,8 +198,10 @@ const PT_NEGATED_VERB_RE =
   /\bn[ãa]o\b[^.!?\n]{0,120}\b(explica|explicam|explicar|explicado|explicada|cobre|cobrem|cobrir|coberto|coberta|descreve|descrevem|descrever|descrito|descrita|documenta|documentam|documentar|documentado|detalha|detalham|detalhar|detalhado|detalhada|inclui|incluem|incluir|inclu[íi]do|inclu[íi]da|cont[ée]m|conter|contido|aborda|abordam|abordar|abordado|apresenta|apresentam|apresentar|apresentado|ensina|ensinam|ensinar|mostra|mostram|mostrar|traz|trazem|trazer)\b/i;
 
 // Placeholders void the doc wherever they appear (general list, EN+PT).
+// `todo` excludes the test-counter shape (`todo 0` in `node --test` summary
+// output pasted into docs) — a bare `TODO:`/`[TODO]`/lone `todo` still voids.
 const GLOBAL_PLACEHOLDER_RE =
-  /\b(todo|tbd|t\.b\.d\.|fixme|xxx|placeholder|lorem\s+ipsum|under\s+construction|coming\s+soon|to\s+be\s+written|work\s+in\s+progress|not\s+yet\s+written|a\s+ser\s+definido|a\s+definir|por\s+definir|em\s+constru[çc][ãa]o|em\s+breve|pendente|rascunho|por\s+fazer)\b/i;
+  /\b(todo(?!\s+\d)|tbd|t\.b\.d\.|fixme|xxx|placeholder|lorem\s+ipsum|under\s+construction|coming\s+soon|to\s+be\s+written|work\s+in\s+progress|not\s+yet\s+written|a\s+ser\s+definido|a\s+definir|por\s+definir|em\s+constru[çc][ãa]o|em\s+breve|pendente|rascunho|por\s+fazer)\b/i;
 
 // Futility about the instructions themselves (general, EN+PT): nobody can use
 // them, no/ missing instructions, out of scope — the doc disclaims its own utility.
@@ -232,6 +234,14 @@ const DENIAL_MARKER_RE = new RegExp(
   `(?:(?<![${WORD_CH}])(?:not|no|never|neither|nor|without|missing|lacking|absent|excluded|outside|except|fails?|failed|denied|denies|void|n[ãa]o|nunca|jamais|sem|ausentes?|falta|faltando|faltam|fora|exclu[íi]dos?|nada)(?![${WORD_CH}])|n\\'t(?![${WORD_CH}])|(?<![${WORD_CH}])fora\\s+de(?![${WORD_CH}])|(?<![${WORD_CH}])out\\s+of(?![${WORD_CH}]))`,
   'i',
 );
+
+/** Pasted machine output in fenced blocks (test runs, logs) is evidence,
+ * never authorial prose: counters like `ℹ fail 0` / `ℹ todo 0` must not
+ * read as denial/disclaimer. Only closed pairs strip (fail-closed: an
+ * unclosed fence leaves the text scanned). */
+function stripFencedCodeBlocks(text: string): string {
+  return text.replace(/```[\s\S]*?```/g, '');
+}
 
 function splitSentences(text: string): string[] {
   // Backtick-aware AND paren-aware: dots inside `code spans` (commands,
@@ -589,7 +599,10 @@ export function assessDocsCoverage(
     }
   }
   // Global disclaimers void the whole doc (general patterns, EN+PT).
-  for (const raw of splitSentences(combined)) {
+  // Pasted machine output in fenced blocks is evidence, never authorial
+  // prose — these two scans run on prose outside fences.
+  const proseOnly = stripFencedCodeBlocks(combined);
+  for (const raw of splitSentences(proseOnly)) {
     if (isGlobalDisclaimerSentence(raw)) {
       return failNotCovered(
         `docs disclaim their own utility ("${raw.slice(0, 120)}") — placeholder or futility disclaimer voids coverage, write real instructions or accept explicitly`,
@@ -600,7 +613,7 @@ export function assessDocsCoverage(
   // absence marker about the criterion itself contradicts it when that same
   // sentence carries no affirmative instruction. Negations about unrelated
   // topics, or markers inside an instructive sentence, do not block.
-  for (const raw of splitSentences(combined)) {
+  for (const raw of splitSentences(proseOnly)) {
     const lower = raw.toLowerCase();
     if (!sentenceMentionsCriterion(lower, keywords, literals)) continue;
     if (isNegatedSentence(raw)) {

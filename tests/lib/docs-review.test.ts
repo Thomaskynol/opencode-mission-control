@@ -108,4 +108,44 @@ describe('assessDocsCoverage', () => {
     );
     expect(r.covered).toBe(true);
   });
+
+  it('does not flag pasted node --test summary output as placeholder/denial', () => {
+    const req = {
+      id: 'api-docs',
+      description: 'API guide explains running tests with `node --test` and verifying passing output',
+    };
+    const doc = `# API guide
+
+This guide explains running tests with \`node --test\`. Open the folder, run the command before verifying the passing output below.
+
+\`\`\`
+✔ mean ([1,2,3]) (1.2ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 120
+\`\`\`
+
+See [tests](../api.test.mjs) for the cases.
+`;
+    const r = assessDocsCoverage(req, { 'docs/api.md': doc }, { existingPaths: ['docs/api.md', 'api.test.mjs'] });
+    expect(r.covered).toBe(true);
+  });
+
+  it('still flags real placeholders (TODO marker, bracket, lone todo)', () => {
+    const bodies = [
+      'TODO: preencher o restante do guia de instalação com os passos finais.',
+      '[TODO] finish the installation guide with the remaining steps below.',
+      'todo',
+    ];
+    for (const body of bodies) {
+      const r = assessDocsCoverage(INSTALL_REQ, { 'README.md': `${GOOD_README}\n${body}\n` });
+      expect(r.covered).toBe(false);
+      expect(r.reason).toMatch(/placeholder|disclaim/i);
+    }
+  });
 });
