@@ -29,7 +29,7 @@ import { loadPlan, isTestEnvPresent } from './plan-state.js';
 import { getXdgDataDir } from './paths.js';
 import { join, dirname } from 'path';
 import { mkdirSync, appendFileSync } from 'node:fs';
-import { PermissionPolicy, type PermissionPolicyConfig } from './permission-policy.js';
+import { PermissionPolicy, policyFloorViolations, type PermissionPolicyConfig } from './permission-policy.js';
 
 type JobEventType = 'complete' | 'failed' | 'blocked' | 'needs_review' | 'awaiting_input' | 'agent_report' | 'question';
 
@@ -496,6 +496,15 @@ export class JobMonitor extends EventEmitter {
             `Check the serve on port ${job.port ?? 'unknown'} for this job, or run resume --takeover to re-drive; job state and conductor lease preserved (fail-closed, no terminal verdict from SSE).`,
         );
         this.cleanupSSEForJob(job.id);
+        // Fail-closed visibility: the worker may be blocked on a permission
+        // the dead stream never delivered. Surface it as blocked (job stays
+        // running, lease untouched) so the operator investigates instead of
+        // assuming healthy — never silently approve or complete.
+        try {
+          this.emit('blocked', job, {
+            reason: `SSE unavailable for job ${job.name} (serve ${client.baseUrl}) — monitor cannot observe permission asks; failing closed, no auto-approve`,
+          });
+        } catch {}
         break;
       }
       let productive = false;
@@ -911,11 +920,24 @@ export class JobMonitor extends EventEmitter {
       }
     }
 
-    return PermissionPolicy.resolvePolicy({
+    const resolved = PermissionPolicy.resolvePolicy({
       jobPolicy,
       planPolicy,
       globalPolicy,
     });
+    // Defense in depth: even if a job/plan file carries a permissive
+    // override past the launch pre-flight, never run reserved scope under
+    // it — fall back to the safe default (fail-closed, operator-visible via
+    // the warning) instead of silently approving.
+    const effectiveConfig = jobPolicy ?? planPolicy ?? globalPolicy ?? PermissionPolicy.getDefaultPolicy();
+    const violations = policyFloorViolations(effectiveConfig);
+    if (violations.length > 0) {
+      console.warn(
+        `[Monitor] Effective permission policy for job ${job.name} violates the policy floor (${violations.join('; ')}) — falling back to the safe default (fail-closed).`,
+      );
+      return PermissionPolicy.resolvePolicy({});
+    }
+    return resolved;
   }
 
   private async handlePermissionUpdate(job: Job, event: any): Promise<void> {

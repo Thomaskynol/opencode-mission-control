@@ -114,7 +114,7 @@ describe('shouldAutoApprove', () => {
     expect(result.autoApproved).toBe(true);
   });
 
-  it('should auto-approve shell commands without specified path', () => {
+  it('should NOT auto-approve shell commands without command text (fail-closed)', () => {
     const permission: PermissionRequest = {
       id: 'perm-1',
       type: 'shell_command',
@@ -123,8 +123,8 @@ describe('shouldAutoApprove', () => {
 
     const result = shouldAutoApprove(permission, worktreePath);
 
-    expect(result.approved).toBe(true);
-    expect(result.autoApproved).toBe(true);
+    expect(result.approved).toBe(false);
+    expect(result.autoApproved).toBe(false);
   });
 
   it('should NOT auto-approve shell commands outside worktree', () => {

@@ -14,10 +14,11 @@ import {
   isTmuxAvailable,
 } from '../lib/tmux';
 import { loadConfig } from '../lib/config';
-import { buildWorktreePermissions } from '../lib/permission-policy';
+import { buildWorktreePermissions, assertPolicyFloorCompliant } from '../lib/permission-policy';
 import { detectOMO } from '../lib/omo';
 import { copyPlansToWorktree } from '../lib/plan-copier';
-import { resolvePostCreateHook } from '../lib/worktree-setup';
+import { resolvePostCreateHook, assertNoPermissiveOpencodeConfig } from '../lib/worktree-setup';
+import { getMainWorktree } from '../lib/worktree';
 import { writePromptFile, cleanupPromptFile, writeLauncherScript, cleanupLauncherScript, writeServeLauncherScript, describeTuiModelPin, TUI_MODEL_BLOCKADE } from '../lib/prompt-file';
 import { getCurrentModel, getCurrentModelInfo } from '../lib/model-tracker';
 import { allocatePort, releasePort } from '../lib/port-allocator';
@@ -147,6 +148,30 @@ export const mc_launch: ToolDefinition = tool({
 
     // 2. Load config for defaults
     const config = await loadConfig();
+
+    // 2b. Policy pre-flight (lane-policy): verify the necessary policy
+    // BEFORE execution, or block the mode that cannot meet restrictions.
+    // A permissive global policy would let reserved actions run without a
+    // decisor (fail-open) — refuse fail-closed with an actionable message.
+    assertPolicyFloorCompliant(config.defaultPermissionPolicy, 'global');
+    // TUI mode cannot enforce session permissions (no serve session, no
+    // permission.asked events for the monitor) — block with guidance.
+    if (config.useServeMode === false) {
+      throw new Error(
+        '[MC] Refusing launch: TUI mode (useServeMode:false) cannot enforce the permission policy ' +
+          '(no session permissions, no monitor permission events). Use serve mode (useServeMode:true, the default) ' +
+          'so in-worktree allow / outside ask-or-deny + operator questions (mc_answer) hold.',
+      );
+    }
+    // Inherited `.opencode`/opencode.json with blanket allow would let the
+    // server allow without asking the monitor (no event to contain) — block.
+    try {
+      const mainPath = await getMainWorktree();
+      assertNoPermissiveOpencodeConfig(mainPath);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('permissive opencode permission')) throw error;
+      // No main worktree determinable (fresh repo): nothing inherited to vet.
+    }
 
     // 3. Resolve parameters
     const jobId = randomUUID();

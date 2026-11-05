@@ -1,5 +1,7 @@
 import type { PostCreateHook } from './providers/worktree-provider';
 import type { WorktreeSetup } from './config';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export type CommandValidationResult = {
   safe: boolean;
@@ -82,6 +84,59 @@ export function validateCommands(
 }
 
 const BUILTIN_SYMLINKS = ['.opencode'];
+
+/**
+ * Fail-closed guard for the inherited `.opencode` symlink (lane-policy):
+ * the worker inherits the main worktree's `.opencode` (agents/skills) AND
+ * any opencode.json permission config reachable from it. A permissive
+ * `permission: { "*"/edit/bash: "allow" }` there would let the server allow
+ * reserved actions WITHOUT asking the monitor — the monitor would never see
+ * a `permission.asked` event, so text analysis downstream cannot contain it.
+ * Scan the small candidate files as TEXT (JSONC-tolerant) before launch and
+ * refuse with an actionable message instead of executing at will.
+ * `lsp: allow` alone is benign (read-only) and does NOT trigger.
+ */
+export function isPermissiveOpencodePermissionText(text: string): boolean {
+  if (!text || !text.includes('permission')) return false;
+  if (!text.includes('allow')) return false;
+  // Blanket `"permission": "allow"` (whole surface allowed).
+  if (/"permission"\s*:\s*"allow"/.test(text)) return true;
+  // Scoped allows that bypass the monitor for reserved scope.
+  // `lsp` is intentionally absent here (read-only, benign).
+  return /"(edit|bash|shell|write|\*|webfetch|fetch|network|all)"\s*:\s*"allow"/.test(text);
+}
+
+export function permissiveOpencodeConfigFiles(mainPath: string): string[] {
+  const candidates = [
+    join(mainPath, '.opencode', 'opencode.json'),
+    join(mainPath, '.opencode', 'opencode.jsonc'),
+    join(mainPath, 'opencode.json'),
+    join(mainPath, 'opencode.jsonc'),
+  ];
+  const hits: string[] = [];
+  for (const file of candidates) {
+    try {
+      if (!existsSync(file)) continue;
+      const text = readFileSync(file, 'utf-8');
+      if (isPermissiveOpencodePermissionText(text)) hits.push(file);
+    } catch {
+      // Unreadable candidate fails closed at launch (below) only when it
+      // looks permissive; read errors here are ignored (no evidence).
+    }
+  }
+  return hits;
+}
+
+/** Throw fail-closed listing the permissive files (launch pre-flight). */
+export function assertNoPermissiveOpencodeConfig(mainPath: string): void {
+  const hits = permissiveOpencodeConfigFiles(mainPath);
+  if (hits.length > 0) {
+    throw new Error(
+      `[MC] Refusing launch: permissive opencode permission config inherited via worktree (${hits.join(', ')}) would allow reserved actions without asking the monitor. ` +
+        `Remove the \`"permission": { "*"/edit/bash: "allow" }\` allow (lsp:allow is fine) or launch with a clean config — never executes at will.`,
+    );
+  }
+}
 
 function normalizePath(p: string): string {
   return p.replace(/\/+$/, '').replace(/^\.\//, '');

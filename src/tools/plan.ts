@@ -5,6 +5,9 @@ import { loadPlan, savePlan, validateGhAuth } from '../lib/plan-state';
 import { Orchestrator, hasCircularDependency } from '../lib/orchestrator';
 import { getSharedMonitor, getSharedNotifyCallback, setSharedOrchestrator } from '../lib/orchestrator-singleton';
 import { loadConfig } from '../lib/config';
+import { assertPolicyFloorCompliant } from '../lib/permission-policy';
+import { assertNoPermissiveOpencodeConfig } from '../lib/worktree-setup';
+import { getMainWorktree } from '../lib/worktree';
 import { gitCommand } from '../lib/git';
 import { getCurrentModel } from '../lib/model-tracker';
 
@@ -60,6 +63,23 @@ export const mc_plan: ToolDefinition = tool({
   },
   async execute(args, context) {
     const mode = args.mode ?? 'autopilot';
+
+    // 0. Policy pre-flight (lane-policy): same floor as mc_launch — verify
+    // BEFORE execution, or block the mode that cannot meet restrictions.
+    const planConfig = await loadConfig();
+    assertPolicyFloorCompliant(planConfig.defaultPermissionPolicy, 'global');
+    if (planConfig.useServeMode === false) {
+      throw new Error(
+        '[MC] Refusing plan: TUI mode (useServeMode:false) cannot enforce the permission policy ' +
+          '(no session permissions, no monitor permission events). Use serve mode (useServeMode:true, the default).',
+      );
+    }
+    try {
+      const mainPath = await getMainWorktree();
+      assertNoPermissiveOpencodeConfig(mainPath);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('permissive opencode permission')) throw error;
+    }
 
     // 1. Validate jobs: unique names
     const jobNames = args.jobs.map((j) => j.name);

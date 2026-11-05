@@ -113,6 +113,12 @@ export async function writeServeLauncherScript(
   const opencodeBin = resolveOpencodePath();
   // Single-quote escaping: configured passwords may contain ", $, backticks
   // (generated ones are hex and always safe). Never emit the value bare.
+  // Permissions are NOT launcher flags/env: they are enforced per-session via
+  // POST /api/session {permissions: allow-inside worktree ruleset} (see
+  // buildWorktreePermissions) + monitor policy (ask-user/deny + operator
+  // mc_answer). Never add `--auto` here: it would auto-approve without a
+  // decisor. TUI launchers have no permission mechanism at all and are
+  // blocked at launch (see mc_launch pre-flight).
   const envLine = password
     ? `export OPENCODE_SERVER_PASSWORD='${password.replace(/'/g, `'\\''`)}'\n`
     : '';
@@ -120,6 +126,16 @@ export async function writeServeLauncherScript(
   await writeFile(launcherPath, script, { mode: 0o755 });
   return launcherPath;
 }
+
+/**
+ * Permission enforcement note (lane-policy): serve workers are scoped via
+ * the session API, never via launcher flags. The launcher intentionally
+ * carries no `--auto` and no permission env — adding either would bypass
+ * the monitor decisor. TUI mode has no equivalent mechanism and is refused
+ * at launch so normal mode always runs under the policy floor.
+ */
+export const SERVE_PERMISSION_ENFORCEMENT_NOTE =
+  'Serve permissions are session-scoped via POST /api/session {permissions} (allow-inside worktree) + monitor policy (ask-user/deny + mc_answer). Launcher carries no --auto/permission flags; TUI mode is blocked.';
 
 /**
  * Per-worker serve credential. `opencode serve` ALWAYS requires auth

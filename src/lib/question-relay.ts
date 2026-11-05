@@ -1,6 +1,6 @@
 import type { Job } from './job-state.js';
 import { createV2Client, v2Prompt, v2ReplyPermission, type V2Client } from './sdk-client.js';
-import { isGitPushText, isPathContainedIn } from './permission-policy.js';
+import { isGitPushText, isPathContainedIn, referencesOutsideWorktree } from './permission-policy.js';
 
 /**
  * Publishing-like permission (push/PR/publish/deploy): must never
@@ -320,10 +320,31 @@ export function shouldAutoApprove(
     };
   }
 
-  // Shell commands: check if inside worktree context
+  // Shell commands: check if inside worktree context.
+  // Fail-closed: no command text (`!path`) is unauditable — never silently
+  // approve (mirrors the policy floor: absence is ask-user, not inside).
+  // Command text may ride in description/action/target too, so the full
+  // haystack is screened for outside/expansion escapes, not just `path`.
   if (permission.type === 'shell_command') {
-    // Shell commands are generally safe inside worktree, but check if path is specified
-    if (!permission.path || isPathInsideWorktree(permission.path, worktreePath)) {
+    if (!permission.path) {
+      return {
+        approved: false,
+        autoApproved: false,
+        reason: 'Shell command is missing command text and requires user approval',
+      };
+    }
+    const haystack = [permission.path, permission.description, permission.action, permission.target];
+    const escapes = haystack.some(
+      (field) => typeof field === 'string' && field.length > 0 && referencesOutsideWorktree(field, worktreePath),
+    );
+    if (escapes) {
+      return {
+        approved: false,
+        autoApproved: false,
+        reason: 'Shell command references outside worktree and requires user approval',
+      };
+    }
+    if (isPathInsideWorktree(permission.path, worktreePath)) {
       return {
         approved: true,
         autoApproved: true,

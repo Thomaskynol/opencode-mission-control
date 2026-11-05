@@ -425,6 +425,14 @@ export async function launchWorkerViaServe(
   client: V2Client,
   input: ServeWorkerInput,
 ): Promise<ServeWorkerHandle> {
+  // Fail-closed: a worker without session permissions would run under the
+  // server default (no allow-inside ruleset, no monitor ask events to
+  // contain). Refuse instead of launching unscoped.
+  if (!input.profile?.permissions || input.profile.permissions.length === 0) {
+    throw new Error(
+      '[MC] Refusing serve launch: session permissions are required (allow-inside worktree ruleset) — launch without them would run unscoped.',
+    );
+  }
   const body: V2CreateSessionBody = {
     ...(input.profile?.agent !== undefined ? { agent: input.profile.agent } : {}),
     ...(input.model ? { model: { ...input.model } } : {}),

@@ -52,6 +52,56 @@ export type PermissionPolicySources = {
   globalPolicy?: PermissionPolicyConfig;
 };
 
+/**
+ * Non-bypassable floor for normal mode: the product installs/verifies the
+ * necessary policy BEFORE execution. A global/job/plan policy that silently
+ * approves reserved actions (outside-worktree writes, outside shell,
+ * network, installs) would let the worker act without a decisor — fail
+ * closed here with an actionable message instead of executing at will.
+ * Legitimate in-worktree approvals + operator questions (ask-user) pass;
+ * only silent `auto-approve` of reserved scope is refused.
+ */
+export function policyFloorViolations(policy: PermissionPolicyConfig | undefined): string[] {
+  if (!policy) return [];
+  const violations: string[] = [];
+  const perms = policy.permissions;
+  if (perms.fileEdit.outsideWorktree !== 'deny') {
+    violations.push(
+      `fileEdit.outsideWorktree must be 'deny' (got '${perms.fileEdit.outsideWorktree}') — writes outside the worktree are reserved and never silently approved`,
+    );
+  }
+  if (perms.shellCommand.outsideWorktree === 'auto-approve') {
+    violations.push(
+      `shellCommand.outsideWorktree must not be 'auto-approve' — outside shell stays ask-user/deny so the operator decides`,
+    );
+  }
+  if ((perms.networkAccess as string) === 'auto-approve') {
+    violations.push(
+      `networkAccess must not be 'auto-approve' — network stays deny/ask-user (fail-closed)`,
+    );
+  }
+  if ((perms.installPackages as string) === 'auto-approve') {
+    violations.push(
+      `installPackages must not be 'auto-approve' — installs stay ask-user/deny so the operator decides`,
+    );
+  }
+  return violations;
+}
+
+/** Throw fail-closed when the effective policy would silently approve reserved scope. */
+export function assertPolicyFloorCompliant(
+  policy: PermissionPolicyConfig | undefined,
+  source = 'global',
+): void {
+  const violations = policyFloorViolations(policy);
+  if (violations.length > 0) {
+    throw new Error(
+      `[MC] Refusing launch: permission policy (${source}) is permissive and would allow reserved actions without a decisor — ${violations.join('; ')}. ` +
+        `Set fileEdit.outsideWorktree='deny', shellCommand.outsideWorktree='ask-user'/'deny', networkAccess='deny'/'ask-user', installPackages='ask-user'/'deny' (see PermissionPolicy.getDefaultPolicy()).`,
+    );
+  }
+}
+
 function normalizePathForComparison(path: string): string {
   return resolve(path.replace(/\\/g, '/')).replace(/\\/g, '/');
 }
@@ -598,7 +648,17 @@ export class PermissionPolicy {
       }
 
       case 'shellCommand': {
-        const rawPath = permissionRequest.path ?? jobContext.worktreePath;
+        // Fail-closed: a shell permission without command text is
+        // unauditable — never silently approve (decisor duplo fix: the
+        // relay had the same hole for `!path`). The v2 server always sends
+        // command text in `resources` for real shell asks; absence means an
+        // unknown shape, not an inside approval.
+        if (!permissionRequest.path) {
+          policyDecision = 'ask-user';
+          reason = 'Shell command is missing command text and requires human review';
+          break;
+        }
+        const rawPath = permissionRequest.path;
         // Shell permission resources carry COMMAND TEXT (v2 `resources`,
         // e.g. "cat probe-secret.txt" — observed live on 2.2.5), not a
         // path. The server runs shell in the session cwd (the worktree),
@@ -606,8 +666,20 @@ export class PermissionPolicy {
         // string always joins inside the worktree lexically, so explicit
         // escapes (absolute outside paths, `..`, `~`, remote targets,
         // expansion/substitution, chaining, redirection) veto FIRST.
-        // Publishing already forced ask-user above.
-        const inWorktree = !referencesOutsideWorktree(rawPath, jobContext.worktreePath)
+        // Publishing already forced ask-user above. Command text may ride
+        // in description/action/target too — any outside reference in the
+        // full haystack keeps outside handling (ask, never silent allow).
+        const haystack = [
+          permissionRequest.path,
+          permissionRequest.description,
+          permissionRequest.action,
+          permissionRequest.target,
+        ];
+        const escapes = haystack.some(
+          (field) => typeof field === 'string' && field.length > 0 && referencesOutsideWorktree(field, jobContext.worktreePath),
+        );
+        const inWorktree = !escapes
+          && !referencesOutsideWorktree(rawPath, jobContext.worktreePath)
           && isInsideWorktree(rawPath, jobContext.worktreePath);
         if (!inWorktree) {
           policyDecision = this.policy.permissions.shellCommand.outsideWorktree;
