@@ -242,6 +242,10 @@ mock.module('../../src/lib/worktree-setup', () => ({
   // Pre-flight vet is covered by dedicated policy suites; the fake
   // main worktree above carries no permissive config.
   assertNoPermissiveOpencodeConfig: vi.fn(() => {}),
+  // Superfície usada por monitor/reports (ressalva sem-ACK): valor canônico
+  // real (mock espelha a forma; o conteúdo é texto de gap, sem I/O).
+  SERVE_PLUGIN_RUNTIME_LIMITATION:
+    'plugin preparado mas carga não comprovada (sem ACK do serve)',
 }));
 
 // Serve-mode capture/status read monitor event accumulators (not the tmux

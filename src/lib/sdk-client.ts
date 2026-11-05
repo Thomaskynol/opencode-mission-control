@@ -433,9 +433,11 @@ export async function launchWorkerViaServe(
       '[MC] Refusing serve launch: session permissions are required (allow-inside worktree ruleset) — launch without them would run unscoped.',
     );
   }
-  // Plugin por projeto (defesa em profundidade): o launcher já garante via
-  // writeServeLauncherScript ANTES do serve subir; aqui re-garante de forma
-  // idempotente para chamadas diretas (o serve recarrega via watcher).
+  // Plugin por projeto (defesa em profundidade): o launcher já prepara o
+  // ARQUIVO via writeServeLauncherScript ANTES do serve subir; aqui
+  // re-garante de forma idempotente para chamadas diretas. A carga pelo
+  // serve segue sem ACK do runtime (ver SERVE_PLUGIN_RUNTIME_LIMITATION) —
+  // nunca "garantida", nunca recarregada por watcher comprovado.
   // Fail-open: nunca bloqueia o launch por plugin — gap explícito no monitor.
   try {
     const { ensureServePluginConfig } = await import('./worktree-setup.js');

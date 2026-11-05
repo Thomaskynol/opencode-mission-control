@@ -115,4 +115,40 @@ describe('serve plugin config (mc_report/mc_status no serve)', () => {
       globalThis.fetch = realFetch;
     }
   });
+
+  it('sucesso materializado retorna loadAck false + log visível sem-ACK (nunca "garantido")', async () => {
+    const wt = join(base, 'wt-ack');
+    await mkdir(wt, { recursive: true });
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(' ')); };
+    try {
+      const res = await ensureServePluginConfig(wt);
+      expect(res.ok).toBe(true);
+      // Carga pelo serve nunca é confirmada pelo runtime: sempre false.
+      expect((res as { loadAck?: unknown }).loadAck).toBe(false);
+      expect(warns.some((w) => /preparado mas carga n.o comprovada.*sem ACK do serve/.test(w))).toBe(true);
+      expect(warns.some((w) => /garantido/i.test(w))).toBe(false);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it('cache (idempotente) também expõe loadAck false + sem-ACK visível', async () => {
+    const wt = join(base, 'wt-ack-cached');
+    await mkdir(wt, { recursive: true });
+    await ensureServePluginConfig(wt);
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(' ')); };
+    try {
+      const res2 = await ensureServePluginConfig(wt);
+      expect(res2.ok).toBe(true);
+      expect(res2.source).toBe('cached');
+      expect((res2 as { loadAck?: unknown }).loadAck).toBe(false);
+      expect(warns.some((w) => /sem ACK do serve/.test(w))).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+  });
 });

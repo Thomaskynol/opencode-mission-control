@@ -196,21 +196,42 @@ export function resolvePostCreateHook(
 /* Serve worker plugin (mc_report/mc_status no serve).                 */
 /* O serve (`opencode serve --port`, cwd=worktree) só expõe tools do   */
 /* plugin carregado no projeto. Sem plugin no worktree, o prompt exige */
-/* mc_report mas a tool não existe (global só tem dcp/ponytail/OMO).   */
-/* Mecanismo já usado pelo codebase: plugin por projeto em            */
-/* `.opencode/plugins/<dir>/index.js` (validado: 0 failed loads, sem   */
-/* tocar perfil global) — `.opencode/` é gitignored, nunca commitado.  */
+/* mc_report mas a tool pode não existir (global só tem dcp/ponytail/OMO). */
+/* Mecanismo usado pelo codebase: plugin por projeto em               */
+/* `.opencode/plugins/<dir>/index.js`. `.opencode/` é gitignored, nunca */
+/* commitado. RESSALVA (M10 comprovou): o runtime v2.2.5 NUNCA confirma */
+/* a carga — o loader loga `loading plugin` só para plugins globais    */
+/* (array `plugins` do config + `~/.config/opencode/plugins/*`);      */
+/* nenhum load de path de projeto aparece no histórico, nem mesmo após */
+/* restart com plugin válido ou quebrado (silêncio total), e o serve    */
+/* não expõe inventário de tools por sessão (`/experimental/tool/ids`  */
+/* 404; `/api/config` devolve documentos de config, sem ACK de tools). */
+/* Arquivo preparado ≠ plugin carregado: sem ACK, sem "garantido".     */
 /* ------------------------------------------------------------------ */
 
-/** Per-project plugin dir/file que o serve carrega sem tocar global. */
+/** Per-project plugin dir/file que o serve deveria carregar (sem ACK). */
 export const MC_SERVE_PLUGIN_DIR = '.opencode/plugins/mc-mission-control';
 export const MC_SERVE_PLUGIN_FILE = 'index.js';
+
+/**
+ * Limitação canônica do runtime (espelha OMO_RUNTIME_LIMITATION): o
+ * arquivo em `.opencode/plugins/` é PREPARADO pelo launcher, mas a carga
+ * pelo serve nunca é confirmada — sem ACK do serve, sem linha de load,
+ * sem inventário de tools. Preparado nunca prova carregado.
+ */
+export const SERVE_PLUGIN_RUNTIME_LIMITATION =
+  'plugin preparado mas carga não comprovada (sem ACK do serve)';
 
 export interface EnsureServePluginResult {
   ok: boolean;
   pluginPath?: string;
   /** Bundle copiado (dist) ou null quando ausente (fail-open com warn). */
   source?: string | null;
+  /**
+   * Carga pelo serve confirmada pelo runtime. Sempre false: v2.2.5 não
+   * expõe ACK (sem linha de load, sem inventário de tools por sessão).
+   */
+  loadAck: false;
   reason?: string;
 }
 
@@ -295,7 +316,7 @@ export async function ensureServePluginConfig(
           try {
             cpSync(absTarget, dotOpencode, { recursive: true, force: false });
           } catch {
-            // Best-effort: plugin abaixo ainda é garantido.
+            // Best-effort: o plugin ainda é preparado abaixo (carga segue sem ACK).
           }
         }
       }
@@ -307,7 +328,10 @@ export async function ensureServePluginConfig(
     try {
       const st = (await import('node:fs')).statSync(pluginPath);
       if (st.isFile() && st.size > 0) {
-        return { ok: true, pluginPath, source: 'cached' };
+        console.warn(
+          `[MC] serve plugin ${SERVE_PLUGIN_RUNTIME_LIMITATION} (arquivo já preparado em ${pluginPath}; preparado nunca prova carregado).`,
+        );
+        return { ok: true, pluginPath, loadAck: false, source: 'cached' };
       }
     } catch {}
     const bundle = resolveHostPluginBundle();
@@ -316,14 +340,17 @@ export async function ensureServePluginConfig(
         '[MC] serve plugin bundle (dist/index.js) não encontrado — worker segue sem mc_report/mc_status; ' +
           'gap renderiza como missing (distinto de invalid), sem bloquear merges.',
       );
-      return { ok: false, reason: 'bundle-not-found' };
+      return { ok: false, loadAck: false, reason: 'bundle-not-found' };
     }
     copyFileSync(bundle, pluginPath);
-    return { ok: true, pluginPath, source: bundle };
+    console.warn(
+      `[MC] serve plugin ${SERVE_PLUGIN_RUNTIME_LIMITATION} (arquivo preparado em ${pluginPath} a partir de ${bundle}; preparado nunca prova carregado).`,
+    );
+    return { ok: true, pluginPath, loadAck: false, source: bundle };
   } catch (error) {
     console.warn(
       `[MC] ensureServePluginConfig falhou (fail-open, gap explícito): ${error instanceof Error ? error.message : String(error)}`,
     );
-    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    return { ok: false, loadAck: false, reason: error instanceof Error ? error.message : String(error) };
   }
 }

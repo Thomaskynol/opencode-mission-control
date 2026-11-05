@@ -3,6 +3,7 @@ import { getRunningJobs, getJob, updateJob, resolveJobPassword, type Job } from 
 import { isPaneRunning, capturePane, captureExitStatus } from './tmux.js';
 import { loadConfig } from './config.js';
 import { readReport } from './reports.js';
+import { SERVE_PLUGIN_RUNTIME_LIMITATION } from './worktree-setup.js';
 import {
   QuestionRelay,
   type PermissionRequest,
@@ -996,7 +997,11 @@ export class JobMonitor extends EventEmitter {
    *   — gap "merged without mc_report" se merged.
    * - 'invalid': arquivo existe mas ilegível/malformado — ignorado, nunca
    *   Verified (distinto de missing).
-   * Logs distintos na primeira ocorrência por job (sem spam por poll).
+   * Em jobs serve-mode, missing/invalid levam a ressalva sem-ACK: o plugin
+   *   foi preparado mas a carga nunca é confirmada pelo runtime
+   *   (SERVE_PLUGIN_RUNTIME_LIMITATION) — causa plausível de o worker nunca
+   *   ter chamado mc_report. Logs distintos na primeira ocorrência por job
+   *   (sem spam por poll).
    */
   private reportGapLogged: Set<string> = new Set();
 
@@ -1014,6 +1019,10 @@ export class JobMonitor extends EventEmitter {
   private async checkAgentReport(
     job: Job,
   ): Promise<'completed' | 'reported' | 'missing' | 'invalid'> {
+    // Ressalva sem-ACK só em serve-mode: lá o plugin é preparado mas a
+    // carga nunca é confirmada — ausência/invalidade do report pode ser
+    // tool nunca carregada, não só worker silencioso.
+    const noAckSuffix = this.isServeModeJob(job) ? ` ${SERVE_PLUGIN_RUNTIME_LIMITATION}.` : '';
     try {
       const report = await readReport(job.id);
       if (!report) {
@@ -1023,7 +1032,7 @@ export class JobMonitor extends EventEmitter {
           if (!this.reportGapLogged.has(key)) {
             this.reportGapLogged.add(key);
             console.warn(
-              `[Monitor] Invalid/malformed mc_report file for job "${job.name}" (${job.id}) — exists but unreadable (parse failed); ignored, never Verified (distinct from missing).`,
+              `[Monitor] Invalid/malformed mc_report file for job "${job.name}" (${job.id}) — exists but unreadable (parse failed); ignored, never Verified (distinct from missing).${noAckSuffix}`,
             );
           }
           return 'invalid';
@@ -1032,7 +1041,7 @@ export class JobMonitor extends EventEmitter {
         if (!this.reportGapLogged.has(key)) {
           this.reportGapLogged.add(key);
           console.warn(
-            `[Monitor] No mc_report yet for job "${job.name}" (${job.id}) — missing (worker may lack plugin/tools or hasn't reported; distinct from invalid/malformed). Gap renders as "merged without mc_report" if merged.`,
+            `[Monitor] No mc_report yet for job "${job.name}" (${job.id}) — missing (worker may lack plugin/tools or hasn't reported; distinct from invalid/malformed). Gap renders as "merged without mc_report" if merged.${noAckSuffix}`,
           );
         }
         return 'missing';

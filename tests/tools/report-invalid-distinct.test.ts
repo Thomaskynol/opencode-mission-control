@@ -119,7 +119,74 @@ describe('report ausente vs inválida + worker com tool produz json', () => {
     const verified = lastMarkdown.split('## Verified')[1].split('## Gaps')[0];
     expect(verified).toContain('missing-job [merged, task-scoped]');
     expect(verified).toContain('bad-job [merged, task-scoped]');
-    // Gap inválido não duplica missing para o mesmo job.
-    expect(lastMarkdown).not.toMatch(/missing per-instance report for "bad-job"/);
+  });
+
+  it('serve merged sem report válido rende gap sem-ACK (1 por job); não-serve segue sem ressalva', async () => {
+    spyOn(planState, 'loadPlan').mockResolvedValue({
+      id: 'plan-s',
+      name: 'S',
+      mode: 'autopilot',
+      status: 'running',
+      jobs: [
+        planJob('serve-missing', 'merged'),
+        planJob('serve-bad', 'merged', 'job-serve-bad'),
+        planJob('tui-missing', 'merged'),
+      ],
+      integrationBranch: 'mc/integration-s',
+      baseCommit: 'abc',
+      createdAt: new Date().toISOString(),
+    } as any);
+    const serveState = (id: string, name: string) => ({
+      id, name, worktreePath: `/tmp/${name}`, branch: `mc/${name}`, tmuxTarget: 't',
+      placement: 'session', status: 'merged', prompt: 'p', mode: 'vanilla',
+      createdAt: new Date().toISOString(), port: 14301, serverUrl: 'http://127.0.0.1:14301',
+      remoteSessionID: `ses_${name}`,
+    });
+    spyOn(jobState, 'loadJobState').mockResolvedValue({
+      version: 3,
+      jobs: [
+        serveState('serve-missing-id', 'serve-missing'),
+        serveState('job-serve-bad', 'serve-bad'),
+        { id: 'tui-missing-id', name: 'tui-missing', worktreePath: '/tmp/t', branch: 'mc/tui-missing', tmuxTarget: 't', placement: 'session', status: 'merged', prompt: 'p', mode: 'vanilla', createdAt: new Date().toISOString() },
+      ],
+      updatedAt: new Date().toISOString(),
+    } as any);
+    // Sem evidência task-scoped: gaps puros de report (sem Verified por gate).
+    const dir = join(stateDir, '..', 'reports');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'job-serve-bad.json'), '{ bad json');
+    // serve-missing COM evidência task-scoped (Verified por gate) mas sem
+    // report: cobre o ramo missing genérico com sem-ACK. serve-bad e
+    // tui-missing sem evidência: ramos inválido e silencioso.
+    const COMMIT = '7762a1462fb1cf0b6b750dd37f126dd95fd9e989';
+    spyOn(durableState, 'loadRuntimeSnapshot').mockResolvedValue(null);
+    spyOn(durableState, 'loadMergeEvidence').mockResolvedValue({
+      'serve-missing': { jobName: 'serve-missing', testStatus: 'passed', scope: 'task', testCommand: 'bun test', reviewedCommit: COMMIT },
+    } as any);
+    spyOn(omo, 'detectOMO').mockResolvedValue({ detected: false } as any);
+    let lastMarkdown = '';
+    spyOn(reports, 'writeFinalReport').mockImplementation(async (_id: string, md: string) => {
+      lastMarkdown = md;
+      return '/tmp/final-s.md';
+    });
+
+    const result = await (mc_report_final.execute as any)({}, { sessionID: 't' }) as unknown as string;
+    // serve-missing verifica por gate mas segue com gap missing sem-ACK;
+    // serve-bad (inválido) + tui-missing (silencioso): 3 Unverified no total.
+    expect(result).toContain('Unverified: 3');
+    // serve missing: gap canônico + ressalva sem-ACK.
+    const serveMissingLine = lastMarkdown.split('\n').find((l) => l.includes('Unverified:') && l.includes('serve-missing')) ?? '';
+    expect(serveMissingLine).toContain('missing per-instance report');
+    expect(serveMissingLine).toContain('sem ACK do serve');
+    // serve inválida: gap distinto + ressalva sem-ACK, nunca Verified por si.
+    const serveBadLine = lastMarkdown.split('\n').find((l) => l.includes('serve-bad') && l.includes('invalid per-instance report')) ?? '';
+    expect(serveBadLine).toContain('distinct from missing mc_report');
+    expect(serveBadLine).toContain('sem ACK do serve');
+    const verified = lastMarkdown.split('## Verified')[1].split('## Gaps')[0];
+    expect(verified).not.toContain('serve-bad');
+    // não-serve missing sem evidência: gap silencioso canônico, sem ressalva.
+    const tuiLine = lastMarkdown.split('\n').find((l) => l.includes('Unverified:') && l.includes('tui-missing')) ?? '';
+    expect(tuiLine).toContain('sem evidência task-scoped, outcome not verified');
+    expect(tuiLine).not.toContain('sem ACK');
   });
 });

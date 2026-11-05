@@ -1,5 +1,6 @@
 import { join } from 'path';
 import { getDataDir } from './paths';
+import { SERVE_PLUGIN_RUNTIME_LIMITATION } from './worktree-setup';
 
 export type ReportStatus = 'working' | 'blocked' | 'needs_review' | 'completed' | 'progress' | 'paused';
 
@@ -333,6 +334,13 @@ export interface FinalReportInput {
   verified?: string[];
   unmet?: string[];
   unverified?: string[];
+  /**
+   * Merged jobs cujo report por instância está ausente E cujo plugin serve
+   * nunca teve a carga confirmada (sem ACK do runtime). As linhas de gap
+   * missing desses jobs levam a ressalva sem-ACK explícita — nunca
+   * "garantido". Opcional: ausente = comportamento anterior (gap puro).
+   */
+  pluginNoAckJobs?: string[];
   environment?: FinalReportEnvironmentLine[];
   limitations?: string[];
   nextSteps?: string[];
@@ -544,6 +552,19 @@ function finalReportLines(items: string[] | undefined, emptyNote: string): strin
 }
 
 /**
+ * Gap canônico para merged sem mc_report por instância. Com
+ * `pluginNoAck`, o job é serve-mode sem report válido (ausente ou
+ * inválido, ambos sem evidência de worker-declarado): a linha leva a
+ * ressalva sem-ACK — o plugin foi preparado mas a carga nunca foi
+ * confirmada pelo runtime. Mantém o prefixo canônico para as categorias
+ * (`describeGapCategories` conta "sem mc_report" do mesmo jeito).
+ */
+export function formatMissingReportGap(jobName: string, opts?: { pluginNoAck?: boolean }): string {
+  const base = `missing per-instance report for "${jobName}" (merged without mc_report)`;
+  return opts?.pluginNoAck ? `${base}; ${SERVE_PLUGIN_RUNTIME_LIMITATION}` : base;
+}
+
+/**
  * Pure builder for the standardized final report. Every required section is
  * always emitted (with an explicit placeholder when empty) so readers can
  * tell "not reported" apart from "reported empty". Verified facts and gaps
@@ -553,9 +574,10 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
   // Merged jobs with no mc_report contribution: named explicitly here and
   // under Gaps — never a clean Verified section next to a placeholder.
   const missingReports = missingContributionJobs(input);
+  const noAckSet = new Set(input.pluginNoAckJobs ?? []);
   const missingGapEntries = missingReports
     .filter((name) => !(input.unverified ?? []).some((entry) => entry.includes(name)))
-    .map((name) => `missing per-instance report for "${name}" (merged without mc_report)`);
+    .map((name) => formatMissingReportGap(name, { pluginNoAck: noAckSet.has(name) }));
   const lines: string[] = [
     `# Final Report: ${input.title}`,
     '',

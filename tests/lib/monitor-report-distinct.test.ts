@@ -150,4 +150,69 @@ describe('monitor distingue ausente vs inválida + poll serve consulta report', 
     await mon.poll();
     expect(spySub).not.toHaveBeenCalled();
   });
+
+  it('serve missing/inválida inclui sem-ACK; job não-serve não leva a ressalva', async () => {
+    const mon: any = new JobMonitor();
+    const orig = console.warn;
+    // missing em serve job: ressalva sem-ACK presente.
+    let warns: string[] = [];
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(' ')); };
+    try {
+      const out = await mon.checkAgentReport(serveJob({ id: 'job-ack-1', name: 'ack-job' }));
+      expect(out).toBe('missing');
+      expect(warns.some((w) => /sem ACK do serve/.test(w))).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+    // inválida em serve job: ressalva sem-ACK presente.
+    writeFileSync(
+      reportsFile('job-ack-2'),
+      '{ malformed {{{',
+    );
+    warns = [];
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(' ')); };
+    try {
+      const out2 = await mon.checkAgentReport(serveJob({ id: 'job-ack-2', name: 'ack-bad' }));
+      expect(out2).toBe('invalid');
+      expect(warns.some((w) => /sem ACK do serve/.test(w))).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+    // job sem port (não-serve): mesma distinção, sem ressalva sem-ACK.
+    const tui = serveJob({ id: 'job-tui-1', name: 'tui-job', port: undefined, serverUrl: undefined, remoteSessionID: undefined });
+    delete (tui as any).port;
+    warns = [];
+    console.warn = (...a: any[]) => { warns.push(a.map(String).join(' ')); };
+    try {
+      const out3 = await mon.checkAgentReport(tui);
+      expect(out3).toBe('missing');
+      expect(warns.some((w) => /No mc_report yet/.test(w))).toBe(true);
+      expect(warns.some((w) => /sem ACK do serve/.test(w))).toBe(false);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it('report válido associa job+sessão corretos (sem cross-talk entre jobs)', async () => {
+    const { writeReport } = reportsMod;
+    // Worker do job B reporta via mesmo sink do mc_report (writeReport direto).
+    await writeReport({
+      jobId: 'job-cross-b',
+      jobName: 'cross-b',
+      status: 'working',
+      message: 'wip b',
+      timestamp: new Date().toISOString(),
+    });
+    const mon: any = new JobMonitor();
+    const jobA = serveJob({ id: 'job-cross-a', name: 'cross-a' });
+    // Job A continua missing: report de B não vaza para A.
+    expect(await mon.checkAgentReport(jobA)).toBe('missing');
+    // Job B: reported, associado ao id correto, sem concluir job errado.
+    let agentJob: unknown = null;
+    mon.on('agent_report', (j: unknown) => { agentJob = j; });
+    const outB = await mon.checkAgentReport(serveJob({ id: 'job-cross-b', name: 'cross-b' }));
+    expect(outB).toBe('reported');
+    expect((agentJob as { id?: string })?.id).toBe('job-cross-b');
+    expect(mockUpdateJob).not.toHaveBeenCalledWith('job-cross-a', expect.anything());
+  });
 });

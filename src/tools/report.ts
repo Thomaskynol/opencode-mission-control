@@ -14,7 +14,11 @@ import {
   excludeAcceptedFromVerified,
   type ReportStatus,
 } from '../lib/reports';
-import { writeReport } from '../lib/reports';
+import {
+  writeReport,
+  formatMissingReportGap,
+} from '../lib/reports';
+import { SERVE_PLUGIN_RUNTIME_LIMITATION } from '../lib/worktree-setup';
 import { detectOMO } from '../lib/omo';
 import { join } from 'path';
 
@@ -58,8 +62,11 @@ export async function listInvalidReportJobIds(): Promise<string[]> {
 }
 
 /** Gap canônico para report inválido (malformado, ignorado, nunca Verified). */
-export function formatInvalidReportGap(jobName: string): string {
-  return `${jobName} [merged] — invalid per-instance report (malformed JSON, ignored; distinct from missing mc_report), outcome not verified`;
+export function formatInvalidReportGap(jobName: string, opts?: { serveMode?: boolean }): string {
+  const base = `${jobName} [merged] — invalid per-instance report (malformed JSON, ignored; distinct from missing mc_report), outcome not verified`;
+  // Serve-mode: o worker pode nunca ter tido a tool (carga sem ACK) —
+  // ressalva explícita, nunca "garantido".
+  return opts?.serveMode ? `${base}; ${SERVE_PLUGIN_RUNTIME_LIMITATION}` : base;
 }
 
 export const mc_report: ToolDefinition = tool({
@@ -230,8 +237,40 @@ export const mc_report_final: ToolDefinition = tool({
     const acceptGaps = [...acceptedByJob.entries()]
       .filter(([name]) => merged.includes(name) && !verifiedNames.has(name))
       .map(([name, actor]) => formatAcceptGap(name, actor));
+    // Serve-mode merged jobs (port + sessão remota, mesmo critério do
+    // fix-before-rollback): plugin preparado mas carga nunca confirmada —
+    // sem report válido, o gap leva a ressalva sem-ACK explícita.
+    const serveModeNames = new Set(
+      state.jobs
+        .filter((j) => (j.port ?? 0) > 0 && j.remoteSessionID)
+        .map((j) => j.name),
+    );
+    // Ausente vs inválida: malformado (arquivo existe, parse falha) rende
+    // gap distinto de missing, nunca Verified. Contém o job name para o
+    // filtro `entry.includes(name)` do markdown suprimir o missing duplicado.
+    // O gap inválido subsume o "sem evidência task-scoped" do mesmo job
+    // (ambos diriam outcome not verified) — 1 job, 1 gap.
+    const invalidNames: string[] = await (async () => {
+      try {
+        const invalidIds = await listInvalidReportJobIds();
+        if (invalidIds.length === 0) return [];
+        const idToName = new Map<string, string>();
+        for (const j of state.jobs) idToName.set(j.id, j.name);
+        for (const j of plan.jobs) {
+          const id = (j as { id?: string }).id;
+          if (id && !idToName.has(id)) idToName.set(id, j.name);
+        }
+        return [...new Set(
+          invalidIds
+            .map((id) => idToName.get(id) ?? id)
+            .filter((name) => merged.includes(name)),
+        )];
+      } catch {
+        return [];
+      }
+    })();
     const silentMergedGaps = merged
-      .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && trivialOf(name) === null)
+      .filter((name) => !verifiedNames.has(name) && !integrationNames.has(name) && !acceptedByJob.has(name) && trivialOf(name) === null && !invalidNames.includes(name))
       .map((name) => `${name} [merged] — sem evidência task-scoped, outcome not verified`);
     const unmet = plan.jobs
       .filter((job) => job.status === 'failed' || job.status === 'conflict' || job.status === 'needs_rebase' || job.status === 'canceled')
@@ -258,7 +297,7 @@ export const mc_report_final: ToolDefinition = tool({
     } catch {
       pendingGaps = [];
     }
-    const unverified = [
+    const unverifiedBase = [
       ...plan.jobs
         .filter((job) => job.status !== 'merged')
         .filter((job) => !unmet.some((entry) => entry.startsWith(`${job.name} `)))
@@ -267,29 +306,7 @@ export const mc_report_final: ToolDefinition = tool({
       ...trivialGaps.map((entry) => `${entry}`),
       ...acceptGaps,
       ...silentMergedGaps,
-      // Ausente vs inválida: malformado (arquivo existe, parse falha) rende
-      // gap distinto de missing, nunca Verified. Contém o job name para o
-      // filtro `entry.includes(name)` do markdown suprimir o missing duplicado.
-      ...(await (async () => {
-        try {
-          const invalidIds = await listInvalidReportJobIds();
-          if (invalidIds.length === 0) return [];
-          const idToName = new Map<string, string>();
-          for (const j of state.jobs) idToName.set(j.id, j.name);
-          for (const j of plan.jobs) {
-            const id = (j as { id?: string }).id;
-            if (id && !idToName.has(id)) idToName.set(id, j.name);
-          }
-          const invalidNames = [...new Set(
-            invalidIds
-              .map((id) => idToName.get(id) ?? id)
-              .filter((name) => merged.includes(name)),
-          )];
-          return invalidNames.map((name) => formatInvalidReportGap(name));
-        } catch {
-          return [];
-        }
-      })()),
+      ...invalidNames.map((name) => formatInvalidReportGap(name, { serveMode: serveModeNames.has(name) })),
       ...pendingGaps,
     ];
     // M8: merged sem mc_report entram no total do header com o texto canônico
@@ -298,12 +315,20 @@ export const mc_report_final: ToolDefinition = tool({
     // (Só contagem aqui: `unverified` passado ao markdown fica inalterado
     // para não duplicar Problems derivados.)
     const haveReports = new Set(reports.map((report) => report.jobName));
+    // Serve sem report válido (ausente ou inválido): o gap que nomear o job
+    // leva a ressalva sem-ACK (carga nunca confirmada). 1 job, 1 gap.
+    const serveNoReport = (name: string) =>
+      serveModeNames.has(name) && (!haveReports.has(name) || invalidNames.includes(name));
+    const unverified = unverifiedBase.map((entry) => {
+      const hit = merged.find((name) => serveNoReport(name) && entry.includes(name) && !entry.includes('sem ACK'));
+      return hit ? `${entry}; ${SERVE_PLUGIN_RUNTIME_LIMITATION}` : entry;
+    });
     const missingReportNames = merged
       .filter((name) => !haveReports.has(name))
       .filter((name) => !unverified.some((entry) => entry.includes(name)));
     const unverifiedForCount = [
       ...unverified,
-      ...missingReportNames.map((name) => `missing per-instance report for "${name}" (merged without mc_report)`),
+      ...missingReportNames.map((name) => formatMissingReportGap(name, { pluginNoAck: serveModeNames.has(name) })),
     ];
     const unverifiedTotal = unverifiedForCount.length;
     const gapDetail = describeGapCategories(unverifiedForCount);
@@ -501,6 +526,9 @@ export const mc_report_final: ToolDefinition = tool({
       verified,
       unmet,
       unverified,
+      // Serve sem report válido (ausente ou inválido): o gap missing do
+      // markdown leva a ressalva sem-ACK (carga nunca confirmada).
+      pluginNoAckJobs: merged.filter((name) => serveNoReport(name)),
       environment,
       limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine, autoFixLine, fixRollbackLine, permissionLogLine, '--actor human é auto-declaração não verificada (origem não comprovada; humano necessário nunca simulado pelo agente — --actor human não comprova humano)'],
       nextSteps: unverified.length > 0 || unmet.length > 0
