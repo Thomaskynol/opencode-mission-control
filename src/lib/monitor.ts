@@ -987,11 +987,55 @@ export class JobMonitor extends EventEmitter {
     return job.port !== undefined && job.port > 0;
   }
 
-  private async checkAgentReport(job: Job): Promise<boolean> {
+  /**
+   * Distingue ausente vs inválida (antes: false silencioso para ambos).
+   * - 'completed': report válido terminal (completed/needs_review) — job
+   *   concluído aqui, sem inventar evidência.
+   * - 'reported': report válido não-terminal (working/blocked/progress).
+   * - 'missing': sem arquivo (worker sem tool/plugin ou ainda não reportou)
+   *   — gap "merged without mc_report" se merged.
+   * - 'invalid': arquivo existe mas ilegível/malformado — ignorado, nunca
+   *   Verified (distinto de missing).
+   * Logs distintos na primeira ocorrência por job (sem spam por poll).
+   */
+  private reportGapLogged: Set<string> = new Set();
+
+  private async reportFileExists(jobId: string): Promise<boolean> {
+    try {
+      const { getDataDir } = await import('./paths.js');
+      const dataDir = await getDataDir();
+      const filePath = join(dataDir, '..', 'reports', `${jobId}.json`);
+      return await Bun.file(filePath).exists();
+    } catch {
+      return false;
+    }
+  }
+
+  private async checkAgentReport(
+    job: Job,
+  ): Promise<'completed' | 'reported' | 'missing' | 'invalid'> {
     try {
       const report = await readReport(job.id);
       if (!report) {
-        return false;
+        const exists = await this.reportFileExists(job.id);
+        if (exists) {
+          const key = `invalid:${job.id}`;
+          if (!this.reportGapLogged.has(key)) {
+            this.reportGapLogged.add(key);
+            console.warn(
+              `[Monitor] Invalid/malformed mc_report file for job "${job.name}" (${job.id}) — exists but unreadable (parse failed); ignored, never Verified (distinct from missing).`,
+            );
+          }
+          return 'invalid';
+        }
+        const key = `missing:${job.id}`;
+        if (!this.reportGapLogged.has(key)) {
+          this.reportGapLogged.add(key);
+          console.warn(
+            `[Monitor] No mc_report yet for job "${job.name}" (${job.id}) — missing (worker may lack plugin/tools or hasn't reported; distinct from invalid/malformed). Gap renders as "merged without mc_report" if merged.`,
+          );
+        }
+        return 'missing';
       }
 
       this.emit('agent_report', job, report);
@@ -1005,15 +1049,21 @@ export class JobMonitor extends EventEmitter {
         if (report.status === 'needs_review') {
           this.emit('needs_review', { ...job, status: 'completed', completedAt: now }, report);
         }
-        return true;
+        return 'completed';
       } else if (report.status === 'blocked') {
         this.emit('blocked', job, report);
       }
 
-      return false;
+      return 'reported';
     } catch {
-      // Non-fatal: report read failures should not disrupt monitoring
-      return false;
+      // Non-fatal: report read failures should not disrupt monitoring.
+      // Distingue no retorno: existência sugere invalid, ausência sugere missing.
+      try {
+        const exists = await this.reportFileExists(job.id);
+        return exists ? 'invalid' : 'missing';
+      } catch {
+        return 'missing';
+      }
     }
   }
 
@@ -1031,10 +1081,24 @@ export class JobMonitor extends EventEmitter {
         this.awaitingInputNotified.delete(id);
       }
     }
+    for (const key of [...this.reportGapLogged]) {
+      const id = key.split(':').slice(1).join(':');
+      if (!activeJobIds.has(id)) {
+        this.reportGapLogged.delete(key);
+      }
+    }
 
     for (const job of jobs) {
       try {
         if (this.isServeModeJob(job)) {
+          // Serve também consulta mc_report a cada poll (antes: nunca
+          // chamava checkAgentReport e concluía só por SSE idle). Report
+          // terminal conclui aqui; missing/invalid seguem para SSE sem
+          // inventar evidência (gap explícito no final).
+          const outcome = await this.checkAgentReport(job);
+          if (outcome === 'completed') {
+            continue;
+          }
           await this.subscribeToSSE(job);
           continue;
         }
@@ -1068,8 +1132,8 @@ export class JobMonitor extends EventEmitter {
           continue;
         }
 
-        const reportHandled = await this.checkAgentReport(job);
-        if (reportHandled) continue;
+        const outcome = await this.checkAgentReport(job);
+        if (outcome === 'completed') continue;
 
         const output = await capturePane(job.tmuxTarget, 50);
         const state = detectSessionState(output);

@@ -16,6 +16,51 @@ import {
 } from '../lib/reports';
 import { writeReport } from '../lib/reports';
 import { detectOMO } from '../lib/omo';
+import { join } from 'path';
+
+/**
+ * Distinção ausente vs inválida (sem inventar report, sem tocar categorias).
+ * - ausente: sem arquivo `<jobId>.json` (worker sem tool/plugin ou ainda não
+ *   reportou) → gap "merged without mc_report".
+ * - inválida: arquivo existe mas JSON malformado (parse falha) → ignorado,
+ *   nunca Verified, gap distinto de ausente.
+ * `readAllReports` (lib) pula malformados silenciosamente; aqui listamos os
+ * malformados para o gap explícito distinto (motivo diferente de missing).
+ */
+export async function listInvalidReportJobIds(): Promise<string[]> {
+  try {
+    const { getDataDir } = await import('../lib/paths');
+    const dataDir = await getDataDir();
+    const reportsDir = join(dataDir, '..', 'reports');
+    const fs = await import('fs');
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(reportsDir);
+    } catch {
+      return [];
+    }
+    const invalid: string[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.json') || entry.endsWith('.tmp')) continue;
+      if (entry.startsWith('final-')) continue;
+      const jobId = entry.slice(0, -'.json'.length);
+      try {
+        const text = fs.readFileSync(join(reportsDir, entry), 'utf-8');
+        JSON.parse(text);
+      } catch {
+        invalid.push(jobId);
+      }
+    }
+    return invalid;
+  } catch {
+    return [];
+  }
+}
+
+/** Gap canônico para report inválido (malformado, ignorado, nunca Verified). */
+export function formatInvalidReportGap(jobName: string): string {
+  return `${jobName} [merged] — invalid per-instance report (malformed JSON, ignored; distinct from missing mc_report), outcome not verified`;
+}
 
 export const mc_report: ToolDefinition = tool({
   description:
@@ -222,6 +267,29 @@ export const mc_report_final: ToolDefinition = tool({
       ...trivialGaps.map((entry) => `${entry}`),
       ...acceptGaps,
       ...silentMergedGaps,
+      // Ausente vs inválida: malformado (arquivo existe, parse falha) rende
+      // gap distinto de missing, nunca Verified. Contém o job name para o
+      // filtro `entry.includes(name)` do markdown suprimir o missing duplicado.
+      ...(await (async () => {
+        try {
+          const invalidIds = await listInvalidReportJobIds();
+          if (invalidIds.length === 0) return [];
+          const idToName = new Map<string, string>();
+          for (const j of state.jobs) idToName.set(j.id, j.name);
+          for (const j of plan.jobs) {
+            const id = (j as { id?: string }).id;
+            if (id && !idToName.has(id)) idToName.set(id, j.name);
+          }
+          const invalidNames = [...new Set(
+            invalidIds
+              .map((id) => idToName.get(id) ?? id)
+              .filter((name) => merged.includes(name)),
+          )];
+          return invalidNames.map((name) => formatInvalidReportGap(name));
+        } catch {
+          return [];
+        }
+      })()),
       ...pendingGaps,
     ];
     // M8: merged sem mc_report entram no total do header com o texto canônico

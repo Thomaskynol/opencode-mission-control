@@ -433,6 +433,18 @@ export async function launchWorkerViaServe(
       '[MC] Refusing serve launch: session permissions are required (allow-inside worktree ruleset) — launch without them would run unscoped.',
     );
   }
+  // Plugin por projeto (defesa em profundidade): o launcher já garante via
+  // writeServeLauncherScript ANTES do serve subir; aqui re-garante de forma
+  // idempotente para chamadas diretas (o serve recarrega via watcher).
+  // Fail-open: nunca bloqueia o launch por plugin — gap explícito no monitor.
+  try {
+    const { ensureServePluginConfig } = await import('./worktree-setup.js');
+    await ensureServePluginConfig(input.worktree);
+  } catch (error) {
+    console.warn(
+      `[MC] serve plugin ensure (launchWorkerViaServe) falhou (fail-open): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const body: V2CreateSessionBody = {
     ...(input.profile?.agent !== undefined ? { agent: input.profile.agent } : {}),
     ...(input.model ? { model: { ...input.model } } : {}),

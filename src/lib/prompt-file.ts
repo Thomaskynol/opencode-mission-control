@@ -124,6 +124,18 @@ export async function writeServeLauncherScript(
     : '';
   const script = `#!/bin/bash\n${envLine}exec ${opencodeBin} serve --port ${port} --hostname 127.0.0.1\n`;
   await writeFile(launcherPath, script, { mode: 0o755 });
+  // Plugin por projeto ANTES do serve subir: o serve carrega
+  // `.opencode/plugins/mc-mission-control/index.js` no boot (0 failed loads,
+  // sem tocar perfil global). Fail-open: bundle ausente vira gap missing
+  // explícito no monitor/final (distinto de invalid), sem bloquear o launch.
+  try {
+    const { ensureServePluginConfig } = await import('./worktree-setup.js');
+    await ensureServePluginConfig(worktreePath);
+  } catch (error) {
+    console.warn(
+      `[MC] serve plugin ensure falhou (fail-open): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   return launcherPath;
 }
 

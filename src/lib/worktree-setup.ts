@@ -1,7 +1,8 @@
 import type { PostCreateHook } from './providers/worktree-provider';
 import type { WorktreeSetup } from './config';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export type CommandValidationResult = {
   safe: boolean;
@@ -189,4 +190,140 @@ export function resolvePostCreateHook(
   }
 
   return hook;
+}
+
+/* ------------------------------------------------------------------ */
+/* Serve worker plugin (mc_report/mc_status no serve).                 */
+/* O serve (`opencode serve --port`, cwd=worktree) só expõe tools do   */
+/* plugin carregado no projeto. Sem plugin no worktree, o prompt exige */
+/* mc_report mas a tool não existe (global só tem dcp/ponytail/OMO).   */
+/* Mecanismo já usado pelo codebase: plugin por projeto em            */
+/* `.opencode/plugins/<dir>/index.js` (validado: 0 failed loads, sem   */
+/* tocar perfil global) — `.opencode/` é gitignored, nunca commitado.  */
+/* ------------------------------------------------------------------ */
+
+/** Per-project plugin dir/file que o serve carrega sem tocar global. */
+export const MC_SERVE_PLUGIN_DIR = '.opencode/plugins/mc-mission-control';
+export const MC_SERVE_PLUGIN_FILE = 'index.js';
+
+export interface EnsureServePluginResult {
+  ok: boolean;
+  pluginPath?: string;
+  /** Bundle copiado (dist) ou null quando ausente (fail-open com warn). */
+  source?: string | null;
+  reason?: string;
+}
+
+/**
+ * Localiza o bundle do plugin (dist/index.js) sem reinventar resolução:
+ * - self quando já roda do bundle (dist/index.js);
+ * - ../../dist/index.js a partir de src/lib (dev/bun test);
+ * - ./dist/index.js a partir do cwd (repo root);
+ * - walk-up até package.json `opencode-mission-control` + dist/index.js.
+ * Retorna null quando não há bundle (fail-open: warn, gap explícito).
+ */
+export function resolveHostPluginBundle(): string | null {
+  const candidates: string[] = [];
+  try {
+    const self = fileURLToPath(import.meta.url);
+    // Self é o bundle quando termina em dist/index.js.
+    if (self.endsWith('dist/index.js') && existsSync(self)) return self;
+    candidates.push(join(dirname(self), '..', '..', 'dist', 'index.js'));
+  } catch {}
+  try {
+    candidates.push(join(process.cwd(), 'dist', 'index.js'));
+  } catch {}
+  // Walk-up: encontra a raiz do pacote e checa dist/index.js lá.
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 6; i++) {
+      const pkg = join(dir, 'package.json');
+      try {
+        if (existsSync(pkg)) {
+          const raw = readFileSync(pkg, 'utf-8');
+          if (raw.includes('"opencode-mission-control"')) {
+            const dist = join(dir, 'dist', 'index.js');
+            candidates.push(dist);
+            break;
+          }
+        }
+      } catch {}
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {}
+  for (const c of candidates) {
+    try {
+      if (c && existsSync(c)) return c;
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Garante `.opencode/plugins/mc-mission-control/index.js` no worktree.
+ * Idempotente; fail-open (nunca throw por plugin ausente — o monitor
+ * registra o gap como missing distinto de invalid, sem bloquear merges).
+ * Se `.opencode` for symlink (herdado do main), converte em dir real com
+ * cópia do conteúdo + plugin (não polui o main; `.opencode/` é ignored).
+ */
+export async function ensureServePluginConfig(
+  worktreePath: string,
+): Promise<EnsureServePluginResult> {
+  const { lstatSync, mkdirSync, readlinkSync, unlinkSync, cpSync, copyFileSync } = await import('node:fs');
+  const pluginDir = join(worktreePath, MC_SERVE_PLUGIN_DIR);
+  const pluginPath = join(pluginDir, MC_SERVE_PLUGIN_FILE);
+  try {
+    const dotOpencode = join(worktreePath, '.opencode');
+    try {
+      const st = lstatSync(dotOpencode);
+      if (st.isSymbolicLink()) {
+        let target: string | null = null;
+        try {
+          target = readlinkSync(dotOpencode);
+        } catch {
+          target = null;
+        }
+        // Resolve relativo ao worktree quando necessário.
+        const absTarget = target
+          ? (target.startsWith('/') ? target : join(worktreePath, target))
+          : null;
+        unlinkSync(dotOpencode);
+        mkdirSync(dotOpencode, { recursive: true });
+        if (absTarget && existsSync(absTarget)) {
+          try {
+            cpSync(absTarget, dotOpencode, { recursive: true, force: false });
+          } catch {
+            // Best-effort: plugin abaixo ainda é garantido.
+          }
+        }
+      }
+    } catch {
+      // Sem .opencode: segue para mkdir.
+    }
+    mkdirSync(pluginDir, { recursive: true });
+    // Idempotente: bundle já materializado com tamanho > 0.
+    try {
+      const st = (await import('node:fs')).statSync(pluginPath);
+      if (st.isFile() && st.size > 0) {
+        return { ok: true, pluginPath, source: 'cached' };
+      }
+    } catch {}
+    const bundle = resolveHostPluginBundle();
+    if (!bundle) {
+      console.warn(
+        '[MC] serve plugin bundle (dist/index.js) não encontrado — worker segue sem mc_report/mc_status; ' +
+          'gap renderiza como missing (distinto de invalid), sem bloquear merges.',
+      );
+      return { ok: false, reason: 'bundle-not-found' };
+    }
+    copyFileSync(bundle, pluginPath);
+    return { ok: true, pluginPath, source: bundle };
+  } catch (error) {
+    console.warn(
+      `[MC] ensureServePluginConfig falhou (fail-open, gap explícito): ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
 }
