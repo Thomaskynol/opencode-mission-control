@@ -461,7 +461,7 @@ function isPathLikeAnchor(anchor: string): boolean {
   const s = anchor.trim();
   if (s.includes('/') || s.includes('\\')) return true;
   if (/\.test\.|\.spec\.|__tests__/.test(s)) return true;
-  if (/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|c|cpp|h|rb|php)$/i.test(s)) return true;
+  if (/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|c|cpp|h|rb|php|md|markdown|mdx|txt|rst|adoc)$/i.test(s)) return true;
   return false;
 }
 
@@ -477,7 +477,13 @@ function extractRequiredLiterals(text: string): string[] {
     .replace(/\b\d+\s+(test\s+)?cases?\b/gi, ' ')
     .replace(/\b\d+\s+tests?\b/gi, ' ')
     .replace(/\b\d+\s+asserts?\b/gi, ' ')
-    .replace(/\b(at least|at most|minimum|maximum|exactly)\s+\d+\b/gi, (m) => m.replace(/\d+/g, ' '));
+    .replace(/\b(at least|at most|minimum|maximum|exactly)\s+\d+\b/gi, (m) => m.replace(/\d+/g, ' '))
+    // Runner exit codes ("exit 0", "exit code 1") are execution shape, never
+    // domain values to assert. Strip them so a correct delivery without a
+    // literal 0 is not forced to assert it. Genuine values
+    // (`total([1,2])===3`, quoted literals, booleans) are unaffected — they
+    // never sit in an exit-phrase.
+    .replace(/\bexit(?:\s+code)?\s+\d+\b/gi, ' ');
   const nums = withoutCounts.match(/\b\d+(?:\.\d+)?\b/g) ?? [];
   const bools = (text.match(/\b(true|false|null|undefined)\b/gi) ?? []).map((s) => s.toLowerCase());
   const quoted: string[] = [];
@@ -1074,16 +1080,20 @@ export function assessFunctionalCoverage(
   // only fail when the file is absent from scope. When present, fall through
   // to the normal judgment (code-ref with bound assertion / behavioural),
   // which alone decides coverage.
-  // shortcut: exact/suffix/dir-prefix match on the whole anchor OR any
-  // embedded path token — upgrade if anchors need globs.
+  // shortcut: exact/suffix/dir-prefix match on the embedded path token when
+  // present, else the whole anchor (exact file anchors) — upgrade if anchors
+  // need globs.
   if (requirement.testAnchors.length > 0 && requirement.testAnchors.every(isPathLikeAnchor)) {
     const unresolved = requirement.testAnchors.filter((a) => {
       const t = a.trim();
       // Auto-generated criteria embed the file in a prose line ("X covered
-      // in f.test.mjs"): extract path-looking substrings (token ending in a
-      // source extension, with or without directory) and match ANY of them.
-      const embedded = [...t.matchAll(/[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.(mjs|cjs|mts|cts|tsx|ts|jsx|js|cpp|c|h|py|go|rs|java|rb|php)\b/g)].map((m) => m[0]);
-      return ![t, ...embedded].some((c) =>
+      // in f.test.mjs", "docs/index.md exists with stamp"): extract
+      // path-looking substrings (token ending in a source or docs extension,
+      // with or without directory) and match ANY of them. When an embedded
+      // path exists it decides — the whole prose sentence is never a path.
+      const embedded = [...t.matchAll(/[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.(mjs|cjs|mts|cts|tsx|ts|jsx|js|cpp|c|h|py|go|rs|java|rb|php|md|markdown|mdx|txt|rst|adoc)\b/g)].map((m) => m[0]);
+      const candidates = embedded.length > 0 ? embedded : [t];
+      return !candidates.some((c) =>
         paths.some((p) => p === c || p.endsWith(`/${c}`) || p.startsWith(c.endsWith('/') ? c : `${c}/`)),
       );
     });
