@@ -6,6 +6,35 @@ export interface OMOStatus {
   detected: boolean;
   configSource: 'local' | 'global' | null;
   sisyphusPath: string | null;
+  /**
+   * Carregado segue sempre 'unknown': o runtime não expõe GET /config nem
+   * inventário de plugins por sessão — config detectada não prova carregado.
+   */
+  loaded: 'unknown';
+  /**
+   * Utilizado segue sempre false: detecção nunca é uso (sem
+   * messages[].agent por worker, load por sessão segue desconhecido).
+   */
+  used: false;
+}
+
+/**
+ * Limitação canônica do runtime: disponibilidade vem de config (detectOMO),
+ * mas carregado por sessão segue desconhecido — o runtime não expõe
+ * GET /config nem messages[].agent por worker. Informe, não invente.
+ */
+export const OMO_RUNTIME_LIMITATION =
+  'OMO load por sessão segue desconhecido: runtime sem GET /config nem messages[].agent por worker — detecção (config) nunca prova carregado nem utilizado.';
+
+/**
+ * Linha canônica disponível/carregado/utilizado a partir de um OMOStatus.
+ * Detecção (config) ≠ carregado (sem evidência runtime) ≠ utilizado (não).
+ */
+export function describeOmoAvailability(status: OMOStatus): string {
+  const available = status.detected
+    ? `detectado em config ${status.configSource ?? 'unknown'}`
+    : 'não detectado';
+  return `OMO (disponível: ${available}; carregado: sem evidência runtime; utilizado: não — detection is not use).`;
 }
 
 /**
@@ -26,6 +55,8 @@ export async function detectOMO(
       detected: true,
       configSource: 'local',
       sisyphusPath: await getSisyphusPath(basePath),
+      loaded: 'unknown',
+      used: false,
     };
   }
 
@@ -36,6 +67,8 @@ export async function detectOMO(
       detected: true,
       configSource: 'global',
       sisyphusPath: await getSisyphusPath(basePath),
+      loaded: 'unknown',
+      used: false,
     };
   }
 
@@ -43,6 +76,8 @@ export async function detectOMO(
     detected: false,
     configSource: null,
     sisyphusPath: null,
+    loaded: 'unknown',
+    used: false,
   };
 }
 

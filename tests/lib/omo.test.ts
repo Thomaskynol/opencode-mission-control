@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { detectOMO } from '../../src/lib/omo';
+import { detectOMO, describeOmoAvailability, OMO_RUNTIME_LIMITATION } from '../../src/lib/omo';
 import { mkdirSync, rmSync } from 'fs';
 
 describe('OMO Detector', () => {
@@ -167,5 +167,69 @@ describe('OMO Detector', () => {
 
     expect(status.detected).toBe(true);
     expect(status.sisyphusPath).toBe('sub/.sisyphus');
+  });
+
+  it('should detect real global config shape (plugins plural + slim@version + default_agent + JSONC + http URL)', async () => {
+    // Replica fiel de ~/.config/opencode/opencode.json (somente leitura):
+    // chave "plugins" no plural, pin "@3.0.4", sufixo -slim, default_agent
+    // orchestrator, comentários JSONC e baseURL com http:// (não é comentário).
+    await Bun.write(
+      './opencode.json',
+      `{
+  "$schema": "https://opencode.ai/config.json",
+  // Local plugins are auto-discovered from ./plugins/
+  "plugins": [
+    "@tarquinen/opencode-dcp@3.2.0",
+    "@dietrichgebert/ponytail@5.3.2",
+    "oh-my-opencode-slim@3.0.4",
+  ],
+  // v2: pin the agent used when no session agent is selected
+  "default_agent": "orchestrator",
+  "provider": { "llamacpp": { "options": { "baseURL": "http://127.0.0.1:8080/v1" } } },
+}`,
+    );
+
+    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+
+    expect(status.detected).toBe(true);
+    expect(status.configSource).toBe('local');
+    expect(status.loaded).toBe('unknown');
+    expect(status.used).toBe(false);
+  });
+
+  it('should reject real absence (plugins plural sem OMO)', async () => {
+    await Bun.write(
+      './opencode.json',
+      JSON.stringify({
+        plugins: ['@tarquinen/opencode-dcp@3.2.0', 'opencode-mission-control'],
+        default_agent: 'orchestrator',
+      }),
+    );
+
+    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+
+    expect(status.detected).toBe(false);
+    expect(status.configSource).toBeNull();
+    expect(status.loaded).toBe('unknown');
+    expect(status.used).toBe(false);
+  });
+
+  it('should describe disponível/carregado/utilizado without claiming load or use', async () => {
+    await Bun.write('./opencode.json', JSON.stringify({ plugins: ['oh-my-opencode-slim@3.0.4'] }));
+    const found = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const missing = await detectOMO('./missing.json', '/nonexistent/global.json');
+
+    const foundLine = describeOmoAvailability(found);
+    expect(foundLine).toContain('disponível: detectado');
+    expect(foundLine).toContain('carregado: sem evidência runtime');
+    expect(foundLine).toContain('utilizado: não');
+
+    const missingLine = describeOmoAvailability(missing);
+    expect(missingLine).toContain('disponível: não detectado');
+    expect(missingLine).toContain('carregado: sem evidência runtime');
+    expect(missingLine).toContain('utilizado: não');
+
+    expect(OMO_RUNTIME_LIMITATION).toContain('GET /config');
+    expect(OMO_RUNTIME_LIMITATION).toContain('messages[].agent');
   });
 });
