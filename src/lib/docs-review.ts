@@ -206,10 +206,25 @@ const PT_NEGATED_VERB_RE =
   /\bn[ãa]o\b[^.!?\n]{0,120}\b(explica|explicam|explicar|explicado|explicada|cobre|cobrem|cobrir|coberto|coberta|descreve|descrevem|descrever|descrito|descrita|documenta|documentam|documentar|documentado|detalha|detalham|detalhar|detalhado|detalhada|inclui|incluem|incluir|inclu[íi]do|inclu[íi]da|cont[ée]m|conter|contido|aborda|abordam|abordar|abordado|apresenta|apresentam|apresentar|apresentado|ensina|ensinam|ensinar|mostra|mostram|mostrar|traz|trazem|trazer)\b/i;
 
 // Placeholders void the doc wherever they appear (general list, EN+PT).
-// `todo` excludes the test-counter shape (`todo 0` in `node --test` summary
-// output pasted into docs) — a bare `TODO:`/`[TODO]`/lone `todo` still voids.
+// `todo` is also a common PT quantifier ("todo artefato" = every artifact),
+// so a bare lowercase `todo` only voids with an explicit marker or in
+// all-caps (see hasTodoPlaceholder below); `todo 0` counters (past
+// `node --test` output) never void — same guard as before.
 const GLOBAL_PLACEHOLDER_RE =
-  /\b(todo(?!\s+\d)|tbd|t\.b\.d\.|fixme|xxx|placeholder|lorem\s+ipsum|under\s+construction|coming\s+soon|to\s+be\s+written|work\s+in\s+progress|not\s+yet\s+written|a\s+ser\s+definido|a\s+definir|por\s+definir|em\s+constru[çc][ãa]o|em\s+breve|pendente|rascunho|por\s+fazer)\b/i;
+  /\b(tbd|t\.b\.d\.|fixme|xxx|placeholder|lorem\s+ipsum|under\s+construction|coming\s+soon|to\s+be\s+written|work\s+in\s+progress|not\s+yet\s+written|a\s+ser\s+definido|a\s+definir|por\s+definir|em\s+constru[çc][ãa]o|em\s+breve|pendente|rascunho|por\s+fazer)\b/i;
+
+// PT `todo` (= every) collides with the EN placeholder: only an explicit
+// marker (`TODO:`, `[TODO]`, lone `todo` line) or all-caps counts.
+// shortcut: marker heuristic — upgrade to a semantic check if EN lowercase
+// prose ("todo items left") is ever missed as a placeholder.
+const TODO_BARE_RE = /\bTODO(?!\s+\d)\b/;
+const TODO_MARKER_RE = /\[todo\]|todo\s*:/i;
+function hasTodoPlaceholder(sentence: string): boolean {
+  if (TODO_BARE_RE.test(sentence)) return true;
+  if (TODO_MARKER_RE.test(sentence)) return true;
+  if (/^\s*todo\s*$/.test(sentence)) return true;
+  return false;
+}
 
 // Futility about the instructions themselves (general, EN+PT): nobody can use
 // them, no/ missing instructions, out of scope — the doc disclaims its own utility.
@@ -234,14 +249,67 @@ const PROCEDURAL_VERB_SRC =
 const PROCEDURAL_VERB_RE = new RegExp(`(?<![${WORD_CH}])(?:${PROCEDURAL_VERB_SRC})(?![${WORD_CH}])`, 'i');
 
 // General denial/disclaimer markers (EN+PT classes, never example phrases):
-// negation (not/n't/no/never/.../não/nunca/jamais...), absence (without/missing/
-// lacking/absent/sem/falta/fora/ausente...) and exclusion (except/outside/fora
-// de/out of...). Used only together with criterion overlap + no instruction in
-// the same sentence, so "without downtime, run..." (with instruction) still passes.
+// negation (not/n't/no-frame/never/.../não/nunca/jamais...), absence
+// (without/missing/lacking/absent/excluded/sem-meta/falta/fora/ausente...) and
+// exclusion (except/outside/fora de/out of...). Bare `no` (PT `em+o`: "no
+// lugar", "no guia") and bare `sem` (PT "sem espaços") are NOT markers —
+// they only deny in the strict frames below. Used only together with
+// criterion overlap + no instruction in the same sentence, so "without
+// downtime, run..." (with instruction) still passes.
 const DENIAL_MARKER_RE = new RegExp(
-  `(?:(?<![${WORD_CH}])(?:not|no|never|neither|nor|without|missing|lacking|absent|excluded|outside|except|fails?|failed|denied|denies|void|n[ãa]o|nunca|jamais|sem|ausentes?|falta|faltando|faltam|fora|exclu[íi]dos?|nada)(?![${WORD_CH}])|n\\'t(?![${WORD_CH}])|(?<![${WORD_CH}])fora\\s+de(?![${WORD_CH}])|(?<![${WORD_CH}])out\\s+of(?![${WORD_CH}]))`,
+  `(?:(?<![${WORD_CH}])(?:not|never|neither|nor|without|missing|lacking|absent|excluded|outside|except|fails?|failed|denied|denies|void|n[ãa]o|nunca|jamais|ausentes?|falta|faltando|faltam|fora|exclu[íi]dos?|nada)(?![${WORD_CH}])|n\\'t(?![${WORD_CH}])|(?<![${WORD_CH}])fora\\s+de(?![${WORD_CH}])|(?<![${WORD_CH}])out\\s+of(?![${WORD_CH}]))`,
   'i',
 );
+
+// Strict frames for the weak markers (PT collisions above):
+// - `sem` only before meta/coverage nouns ("sem cobertura", "sem
+//   documentação"); "sem espaços" (domain noun) is description, not denial.
+//   (`sem instruções|detalhes` already void globally via futility.)
+// - `no` only in an EN frame (sentence-initial or existential/have/with +
+//   `no`: "There is no X", "has no X") directly governing the criterion.
+// shortcut: frame/meta-noun heuristics — extend if real denials are missed.
+const SEM_META_RE =
+  /\bsem\b\s+(?:nenhum(?:a|es)?|algum(?:a)?|qualquer|uma?|de\s+)?(?:instru[çc][oõ]es?|detalhes?|cobertura|documenta[çc][aã]o|explica[çc][aã]o|conte[úu]dos?|men[çc][aã]o|refer[êe]ncias?|provas?|evid[êe]ncias?|exemplos?|suporte)\b/i;
+
+/** Criterion terms a weak `no` must govern to count as denial. */
+function weakDenialTerms(keywords: string[], literals: string[]): Set<string> {
+  const terms = new Set<string>();
+  for (const k of keywords) {
+    const t = k.toLowerCase();
+    if (t.length >= 4) terms.add(t);
+  }
+  for (const l of literals) {
+    const t = l.toLowerCase();
+    if (t.length >= 4) terms.add(t);
+    for (const part of t.split(/[^a-zà-ú0-9]+/)) {
+      if (part.length >= 4) terms.add(part);
+    }
+  }
+  return terms;
+}
+
+const NO_EN_FRAMERS = new Set([
+  'there', 'is', 'are', 'was', 'were', 'has', 'have', 'had', 'with',
+  'provides', 'provide', 'provided', 'offers', 'offer', 'includes', 'include',
+  'contains', 'contain', 'shows', 'show', 'lacks', 'lacking',
+]);
+
+/** True when an EN-framed `no` governs the criterion within a few words
+ * ("There is no rollback procedure" denies; "no lugar de espaços" does not). */
+function hasNoEnDenialAboutCriterion(sentenceLower: string, keywords: string[], literals: string[]): boolean {
+  const terms = weakDenialTerms(keywords, literals);
+  if (terms.size === 0) return false;
+  const words = sentenceLower.match(/[a-zà-ú0-9]+/g) ?? [];
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] !== 'no') continue;
+    const framed = i === 0 || NO_EN_FRAMERS.has(words[i - 1]!) || (i >= 2 && words[i - 2] === 'there');
+    if (!framed) continue;
+    for (let j = i + 1; j <= Math.min(i + 4, words.length - 1); j++) {
+      if (terms.has(words[j]!)) return true;
+    }
+  }
+  return false;
+}
 
 /** Pasted machine output in fenced blocks (test runs, logs) is evidence,
  * never authorial prose: counters like `ℹ fail 0` / `ℹ todo 0` must not
@@ -298,6 +366,7 @@ function isNegatedSentence(sentence: string): boolean {
 }
 
 function isGlobalDisclaimerSentence(sentence: string): boolean {
+  if (hasTodoPlaceholder(sentence)) return true;
   if (GLOBAL_PLACEHOLDER_RE.test(sentence)) return true;
   return GLOBAL_FUTILITY_RES.some((re) => re.test(sentence));
 }
@@ -514,6 +583,10 @@ function qualifyingInstructionSentences(combined: string, keywords: string[], li
     if (isGlobalDisclaimerSentence(s)) continue;
     if (isNegatedSentence(s)) continue;
     if (DENIAL_MARKER_RE.test(s) && sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
+    // Weak markers (`no` EN-framed, `sem` + meta) also disqualify a sentence
+    // as affirmative substance when about the criterion.
+    if (SEM_META_RE.test(s) && sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
+    if (hasNoEnDenialAboutCriterion(s.toLowerCase(), keywords, literals)) continue;
     const words3 = s.toLowerCase().match(/[a-zà-ú0-9]{3,}/g) ?? [];
     if (words3.length < 5) continue;
     // F2: a sentence linking a demanded file carries the artifact as its
@@ -630,6 +703,17 @@ export function assessDocsCoverage(
       );
     }
     if (DENIAL_MARKER_RE.test(raw)) {
+      const kwLower = keywords.map((k) => k.toLowerCase());
+      const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
+      if (!sentenceHasInstruction(raw, kwLower, litLower, criterionVerbs)) {
+        return failNotCovered(
+          `docs deny coverage ("${raw.slice(0, 140)}") — content contradicts the criterion, fix the docs or accept explicitly`,
+        );
+      }
+    }
+    // Strict weak-marker denial: `sem` + meta noun, or EN-framed `no`
+    // governing the criterion — same instruction escape as strong markers.
+    if (SEM_META_RE.test(raw) || hasNoEnDenialAboutCriterion(lower, keywords, literals)) {
       const kwLower = keywords.map((k) => k.toLowerCase());
       const litLower = literals.map((l) => l.toLowerCase()).filter((l) => l.length >= 4);
       if (!sentenceHasInstruction(raw, kwLower, litLower, criterionVerbs)) {

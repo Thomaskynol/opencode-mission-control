@@ -460,6 +460,34 @@ export function deriveProblemsFromRecords(input: FinalReportInput): FinalReportP
 }
 
 /**
+ * M8: categorias de gaps para o header clicar com a seção Gaps.
+ * Conta por marcadores canônicos (mesmos textos emitidos por
+ * mc_report_final): aceites com ressalva, cobertura parcial (smoke global),
+ * sem mc_report, sem evidência task-scoped, comando trivial, pendências
+ * humanas; o resto conta como outro(s). Aceite nunca sai daqui para
+ * Verified — ver excludeAcceptedFromVerified.
+ */
+export function describeGapCategories(items: string[]): string {
+  const count = (re: RegExp) => items.filter((entry) => re.test(entry)).length;
+  const parts: string[] = [];
+  const aceites = count(/aceite/);
+  if (aceites > 0) parts.push(`${aceites} aceite(s) com ressalva`);
+  const parcial = count(/covered only by global integration smoke/);
+  if (parcial > 0) parts.push(`${parcial} cobertura parcial (smoke global)`);
+  const semContrib = count(/missing per-instance report/);
+  if (semContrib > 0) parts.push(`${semContrib} sem mc_report`);
+  const semEvid = count(/sem evid[êe]ncia task-scoped/);
+  if (semEvid > 0) parts.push(`${semEvid} sem evidência task-scoped`);
+  const trivial = count(/comando de teste trivial/);
+  if (trivial > 0) parts.push(`${trivial} comando trivial`);
+  const pending = count(/pending human decision|permission escalation pendente/);
+  if (pending > 0) parts.push(`${pending} pendência(s) humana(s)`);
+  const outros = items.length - aceites - parcial - semContrib - semEvid - trivial - pending;
+  if (outros > 0) parts.push(`${outros} outro(s)`);
+  return parts.join(' + ');
+}
+
+/**
  * R2: aceite nunca Verified — linha de gap canônica para jobs com
  * reviewApproval integrados. Renderiza ator + COM RESSALVA em Gaps, mesmo
  * quando a evidência task-scoped existir (retry operacional, sem approval,
@@ -647,11 +675,14 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
     '',
     ...(() => {
       const unmetItems = input.unmet ?? [];
-      const unverifiedCount = (input.unverified ?? []).length + missingGapEntries.length;
+      const allUnverified = [...(input.unverified ?? []), ...missingGapEntries];
+      const unverifiedCount = allUnverified.length;
+      const cats = unverifiedCount > 0 ? describeGapCategories(allUnverified) : '';
       // M6: "No unmet items" convivendo com Unverified induz otimismo —
-      // ausência de Unmet nunca é sucesso quando há Unverified.
+      // ausência de Unmet nunca é sucesso quando há Unverified. M8: o total
+      // inclui sem-mc_report (categorias abaixo = mesmo total do header).
       if (unmetItems.length === 0 && unverifiedCount > 0) {
-        return [`- No unmet items reported (atenção: há ${unverifiedCount} item(ns) Unverified abaixo — ausência de Unmet não é sucesso)`];
+        return [`- No unmet items reported (atenção: há ${unverifiedCount} item(ns) Unverified abaixo — ausência de Unmet não é sucesso; categorias: ${cats})`];
       }
       return finalReportLines(
         unmetItems.map((item) => `Unmet: ${item}`),
@@ -663,6 +694,12 @@ export function buildFinalReportMarkdown(input: FinalReportInput): string {
       [...(input.unverified ?? []), ...missingGapEntries].map((item) => `Unverified: ${item}`),
       'No unverified items reported',
     ),
+    ...(() => {
+      const allUnverified = [...(input.unverified ?? []), ...missingGapEntries];
+      if (allUnverified.length === 0) return [];
+      // M8: total explícito para clicar com o header (Unverified: N (...)).
+      return [`- Total Unverified: ${allUnverified.length} (${describeGapCategories(allUnverified)}) — mesmo total do header`];
+    })(),
     '',
     '## Environment (Used vs Detected)',
     '',

@@ -8,6 +8,7 @@ import {
   writeFinalReport,
   describeOmoLimitation,
   deriveProblemsFromRecords,
+  describeGapCategories,
   formatActorLabel,
   formatAcceptGap,
   excludeAcceptedFromVerified,
@@ -223,6 +224,21 @@ export const mc_report_final: ToolDefinition = tool({
       ...silentMergedGaps,
       ...pendingGaps,
     ];
+    // M8: merged sem mc_report entram no total do header com o texto canônico
+    // de buildFinalReportMarkdown — o filtro `entry.includes(name)` de lá
+    // evita duplicar na seção Gaps, então header e Gaps mostram o mesmo total.
+    // (Só contagem aqui: `unverified` passado ao markdown fica inalterado
+    // para não duplicar Problems derivados.)
+    const haveReports = new Set(reports.map((report) => report.jobName));
+    const missingReportNames = merged
+      .filter((name) => !haveReports.has(name))
+      .filter((name) => !unverified.some((entry) => entry.includes(name)));
+    const unverifiedForCount = [
+      ...unverified,
+      ...missingReportNames.map((name) => `missing per-instance report for "${name}" (merged without mc_report)`),
+    ];
+    const unverifiedTotal = unverifiedForCount.length;
+    const gapDetail = describeGapCategories(unverifiedForCount);
     // Operator notes are labeled as such under Real Evidence — they are
     // human claims, never automatic product evidence.
     const notes = args.notes?.trim() ? [`Operator note: ${args.notes.trim()}`] : [];
@@ -458,7 +474,7 @@ export const mc_report_final: ToolDefinition = tool({
     return [
       `Final report for plan "${plan.name}" written to ${filePath}.`,
       '',
-      `Integrated: ${merged.length}, Unmet: ${unmet.length}, Unverified: ${unverified.length}.`,
+      `Integrated: ${merged.length}, Unmet: ${unmet.length}, Unverified: ${unverifiedTotal}${gapDetail ? ` (${gapDetail})` : ''}.`,
       'Merges are integration, not verification: a merge alone does not prove functioning.',
       'Long logs are in Annexes; unknown work is under Gaps, never under Verified.',
     ].join('\n');
