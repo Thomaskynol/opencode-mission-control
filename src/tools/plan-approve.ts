@@ -147,6 +147,8 @@ export const mc_plan_approve: ToolDefinition = tool({
         }
 
         const retryJob = plan.jobs.find(j => j.name === args.retry)!;
+        // M9: retry resets status/checkpoint only — review attempts persist via
+        // plan-state (durable budget), so the counter is never reset here.
         retryJob.status = 'ready_to_merge';
         retryJob.error = undefined;
 
@@ -233,6 +235,7 @@ export const mc_plan_approve: ToolDefinition = tool({
             }
           }
           job.status = 'ready_to_merge';
+          // M9: scoped retry also preserves persisted review attempts (budget).
           job.error = undefined;
           await savePlan(plan);
           const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });

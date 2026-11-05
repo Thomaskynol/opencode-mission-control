@@ -973,3 +973,104 @@ export async function claimJobForDispatch(
     return { ok: true as const, status: 'running' as const };
   }, effectiveRepo);
 }
+
+/* ------------------------------------------------------------------ */
+/* Review auto-fix attempts (M9): durable per-job counter beside        */
+/* plan.json. The conductor is one-shot per retry, so a per-process    */
+/* Map resets prev.attempts to 0 on every retry ("attempt 1/2" forever, */
+/* budget never exhausts). Persisted {attempts,lastSignature} per      */
+/* plan+job: retry preserves, the budget exhausts, pass clears.        */
+/* Sidecar (not JobSpec) so no schema change is needed; keyed by       */
+/* plan+job. Reads never throw (absent/corrupt → null → fresh start).  */
+/* ------------------------------------------------------------------ */
+
+const REVIEW_ATTEMPTS_FILE = 'review-attempts.json';
+
+export interface ReviewAttemptRecord {
+  attempts: number;
+  lastSignature: string;
+}
+
+function normalizeReviewAttempt(raw: unknown): ReviewAttemptRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (!Number.isInteger(r['attempts']) || (r['attempts'] as number) < 0) return null;
+  if (typeof r['lastSignature'] !== 'string') return null;
+  return { attempts: r['attempts'] as number, lastSignature: r['lastSignature'] as string };
+}
+
+async function getReviewAttemptsFilePath(repoRoot?: string): Promise<string> {
+  const dataDir = await getDataDir(repoRoot);
+  return join(dataDir, REVIEW_ATTEMPTS_FILE);
+}
+
+async function readReviewAttemptsFile(filePath: string): Promise<Record<string, Record<string, ReviewAttemptRecord>>> {
+  try {
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) return {};
+    const parsed: unknown = JSON.parse(await file.text());
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: Record<string, Record<string, ReviewAttemptRecord>> = {};
+    for (const [planId, jobs] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!jobs || typeof jobs !== 'object') continue;
+      for (const [jobName, rec] of Object.entries(jobs as Record<string, unknown>)) {
+        const norm = normalizeReviewAttempt(rec);
+        if (!norm) continue;
+        (out[planId] ??= {})[jobName] = norm;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Load the persisted review attempts for a job (null when never recorded). Never throws. */
+export async function loadReviewAttempt(
+  planId: string,
+  jobName: string,
+  repoRoot?: string,
+): Promise<ReviewAttemptRecord | null> {
+  try {
+    const filePath = await getReviewAttemptsFilePath(repoRoot);
+    const all = await readReviewAttemptsFile(filePath);
+    return all[planId]?.[jobName] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the review attempts for a job (retry preserves; pass clears via clearReviewAttempt). */
+export async function saveReviewAttempt(
+  planId: string,
+  jobName: string,
+  record: ReviewAttemptRecord,
+  repoRoot?: string,
+): Promise<void> {
+  const norm = normalizeReviewAttempt(record);
+  if (!norm) throw new Error(`Invalid review attempt record for job "${jobName}" (attempts must be an integer >= 0).`);
+  const filePath = await getReviewAttemptsFilePath(repoRoot);
+  await withFileLock(lockPathFor(filePath), async () => {
+    const all = await readReviewAttemptsFile(filePath);
+    (all[planId] ??= {})[jobName] = norm;
+    await atomicWrite(filePath, JSON.stringify(all, null, 2));
+  });
+}
+
+/** Clear the persisted review attempts for a job (review pass). Never throws. */
+export async function clearReviewAttempt(
+  planId: string,
+  jobName: string,
+  repoRoot?: string,
+): Promise<void> {
+  try {
+    const filePath = await getReviewAttemptsFilePath(repoRoot);
+    await withFileLock(lockPathFor(filePath), async () => {
+      const all = await readReviewAttemptsFile(filePath);
+      if (all[planId]?.[jobName] === undefined) return;
+      delete all[planId][jobName];
+      if (Object.keys(all[planId]).length === 0) delete all[planId];
+      await atomicWrite(filePath, JSON.stringify(all, null, 2));
+    });
+  } catch {}
+}

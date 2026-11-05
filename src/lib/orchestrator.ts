@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
-import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock, type PlanFencing } from './plan-state';
+import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock, loadReviewAttempt, saveReviewAttempt, clearReviewAttempt, type PlanFencing } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
 import { coordinateOnce, clampMaxParallel, isDispatchInfraError, parseDispatchAttempt, formatDispatchInfraError, MAX_DISPATCH_ATTEMPTS } from './coordinator';
@@ -427,6 +427,35 @@ export function topologicalSort(jobs: JobSpec[]): JobSpec[] {
 }
 
 /**
+ * M9: review auto-fix dispatch decision (durable-budget gate). Pure: `prev`
+ * comes from persisted plan state (plan-state loadReviewAttempt), never from
+ * a per-process Map — a one-shot conductor after `approve --retry` sees the
+ * same counter the previous process left. A repeating failure signature does
+ * NOT block a budgeted dispatch: every round consumes the budget
+ * (1/2 → 2/2 → exhausted → escalate). No-progress is reported at escalation
+ * time, never as a silent counter reset.
+ */
+export function decideReviewAutoFix(
+  prev: { attempts: number; lastSignature: string },
+  signature: string,
+  opts: { reserved: boolean; canRelaunch: boolean; maxAutoFix: number },
+): {
+  dispatch: boolean;
+  nextAttempts: number;
+  noProgress: boolean;
+  escalateReason: 'reserved' | 'budget-exhausted' | 'cannot-relaunch' | null;
+} {
+  const attempts = Number.isInteger(prev.attempts) && prev.attempts >= 0 ? prev.attempts : 0;
+  const noProgress = prev.lastSignature !== '' && prev.lastSignature === signature;
+  if (opts.reserved) return { dispatch: false, nextAttempts: attempts, noProgress, escalateReason: 'reserved' };
+  if (!opts.canRelaunch) return { dispatch: false, nextAttempts: attempts, noProgress, escalateReason: 'cannot-relaunch' };
+  if (attempts >= opts.maxAutoFix) {
+    return { dispatch: false, nextAttempts: attempts, noProgress, escalateReason: 'budget-exhausted' };
+  }
+  return { dispatch: true, nextAttempts: attempts + 1, noProgress, escalateReason: null };
+}
+
+/**
  * B4: merge readiness gate. A `ready_to_merge` job merges when its
  * declared dependencies are merged and no earlier (mergeOrder) sibling
  * with unfinished work blocks it. A `failed` earlier sibling never
@@ -584,10 +613,25 @@ export class Orchestrator {
   private firstJobCompleted = false;
   /**
    * R01: bounded autonomous fix-loop state per job (diagnostic → worker
-   * instruction → reverification). attempts counts correction dispatches;
-   * lastSignature detects no-progress repeats. Cleared on pass.
+   * instruction → reverification). M9: durable, not a per-process Map —
+   * attempts+lastSignature persist via plan-state (review-attempts.json
+   * beside plan.json) so an `approve --retry` one-shot conductor inherits
+   * the counter and the budget exhausts. Cleared on pass.
    */
-  private reviewAttempts = new Map<string, { attempts: number; lastSignature: string }>();
+  private async loadReviewPrev(jobName: string, planId: string): Promise<{ attempts: number; lastSignature: string }> {
+    try {
+      const persisted = await loadReviewAttempt(planId, jobName, this.effectiveRepoRoot());
+      if (persisted) return persisted;
+    } catch {}
+    return { attempts: 0, lastSignature: '' };
+  }
+  private async saveReviewPrev(jobName: string, planId: string, prev: { attempts: number; lastSignature: string }): Promise<void> {
+    try {
+      await saveReviewAttempt(planId, jobName, prev, this.effectiveRepoRoot());
+    } catch (error) {
+      console.warn(`[MC] review attempts persist failed for job "${jobName}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   /** R01: job whose latest review dispatched an autonomous correction (merge skips pause for it). */
   private lastReviewAutoFix: string | null = null;
   /** R01: autonomous correction dispatches before escalating to the user. */
@@ -1292,7 +1336,9 @@ export class Orchestrator {
       };
     }
     if (loop.verdict.verdict === 'pass') {
-      this.reviewAttempts.delete(job.name);
+      try {
+        await clearReviewAttempt(plan.id, job.name, this.effectiveRepoRoot());
+      } catch {}
       // Conserve task-scoped evidence (merged, never replaced) so the final
       // report verifies this job without the global smoke.
       try {
@@ -1327,40 +1373,47 @@ export class Orchestrator {
     }
     // Fail: decide autonomous correction vs escalation.
     const signature = [...loop.verdict.reasons].sort().join('\n');
-    const prev = this.reviewAttempts.get(job.name) ?? { attempts: 0, lastSignature: '' };
-    const noProgress = prev.lastSignature !== '' && prev.lastSignature === signature;
+    // M9: durable counter — a one-shot conductor after retry reads what the
+    // previous process persisted, never a reset Map.
+    const prev = await this.loadReviewPrev(job.name, plan.id);
     const reasonsText = loop.verdict.reasons.join(' ');
     const reserved =
       requiresUserReview(reasonsText) ||
       /touchSet violation|missing test command|missing execution environment|tested code diverges|candidate .*diverges|tested tree was dirty|missing functional evidence|no test command exists/i.test(reasonsText);
     const canRelaunch = Boolean(job.branch && job.worktreePath);
-    if (!reserved && !noProgress && prev.attempts < Orchestrator.REVIEW_MAX_AUTO_FIX && canRelaunch) {
+    const autoFix = decideReviewAutoFix(prev, signature, {
+      reserved,
+      canRelaunch,
+      maxAutoFix: Orchestrator.REVIEW_MAX_AUTO_FIX,
+    });
+    const noProgress = autoFix.noProgress;
+    if (autoFix.dispatch) {
       const instruction = this.buildFunctionalCorrection(job, gradedRequirements, pins.changedFiles, loop.verdict.reasons);
       try {
         await updatePlanJob(plan.id, job.name, {
           status: 'failed',
           error: `Functional review failed: ${loop.verdict.reasons.join('; ').slice(0, 500)}`,
-          prompt: `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`,
+          prompt: `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${autoFix.nextAttempts}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`,
         });
         job.status = 'failed';
-        job.prompt = `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`;
+        job.prompt = `${job.prompt}\n\n---\nREVIEW CORRECTION (attempt ${autoFix.nextAttempts}/${Orchestrator.REVIEW_MAX_AUTO_FIX}):\n${instruction}`;
         await this.relaunchJobForCorrection(job.name, [], [], {
           functional: { title: 'CORRECTION TASK — Functional review failed', body: instruction },
         });
         job.status = 'running';
-        this.reviewAttempts.set(job.name, { attempts: prev.attempts + 1, lastSignature: signature });
+        await this.saveReviewPrev(job.name, plan.id, { attempts: autoFix.nextAttempts, lastSignature: signature });
         this.lastReviewAutoFix = job.name;
         try {
           const snap = await loadRuntimeSnapshot().catch(() => null);
           const intakeId = snap?.autoIntake?.id;
           if (intakeId) {
-            await appendAutoDecision(intakeId, `review ${job.name}: fail (${loop.verdict.reasons.length} reason(s)) — auto-fix attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched`).catch(() => {});
+            await appendAutoDecision(intakeId, `review ${job.name}: fail (${loop.verdict.reasons.length} reason(s)) — auto-fix attempt ${autoFix.nextAttempts}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched`).catch(() => {});
           }
         } catch {}
         return {
           verdict: 'fail',
           blocking: true,
-          reasons: [...loop.verdict.reasons, `auto-fix attempt ${prev.attempts + 1}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched: worker re-oriented, merge deferred (no pause)`],
+          reasons: [...loop.verdict.reasons, `auto-fix attempt ${autoFix.nextAttempts}/${Orchestrator.REVIEW_MAX_AUTO_FIX} dispatched: worker re-oriented, merge deferred (no pause)${noProgress ? ' (same signature as previous round — budget consumed, next failure escalates)' : ''}`],
           jobName: job.name,
           reviewedCommit: pins.jobHead,
           reviewedBase: pins.baseHead,
