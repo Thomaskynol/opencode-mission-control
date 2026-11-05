@@ -56,6 +56,12 @@ const MAX_EVENTS_PER_JOB = 100;
 const SSE_INITIAL_BACKOFF_MS = 100;
 const SSE_MAX_BACKOFF_MS = 30000;
 const SSE_BACKOFF_FACTOR = 2;
+// F5: a dead serve must not hold a foreground resume in an infinite
+// 100ms "attempt 1" loop. After this many consecutive non-productive
+// iterations the subscription gives up with an actionable message (the
+// job and conductor lease stay untouched — fail-closed, no terminal
+// verdict from SSE). Exported for tests.
+export const SSE_MAX_RECONNECT_ATTEMPTS = 10;
 
 export interface JobMonitorOptions {
   pollInterval?: number;
@@ -455,42 +461,73 @@ export class JobMonitor extends EventEmitter {
    * dispatch this job's session events. Volatile by contract (slow
    * consumers overflow; disconnects miss events) — backfill above covers
    * the question gap on reconnect.
+   *
+   * F5: bounded retries. The old loop reset the attempt counter on every
+   * iteration, so a dead serve retried forever at 100ms "attempt 1" and
+   * held a foreground resume hostage. Now attempts only reset after a
+   * stream that actually delivered this job's events; consecutive
+   * non-productive iterations (refused connection, HTTP error, clean EOF
+   * with nothing received) back off exponentially and give up after
+   * `maxAttempts` with an actionable message. Give-up only stops THIS
+   * job's SSE subscription (cleanup + break) — the job is not marked
+   * terminal and the conductor lease is untouched (fail-closed).
    */
   private async processSSEStream(
     job: Job,
     client: V2Client,
     abortController: AbortController,
+    opts?: { maxAttempts?: number; baseMs?: number; maxMs?: number },
   ): Promise<void> {
+    const maxAttempts = Math.max(1, Math.floor(opts?.maxAttempts ?? SSE_MAX_RECONNECT_ATTEMPTS));
+    const baseMs = opts?.baseMs ?? SSE_INITIAL_BACKOFF_MS;
+    const maxMs = opts?.maxMs ?? SSE_MAX_BACKOFF_MS;
+    // Local consecutive-failure count (mirrored onto the subscription when
+    // present): the bound must hold even if the map entry was cleaned up
+    // under us — attempts read from a missing entry alone would pin to 0.
+    let attempts = 0;
+    const syncAttempts = () => {
+      const sub = this.sseSubscriptions.get(job.id);
+      if (sub) sub.reconnectAttempts = attempts;
+    };
     while (this.isRunning && !abortController.signal.aborted) {
+      if (attempts >= maxAttempts) {
+        console.warn(
+          `[Monitor] SSE giving up for job ${job.name} after ${attempts} failed attempts (serve ${client.baseUrl} unreachable or idle-closed). ` +
+            `Check the serve on port ${job.port ?? 'unknown'} for this job, or run resume --takeover to re-drive; job state and conductor lease preserved (fail-closed, no terminal verdict from SSE).`,
+        );
+        this.cleanupSSEForJob(job.id);
+        break;
+      }
+      let productive = false;
       try {
-        const subscription = this.sseSubscriptions.get(job.id);
-        if (subscription) {
-          subscription.reconnectAttempts = 0;
-        }
-
-        await this.consumeEventStream(job, client, abortController);
+        const received = await this.consumeEventStream(job, client, abortController);
+        productive = received > 0;
       } catch (error) {
         if (abortController.signal.aborted) {
           break;
         }
-
-        const subscription = this.sseSubscriptions.get(job.id);
-        const reconnectAttempts = subscription?.reconnectAttempts ?? 0;
-        const backoffMs = Math.min(
-          SSE_INITIAL_BACKOFF_MS * Math.pow(SSE_BACKOFF_FACTOR, reconnectAttempts),
-          SSE_MAX_BACKOFF_MS,
-        );
-
-        if (subscription) {
-          subscription.reconnectAttempts = reconnectAttempts + 1;
-        }
-
-        console.warn(
-          `[Monitor] SSE connection lost for job ${job.name}, reconnecting in ${backoffMs}ms (attempt ${reconnectAttempts + 1})`,
-        );
-
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        productive = false;
       }
+      if (abortController.signal.aborted) {
+        break;
+      }
+      if (productive) {
+        attempts = 0;
+        syncAttempts();
+        continue;
+      }
+      const backoffMs = Math.min(
+        baseMs * Math.pow(SSE_BACKOFF_FACTOR, attempts),
+        maxMs,
+      );
+      attempts++;
+      syncAttempts();
+
+      console.warn(
+        `[Monitor] SSE connection lost for job ${job.name}, reconnecting in ${backoffMs}ms (attempt ${attempts}/${maxAttempts}) — serve ${client.baseUrl}; if the serve is dead, restart it or run resume --takeover (lease preserved, fail-closed).`,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
   }
 
@@ -498,7 +535,7 @@ export class JobMonitor extends EventEmitter {
     job: Job,
     client: V2Client,
     abortController: AbortController,
-  ): Promise<void> {
+  ): Promise<number> {
     const response = await fetch(`${client.baseUrl}/event`, {
       headers: { ...client.headers, Accept: 'text/event-stream' },
       signal: abortController.signal,
@@ -510,6 +547,7 @@ export class JobMonitor extends EventEmitter {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let received = 0;
 
     for (;;) {
       const { done, value } = await reader.read();
@@ -528,6 +566,7 @@ export class JobMonitor extends EventEmitter {
           try {
             const event = JSON.parse(payload);
             if (eventBelongsToSession(event, job.remoteSessionID)) {
+              received++;
               await this.handleSSEEvent(job, event);
             }
           } catch {
@@ -539,6 +578,7 @@ export class JobMonitor extends EventEmitter {
 
       if (abortController.signal.aborted) break;
     }
+    return received;
   }
 
   /**

@@ -101,7 +101,7 @@ export function buildPlannerPrompt(intake: AutoIntakeInput): string {
     ' "decisions":[strings],"questions":[strings for the user],"nextSteps":[strings]}.',
     'Rules: names are unique slugs; dependsOn names existing tasks; no cycles;',
     ' task prompts are concrete and self-contained; every task lists acceptance criteria;',
-    ' acceptance file references (test files, docs) must live inside that task\'s touchSet, or in a dependent test job\'s touchSet;',
+    ' acceptance file references (test files, docs) must live inside that task\'s touchSet, or in the touchSet of a job linked via dependsOn (either direction, direct or transitive — canonical coherence rule);',
     ' task prompts are worktree-local: relative paths only, never absolute paths, never `cd` outside the worktree;',
     ' touchSet holds repo-relative paths only, never absolute or ../ escapes;',
     ' never push, publish, deploy, approve permissions, or touch the global config;',
@@ -348,10 +348,59 @@ export function extractAcceptanceFileRefs(texts: string[]): string[] {
 }
 
 function normalizeCoherencePath(p: string): string {
-  return p
+  const cleaned = p
     .trim()
     .replace(/^["'`(\[]+|["'`)\].,;:]+$/g, '')
     .replace(/^\.\//, '');
+  // M6 §2a: lexical `..` resolution, no filesystem access.
+  // `docs/../mean.test.mjs` → `mean.test.mjs`. A `..` that would escape the
+  // repo root is preserved, so `../x` (or `a/../../x`) never equals a
+  // repo-relative entry — outside-repo stays outside (fail-closed).
+  // Trailing `/` is preserved: `src/` keeps directory semantics for the
+  // glob matcher below.
+  const trailingSlash = /\/$/.test(cleaned);
+  const stack: string[] = [];
+  for (const part of cleaned.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (stack.length === 0 || stack[stack.length - 1] === '..') {
+        stack.push('..');
+        continue;
+      }
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  const out = stack.join('/');
+  return out !== '' && trailingSlash ? `${out}/` : out;
+}
+
+/**
+ * M6 §2a: resolve an acceptance ref positionally against the asserting
+ * task's own scope dirs (lexical only). A docs task owning `docs/mean.md`
+ * that references `../mean.test.mjs` means repo-root `mean.test.mjs`
+ * (`docs/` + `../mean.test.mjs`). Only refs containing `..` resolve —
+ * plain refs keep exact current behavior. Escapes (`../x` at the root)
+ * resolve to nothing and keep failing as before.
+ */
+function resolveRefInScope(ref: string, scopeEntries: string[] | undefined): string[] {
+  if (!ref.includes('..')) return [];
+  const out: string[] = [];
+  for (const entry of scopeEntries ?? []) {
+    const base = entry.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!base || base === '.' || base.includes('..')) continue;
+    const segs = base.split('/');
+    const last = segs[segs.length - 1] ?? '';
+    // A file entry contributes its dirname; a directory (or extensionless
+    // bare name) contributes itself.
+    const isDir = /\/$/.test(entry.trim()) || !/\.[a-z0-9]{1,5}$/i.test(last);
+    const dir = isDir ? base : segs.slice(0, -1).join('/');
+    const norm = normalizeCoherencePath(dir ? `${dir}/${ref}` : ref);
+    if (!norm || norm === '..' || norm.startsWith('../')) continue;
+    if (!out.includes(norm)) out.push(norm);
+  }
+  return out;
 }
 
 /** True when a touchSet entry covers an acceptance file ref (glob parity with merge-train). */
@@ -380,36 +429,102 @@ export interface TaskCoherenceInput {
 }
 
 /**
- * Pure single-task coherence: every file referenced by acceptance must be
- * inside the task's own touchSet.
+ * Single-task coherence under the canonical rule (see CANONICAL COHERENCE
+ * RULE above): every file referenced by acceptance must be inside the
+ * task's own touchSet, or — when sibling context is provided — inside the
+ * touchSet of a task linked via dependsOn (either direction, transitive).
+ * Without siblings the check is strict single-task (fail-closed: linked
+ * ownership cannot be verified, so only own touchSet counts); callers with
+ * plan context (launch/relaunch/touchset) must pass siblings.
  *
  * Integrator contract (orchestrator.ts owns the call sites — do NOT add them
- * here): call `validateTaskCoherence({ name, acceptance, touchSet })` at the
- * top of `launchJob(job)` and `relaunchJobForCorrection(...)`, before the
- * dispatch claim, so a relaunch never preserves a contradictory prompt
- * (acceptance demanding a file the touchSet forbids). Plan-wide, call
- * `assertPlanCoherence(draft, { testCommand })` after `validatePlan`.
+ * here): call `validateTaskCoherence({ name, acceptance, touchSet,
+ * dependsOn }, { siblings })` at the top of `launchJob(job)` and
+ * `relaunchJobForCorrection(...)`, before the dispatch claim, so a relaunch
+ * never preserves a contradictory prompt (acceptance demanding a file the
+ * touchSet forbids). Plan-wide, call `assertPlanCoherence(draft, {
+ * testCommand })` after `validatePlan`.
  */
-export function validateTaskCoherence(task: TaskCoherenceInput): void {
+export function validateTaskCoherence(
+  task: TaskCoherenceInput,
+  opts?: { siblings?: TaskCoherenceInput[] },
+): void {
   const refs = extractAcceptanceFileRefs(task.acceptance ?? []);
   if (refs.length === 0) return;
   const owned = task.touchSet ?? [];
-  const missing = refs.filter((ref) => !touchSetCovers(owned, ref));
+  // M6 §2a: a ref may name its target relative to the asserting scope
+  // (`../mean.test.mjs` from `docs/mean.md`); try the raw ref plus every
+  // in-scope positional resolution.
+  const candidates = (ref: string): string[] => [ref, ...resolveRefInScope(ref, owned)];
+  const coversOwn = (ref: string): boolean => candidates(ref).some((c) => touchSetCovers(owned, c));
+  const missing = refs.filter((ref) => !coversOwn(ref));
   if (missing.length === 0) return;
+  const siblings = opts?.siblings ?? [];
+  if (siblings.length > 0) {
+    const byName = new Map<string, DependsNode>(siblings.map((s) => [s.name, s]));
+    byName.set(task.name, task);
+    const linkedOwners = (ref: string): string[] =>
+      siblings
+        .filter(
+          (s) =>
+            s.name !== task.name && candidates(ref).some((c) => touchSetCovers(s.touchSet, c)),
+        )
+        .map((s) => s.name);
+    const unlinked: string[] = [];
+    for (const ref of missing) {
+      const owners = linkedOwners(ref);
+      if (owners.length === 0) {
+        unlinked.push(ref);
+        continue;
+      }
+      const linked = owners.some(
+        (o) => dependsTransitively(task.name, o, byName) || dependsTransitively(o, task.name, byName),
+      );
+      if (!linked) {
+        throw new Error(
+          `Task "${task.name}" asserts on "${ref}" which belongs to job ${owners.map((o) => `"${o}"`).join(', ')} (touchSet) with no dependsOn edge. ` +
+            `Link via dependsOn, or widen "${task.name}" touchSet to include "${ref}".`,
+        );
+      }
+    }
+    if (unlinked.length > 0) {
+      const quoted = unlinked.map((m) => `"${m}"`).join(', ');
+      const scope = owned.length > 0 ? `[${owned.join(', ')}]` : '(empty — task declares no touchSet)';
+      throw new Error(
+        `Task "${task.name}" is incoherent: acceptance references ${quoted} outside its touchSet ${scope} (no linked job owns it either). ` +
+          `Widen the touchSet to include ${quoted}, or move the test into a dependent job (dependsOn).`,
+      );
+    }
+    return;
+  }
   const quoted = missing.map((m) => `"${m}"`).join(', ');
   const scope = owned.length > 0 ? `[${owned.join(', ')}]` : '(empty — task declares no touchSet)';
   throw new Error(
-    `Task "${task.name}" is incoherent: acceptance references ${quoted} outside its touchSet ${scope}. ` +
+    `Task "${task.name}" is incoherent: acceptance references ${quoted} outside its touchSet ${scope} (no sibling context — provide siblings to allow linked-job ownership). ` +
       `Widen the touchSet to include ${quoted}, or move the test into a dependent job (dependsOn).`,
   );
 }
+
+/**
+ * CANONICAL COHERENCE RULE (F3 — planner, single-task and plan-wide agree):
+ * every file referenced by a task's acceptance criteria must be owned
+ * (touchSetCovers) by the asserting task itself, or by another task linked
+ * to it through dependsOn (either direction, directly or transitively).
+ * Refs may be positional to the asserting task's scope: `../mean.test.mjs`
+ * from a task owning `docs/mean.md` resolves lexically to repo-root
+ * `mean.test.mjs` (M6 §2a); refs escaping the root keep failing.
+ * Anything else — a ref owned by an unrelated job, or by nobody — is
+ * incoherent and throws. The rule never weakens: narrowing below acceptance
+ * refs, or asserting on an unlinked job's files, always refuses.
+ */
+type DependsNode = { dependsOn?: string[] };
 
 /**
  * Transitive dependsOn reachability: true when `to` is reachable from `from`
  * through any chain of dependsOn edges. Unknown names are dead ends (the
  * structural validators reject them elsewhere; here they simply add no edge).
  */
-function dependsTransitively(from: string, to: string, byName: Map<string, AutoTaskDraft>): boolean {
+function dependsTransitively(from: string, to: string, byName: Map<string, DependsNode>): boolean {
   const seen = new Set<string>();
   const stack = [...(byName.get(from)?.dependsOn ?? [])];
   while (stack.length > 0) {
@@ -423,12 +538,13 @@ function dependsTransitively(from: string, to: string, byName: Map<string, AutoT
 }
 
 /** True when either task hands off to the other, directly or transitively. */
-function orderedBetween(a: string, b: string, byName: Map<string, AutoTaskDraft>): boolean {
+function orderedBetween(a: string, b: string, byName: Map<string, DependsNode>): boolean {
   return dependsTransitively(a, b, byName) || dependsTransitively(b, a, byName);
 }
 
 /**
- * Plan-wide coherence: single-task checks plus cross-job diagnosis —
+ * Plan-wide coherence under the canonical rule (see CANONICAL COHERENCE
+ * RULE above): single-task checks plus cross-job diagnosis —
  * concurrent writers of overlapping scope without a dependsOn handoff, a test
  * asserting on a file owned by an unrelated job, and a ceiling testCommand
  * targeting files no job owns. Throws on the first incoherence found.
@@ -471,11 +587,17 @@ export function assertPlanCoherence(draft: AutoPlanDraft, opts?: { testCommand?:
   }
 
   // Acceptance refs must be owned by the asserting task or by a linked job.
+  // M6 §2a: refs may be positional to the asserting scope (`../mean.test.mjs`
+  // from `docs/mean.md`); ownership is checked for the raw ref plus every
+  // in-scope resolution.
   for (const t of draft.tasks) {
+    const scopeCandidates = (ref: string): string[] => [ref, ...resolveRefInScope(ref, t.touchSet)];
+    const coversAny = (touchSet: string[] | undefined, ref: string): boolean =>
+      scopeCandidates(ref).some((c) => touchSetCovers(touchSet, c));
     for (const ref of extractAcceptanceFileRefs(t.acceptance ?? [])) {
-      if (touchSetCovers(t.touchSet, ref)) continue;
+      if (coversAny(t.touchSet, ref)) continue;
       const owners = draft.tasks
-        .filter((o) => o.name !== t.name && touchSetCovers(o.touchSet, ref))
+        .filter((o) => o.name !== t.name && coversAny(o.touchSet, ref))
         .map((o) => o.name);
       if (owners.length > 0) {
         const linked = owners.some((o) => orderedBetween(t.name, o, byName));

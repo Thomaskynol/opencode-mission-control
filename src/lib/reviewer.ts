@@ -320,6 +320,26 @@ function extractRequirementSymbols(description: string, anchors: string[]): stri
   return [...called, ...uniq.filter((s) => !called.includes(s))].slice(0, 12);
 }
 
+/**
+ * F1: file refs in requirement text that name a test file
+ * (`stats.test.mjs`, `tests/x.spec.ts`). Existence claims about such files
+ * ("stats.test.mjs exists using node:test ...") are judged by real code
+ * (implementation candidates asserted in that file), never by asking the
+ * implementation to *define* prose tokens — that demand is unsatisfiable
+ * by construction. Non-test refs (impl files) never reroute: an
+ * impl-existence claim keeps the normal symbol judgment below.
+ */
+function extractTestFileRefs(text: string): string[] {
+  const out: string[] = [];
+  const re = /[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.(mjs|cjs|mts|cts|tsx|ts|jsx|js|cpp|c|h|py|go|rs|java|rb|php)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const t = m[0];
+    if (/test|spec|__tests__/i.test(t) && !out.some((s) => s.toLowerCase() === t.toLowerCase())) out.push(t);
+  }
+  return out;
+}
+
 function findDefinedSymbols(content: string, symbols: string[]): string[] {
   const defined: string[] = [];
   for (const sym of symbols) {
@@ -447,15 +467,16 @@ function isPathLikeAnchor(anchor: string): boolean {
 
 /** Numbers, quoted literals and booleans the criterion pins down. */
 function extractRequiredLiterals(text: string): string[] {
-  // G4b: prose test-counts ("at least 3 cases", "4 tests", "3 test cases")
-  // are suite shape, never values to assert. Strip them before extracting
-  // numbers so a correct delivery with N passing tests is not forced to
-  // assert the literal N. Genuine values (`total([1,2])===3`, quoted
-  // literals, booleans) are unaffected — they never sit in a cases/tests
-  // phrase.
+  // G4b: prose test-counts ("at least 3 cases", "4 tests", "3 test cases",
+  // ">=3 asserts") are suite shape, never values to assert. Strip them
+  // before extracting numbers so a correct delivery with N passing tests
+  // is not forced to assert the literal N. Genuine values
+  // (`total([1,2])===3`, quoted literals, booleans) are unaffected — they
+  // never sit in a cases/tests/asserts phrase.
   const withoutCounts = text
     .replace(/\b\d+\s+(test\s+)?cases?\b/gi, ' ')
     .replace(/\b\d+\s+tests?\b/gi, ' ')
+    .replace(/\b\d+\s+asserts?\b/gi, ' ')
     .replace(/\b(at least|at most|minimum|maximum|exactly)\s+\d+\b/gi, (m) => m.replace(/\d+/g, ' '));
   const nums = withoutCounts.match(/\b\d+(?:\.\d+)?\b/g) ?? [];
   const bools = (text.match(/\b(true|false|null|undefined)\b/gi) ?? []).map((s) => s.toLowerCase());
@@ -682,16 +703,36 @@ function hasAssertedCall(testContent: string, symbol: string): boolean {
 }
 
 /**
- * Bound assertion: the expected literals sit INSIDE the assert arguments
- * that receive the `symbol(` call (or a harness variable links them), so
- * `total([1,2]); assert.equal(3,3)` does NOT bind — the `3`s never touch
- * the call. Mere window co-occurrence never suffices.
+ * Required literals NOT bound by any assert snippet calling `symbol` in
+ * this file (union semantics — each literal is checked independently).
+ * Empty = every literal sits inside the assert arguments of SOME call.
+ */
+function missingBoundLiterals(testContent: string, symbol: string, required: string[]): string[] {
+  if (required.length === 0) return [];
+  const code = removeImportRequireLines(stripCommentsKeepStrings(testContent));
+  const callSnippets = assertionSnippets(code).filter((s) => snippetCallsSymbol(s, symbol));
+  return required.filter((lit) => !callSnippets.some((s) => snippetCoversLiterals(s, [lit])));
+}
+
+/**
+ * Bound assertion (union over snippets): every expected literal must sit
+ * INSIDE the assert arguments of SOME snippet calling `symbol(` (or a
+ * harness variable links them). Separate correct cases count —
+ * `strictEqual(mean([1,2,3]),2)` plus `strictEqual(mean([2,4]),3)` binds
+ * {1,2,3,4} together, while `total([1,2]); assert.equal(3,3)` still does
+ * NOT bind (the `3` never touches the call). Mere window co-occurrence
+ * never suffices.
  */
 function hasBoundAssertion(testContent: string, symbol: string, required: string[]): boolean {
   const code = removeImportRequireLines(stripCommentsKeepStrings(testContent));
-  for (const s of assertionSnippets(code)) {
-    if (snippetCallsSymbol(s, symbol) && snippetCoversLiterals(s, required)) return true;
+  if (required.length === 0) {
+    for (const s of assertionSnippets(code)) {
+      if (snippetCallsSymbol(s, symbol)) return true;
+    }
+    if (exitHarnessCovers(code, symbol, [])) return true;
+    return false;
   }
+  if (missingBoundLiterals(testContent, symbol, required).length === 0) return true;
   if (exitHarnessCovers(code, symbol, required)) return true;
   return false;
 }
@@ -1157,9 +1198,19 @@ export function assessFunctionalCoverage(
       };
     }
     if (unbound.length > 0) {
+      // Name the literals actually missing per candidate (union view), so
+      // the diagnosis describes the real condition instead of the full set.
+      const detail = unbound.map((cand) => {
+        const files = testPool.filter((tp) => hasAssertedCall((testContents[tp] ?? ''), cand));
+        const scope = files.length > 0 ? files : testPool;
+        const missing = required.filter(
+          (lit) => !scope.some((tp) => missingBoundLiterals((testContents[tp] ?? ''), cand, [lit]).length === 0),
+        );
+        return `${cand}() missing ${(missing.length > 0 ? missing : required).join('/')}`;
+      });
       return {
         covered: false,
-        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${unbound.join('/')}() but no assertion binds the call to required ${required.join('/')} — fix the tests to assert the implementation result for the required case`,
+        reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${unbound.join('/')}() but no assertion binds the call to required ${required.join('/')} (${detail.join('; ')}) — fix the tests to assert the implementation result for the required case`,
       };
     }
     if (trivialOnly.length > 0) {
@@ -1175,14 +1226,39 @@ export function assessFunctionalCoverage(
   }
 
   // 2a. Code-ref requirements: symbol must be defined, then bound-asserted.
-  const symbols = extractRequirementSymbols(requirement.description, requirement.testAnchors);
+  let symbols = extractRequirementSymbols(requirement.description, requirement.testAnchors);
+  let defined = findDefinedSymbols(implSources, symbols);
+  // F1 reroute: an existence claim about a test file in scope
+  // ("stats.test.mjs exists using node:test ...") is judged by REAL code —
+  // implementation candidates asserted by that named test file (bound to
+  // required literals when the criterion pins values) — never by prose
+  // tokens no implementation can define. A missing file, or a test that
+  // never asserts the implementation, still fails (fail-closed).
+  let definedPool: string[] | null = null;
+  if (defined.length === 0 && /\bexists?\b/i.test(fullText)) {
+    const named = extractTestFileRefs(fullText).filter((f) =>
+      paths.some((p) => p === f || p.endsWith(`/${f}`)),
+    );
+    if (named.length > 0) {
+      const candidates = extractImplCandidates(implSources);
+      if (candidates.length > 0) {
+        symbols = candidates;
+        defined = candidates;
+        definedPool = named;
+      }
+    }
+  }
   if (symbols.length === 0) {
     return {
       covered: false,
       reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): no code symbol to link requirement to implementation`,
     };
   }
-  const defined = findDefinedSymbols(implSources, symbols);
+  // (F1 reroute above already resolved `defined` to real candidates; only
+  // resolve prose symbols when no reroute happened.)
+  if (definedPool === null) {
+    defined = findDefinedSymbols(implSources, symbols);
+  }
   if (defined.length === 0) {
     // Same barrel abstention as the NL branch, gated the same way: only
     // when an external decision participates; otherwise fail-closed.
@@ -1204,9 +1280,13 @@ export function assessFunctionalCoverage(
     };
   }
   const required = extractRequiredLiterals(fullText);
+  // F1 reroute scope: the requirement names a test file, so only assertions
+  // inside that file demonstrate it — an unrelated test asserting the
+  // implementation does not prove the NAMED file exists and covers it.
+  const definedPoolPaths = definedPool ?? testPool;
   if (required.length === 0) {
     for (const sym of defined) {
-      for (const tp of testPool) {
+      for (const tp of definedPoolPaths) {
         if (hasAssertedCall((testContents[tp] ?? ''), sym)) {
           return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}()` };
         }
@@ -1214,18 +1294,27 @@ export function assessFunctionalCoverage(
     }
   } else {
     for (const sym of defined) {
-      for (const tp of testPool) {
+      for (const tp of definedPoolPaths) {
         if (hasBoundAssertion((testContents[tp] ?? ''), sym, required)) {
           return { covered: true, reason: `requirement "${requirement.id}" exercised: test ${tp} asserts ${sym}() with expected ${required.join('/')} ` };
         }
       }
     }
   }
-  const anyCall = defined.some((sym) => testPool.some((tp) => testCallsSymbol((testContents[tp] ?? ''), sym)));
+  const anyCall = defined.some((sym) => definedPoolPaths.some((tp) => testCallsSymbol((testContents[tp] ?? ''), sym)));
   if (anyCall) {
+    // Name the literals actually missing per symbol (union view).
+    const detail = defined.flatMap((sym) => {
+      const callFiles = definedPoolPaths.filter((tp) => testCallsSymbol((testContents[tp] ?? ''), sym));
+      if (callFiles.length === 0) return [];
+      const missing = required.filter(
+        (lit) => !callFiles.some((tp) => missingBoundLiterals((testContents[tp] ?? ''), sym, [lit]).length === 0),
+      );
+      return missing.length > 0 ? [`${sym}() missing ${missing.join('/')}`] : [];
+    });
     return {
       covered: false,
-      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${defined.join('/')}() but no assertion checks expected ${required.join('/')} — fix the tests to assert the implementation result for the required case${skipNote}`,
+      reason: `green tests do not cover requirement "${requirement.id}" (${requirement.description}): tests call ${defined.join('/')}() but no assertion checks expected ${required.join('/')} (${detail.join('; ') || 'no bound literal found'}) — fix the tests to assert the implementation result for the required case${skipNote}`,
     };
   }
   const anchorHint = requirement.testAnchors.some((a) => testOutput.includes(a))

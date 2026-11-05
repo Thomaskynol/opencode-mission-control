@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   PermissionPolicy,
   buildWorktreePermissions,
+  deobfuscateShellToken,
   isGitPushText,
+  isSimpleAuditableShellText,
+  referencesOutsideWorktree,
+  referencesSecretMaterial,
   requiresHumanAuth,
   type PermissionPolicyConfig,
 } from '../../src/lib/permission-policy';
@@ -302,5 +309,144 @@ describe('PermissionPolicy', () => {
         { worktreePath: WORKTREE },
       ),
     ).toBe('ask-user');
+  });
+
+  describe('PERMX containment (reported bypasses + general vector)', () => {
+    const policy = () => PermissionPolicy.resolvePolicy({});
+    const shell = (text: string) =>
+      policy().evaluate(
+        { type: 'shell_command', path: text, description: text },
+        { worktreePath: WORKTREE },
+      );
+
+    it('bypass A: $HOME expansion to a key never auto-approves', () => {
+      expect(referencesOutsideWorktree('cat "$HOME/.ssh/id_rsa"', WORKTREE)).toBe(true);
+      expect(shell('cat "$HOME/.ssh/id_rsa"')).toBe('ask-user');
+      expect(shell('cat $HOME/.ssh/id_rsa')).toBe('ask-user');
+      expect(shell('cat ${HOME}/.ssh/id_rsa')).toBe('ask-user');
+    });
+
+    it('bypass B: quote-obfuscated push still requires a human', () => {
+      for (const text of [`g''it push`, `g\\it push`, `"git" push`, `'git' push`, `""git push`]) {
+        expect(isGitPushText(text)).toBe(true);
+        expect(requiresHumanAuth({ type: 'shell_command', description: text })).toBe(true);
+        expect(shell(text)).toBe('ask-user');
+      }
+      expect(deobfuscateShellToken(`g''it`)).toBe('git');
+    });
+
+    it('command substitution never auto-approves', () => {
+      expect(shell('cat $(echo /etc/passwd)')).toBe('ask-user');
+      expect(shell('cat `echo /etc/passwd`')).toBe('ask-user');
+      expect(shell('echo $UID')).toBe('ask-user');
+    });
+
+    it('chaining and redirection never auto-approve the visible prefix', () => {
+      for (const text of [
+        'echo hi; cat /etc/passwd',
+        'echo hi && cat /etc/passwd',
+        'echo hi || cat /etc/passwd',
+        'cat /etc/passwd | head',
+        'echo hi > /tmp/x',
+        'cat < /etc/passwd',
+      ]) {
+        expect(referencesOutsideWorktree(text, WORKTREE)).toBe(true);
+        expect(shell(text)).toBe('ask-user');
+      }
+    });
+
+    it('obfuscated publish actions (gh/npm/deploy) still require a human', () => {
+      for (const text of [`g''h pr create --title x`, `np''m publish`, `git pu''sh origin main`]) {
+        expect(requiresHumanAuth({ type: 'shell_command', description: text })).toBe(true);
+        expect(shell(text)).toBe('ask-user');
+      }
+    });
+
+    it('secret reads never auto-approve, even relative/inside', () => {
+      expect(referencesSecretMaterial('cat .ssh/id_rsa')).toBe(true);
+      expect(referencesSecretMaterial('cat keys/id_rsa')).toBe(true);
+      expect(referencesSecretMaterial('cat server.pem')).toBe(true);
+      expect(referencesSecretMaterial('cat .env')).toBe(true);
+      expect(referencesSecretMaterial('cat .env.local')).toBe(true);
+      for (const text of [
+        'cat .ssh/id_rsa',
+        'cat keys/id_rsa',
+        'cat id_ed25519',
+        'cat server.pem',
+        'cat tls.key',
+        'cat .env',
+        'cat config/.env.production',
+      ]) {
+        expect(shell(text)).toBe('ask-user');
+      }
+    });
+
+    it('names merely containing sensitive words stay auto-approved', () => {
+      expect(referencesSecretMaterial('cat probe-secret.txt')).toBe(false);
+      expect(referencesSecretMaterial('cat .env.example')).toBe(false);
+      expect(shell('cat probe-secret.txt')).toBe('auto-approve');
+      expect(shell('cat .env.example')).toBe('auto-approve');
+    });
+
+    it('non-simple shapes (globs, parens, unknown binaries) ask, never approve', () => {
+      expect(isSimpleAuditableShellText('ls *.ts')).toBe(false);
+      expect(isSimpleAuditableShellText('node -e "console.log(1)"')).toBe(false);
+      expect(isSimpleAuditableShellText('FOO=1 npm test')).toBe(true);
+      expect(shell('ls *.ts')).toBe('ask-user');
+      expect(shell('node -e "console.log(1)"')).toBe('ask-user');
+      expect(shell('curl https://example.com')).toBe('ask-user');
+      expect(shell('ssh deploy@host')).toBe('ask-user');
+      expect(shell('sudo ls')).toBe('ask-user');
+      expect(shell('terraform apply')).toBe('ask-user');
+    });
+
+    it('symlink-escaping operands ask, never auto-approve (real fs)', () => {
+      const root = mkdtempSync(join(tmpdir(), 'mc-permx-'));
+      const wt = join(root, 'wt');
+      const outside = join(root, 'outside');
+      mkdirSync(wt, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, 'secret.txt'), 'top secret');
+      symlinkSync(outside, join(wt, 'esc-link'));
+      try {
+        const p = PermissionPolicy.resolvePolicy({});
+        const decide = (text: string) =>
+          p.evaluate(
+            { type: 'shell_command', path: text, description: text },
+            { worktreePath: wt },
+          );
+        expect(decide('cat esc-link/secret.txt')).toBe('ask-user');
+        expect(decide('ls esc-link')).toBe('ask-user');
+        writeFileSync(join(wt, 'keep.ts'), 'export const a = 1;');
+        expect(decide('cat keep.ts')).toBe('auto-approve');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('legitimate in-worktree commands keep auto-approving', () => {
+      for (const text of [
+        'node --test',
+        'bun test',
+        'npm test',
+        'git status',
+        'git log --oneline',
+        'git diff --stat',
+        'cat notes.txt',
+        'echo hello',
+        'rtk ls',
+        'ls',
+        'FOO=1 npm test',
+      ]) {
+        expect(shell(text)).toBe('auto-approve');
+      }
+      // Plain path context (the R1 monitor `path: wt` shape) stays approved.
+      expect(
+        policy().evaluate(
+          { type: 'shell_command', path: WORKTREE, description: 'run build in worktree' },
+          { worktreePath: WORKTREE },
+        ),
+      ).toBe('auto-approve');
+    });
   });
 });

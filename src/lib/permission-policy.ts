@@ -165,6 +165,18 @@ const PUBLISH_PATTERNS = [
   /\bdeploy\b/,
 ];
 
+/**
+ * De-obfuscate one shell word for *detection* (never for execution):
+ * quote insertion (`g''it`, `"git"`, `gi't'`) and backslash escapes
+ * (`g\it`) still execute as the bare word, so detection must see through
+ * them. `$`-family expansions (`$X`, `${X}`, `$()`) are NOT normalized —
+ * any command containing `$`/backtick is unauditable and fails closed to
+ * ask-user via the simplicity gate instead.
+ */
+export function deobfuscateShellToken(token: string): string {
+  return token.replace(/['"\\]/g, '');
+}
+
 function stripPushQuotes(s: string): string {
   if (s.length >= 2) {
     const first = s[0];
@@ -218,10 +230,10 @@ function splitShellWords(input: string): string[] {
 export function isGitPushText(haystack: string): boolean {
   const tokens = splitShellWords(haystack);
   for (let i = 0; i < tokens.length; i++) {
-    if (stripPushQuotes(tokens[i]).toLowerCase() !== 'git') continue;
+    if (deobfuscateShellToken(tokens[i]).toLowerCase() !== 'git') continue;
     let j = i + 1;
     while (j < tokens.length) {
-      const low = stripPushQuotes(tokens[j]).toLowerCase();
+      const low = deobfuscateShellToken(tokens[j]).toLowerCase();
       if (
         low === '-c' ||
         low === '--git-dir' ||
@@ -249,7 +261,7 @@ export function isGitPushText(haystack: string): boolean {
       }
       break;
     }
-    if (j < tokens.length && stripPushQuotes(tokens[j]).toLowerCase() === 'push') {
+    if (j < tokens.length && deobfuscateShellToken(tokens[j]).toLowerCase() === 'push') {
       return true;
     }
   }
@@ -264,8 +276,22 @@ export function isGitPushText(haystack: string): boolean {
  * `../x`, `~/x`, `curl https://…`) is not. Anything flagged here keeps
  * outside handling (ask, never silent allow); everything else is session
  * scoped. Conservative: unknown shapes fail toward ask, never approve.
+ *
+ * Architectural note: free shell text is undecidable in general (variable
+ * expansion, command substitution, chaining, redirection can hide any
+ * target), so this function fails closed on every such shape: `$`/backtick
+ * (expansion/substitution — e.g. `cat "$HOME/.ssh/id_rsa"`), `;|&><`
+ * (chaining/redirection — the visible prefix says nothing about the rest)
+ * and `\` (escape obfuscation — e.g. `c\at /etc/passwd`) all count as
+ * outside. The simplicity gate in `evaluate` additionally refuses to
+ * auto-approve any non-trivial command text (globs, parens, unknown
+ * binaries); this function stays focused on outside/undecidable references
+ * so direct callers also fail closed.
  */
 export function referencesOutsideWorktree(commandText: string, worktreePath: string): boolean {
+  // Undecidable shapes: expansion/substitution, chaining/redirection,
+  // escape obfuscation, multi-line scripts. Never provably inside.
+  if (/[$`\\;|&><\r\n]/.test(commandText)) return true;
   for (const rawToken of splitShellWords(commandText)) {
     const candidates = [stripPushQuotes(rawToken)];
     // `KEY=/abs/path` assignments (e.g. GIT_DIR=/x): inspect the value too.
@@ -295,9 +321,174 @@ export function requiresHumanAuth(permissionRequest: PermissionPolicyRequest): b
   const haystack = [permissionRequest.action, permissionRequest.description, permissionRequest.target]
     .filter((part): part is string => typeof part === 'string')
     .join('\n');
+  // De-obfuscation happens per-token inside `isGitPushText` (quote
+  // insertion like `g''it` / `g\it` still executes as `git`), because
+  // stripping quotes BEFORE splitting would break quoted paths
+  // (`git -C "my dir" push` needs `"my dir"` to stay one token for the
+  // flag-skip). `$`-family tricks (`$Xgit push`) need no normalization —
+  // the `$` gate already forces those to ask-user. The regex patterns
+  // below run on de-obfuscated text so `g''h pr create` still matches.
   if (isGitPushText(haystack)) return true;
-  const lower = haystack.toLowerCase();
+  const lower = deobfuscateShellToken(haystack).toLowerCase();
   return PUBLISH_PATTERNS.some((pattern) => pattern.test(lower));
+}
+
+/**
+ * Architectural containment for free shell text: arbitrary shell is
+ * undecidable (expansion, substitution, interpreter flags like `node -e`
+ * can reach anywhere regardless of visible text), so NO allowlist-shaped
+ * regex decides safety. Instead, shell text auto-approves ONLY when it is
+ * provably simple AND its binary is known-safe AND it names no secret AND
+ * every path operand stays inside the worktree (symlink-aware). Anything
+ * else fails closed to ask-user — never approve, never a growing denylist.
+ *
+ * - Simple: one line, no `$` `` ` `` `\` `;|&><` `(){}[]*?!~^` control/glob
+ *   characters. (shortcut: globs like `*.ts` and `node -e "f(1)"` ask even
+ *   when inside; approve once by the operator, or spell out paths.)
+ * - Known-safe binary: bare first word (after `KEY=value` prefixes) in the
+ *   list below. Unknown binaries — shells, ssh/curl/sudo, package
+ *   managers-as-publishers, project tools not listed here — ask. Adding a
+ *   binary here WIDENS auto-approve; never add shells, network, privilege
+ *   or publish-capable tools.
+ * - No secret: private keys, `.ssh/`, `.gnupg/`, `.aws/`, `.env` files.
+ * - Inside operands: every non-flag path operand (and every `=` value)
+ *   must resolve inside the worktree, so `cat esc-link/secret.txt` (a
+ *   symlink escaping the worktree) asks instead of approving.
+ */
+const SHELL_AUTO_APPROVE_BINARIES: ReadonlySet<string> = new Set([
+  // Runtimes / build / test (bare `node --test`, `bun test`, `npm test`…).
+  'node', 'bun', 'deno', 'npm', 'pnpm', 'yarn', 'npx', 'tsx', 'tsc',
+  'jest', 'vitest', 'pytest', 'python', 'python3', 'make',
+  // Read-only VCS inspection (`git push` never reaches here: publishing
+  // forces ask-user first, even obfuscated).
+  'git',
+  // Read-only inspection.
+  'ls', 'cat', 'head', 'tail', 'wc', 'diff', 'file', 'stat', 'pwd',
+  'echo', 'printf', 'true', 'false', 'test',
+  // In-worktree search (operands still gated to inside, no secrets).
+  'grep', 'rg', 'find', 'fd',
+  // In-worktree file mutation (consistent with fileEdit inside-worktree
+  // auto-approve; outside/secret operands still refuse).
+  'mkdir', 'touch', 'cp', 'mv', 'rm',
+  // Project CLIs observed in this repo (`rtk` is the installed helper).
+  'rtk',
+]);
+
+/** Single-line, no shell metacharacters: `argv0 arg …` shapes only. */
+export function isSimpleAuditableShellText(text: string): boolean {
+  if (!text || /[\r\n\0]/.test(text)) return false;
+  // `$` expansion, backtick substitution, `\` escapes, chaining
+  // (`;|&`), redirection (`><`), subshells/groups (`(){}`), globs
+  // (`*?[]`), negation/history (`!`), home (`~`), anchors (`^`).
+  // Allowed: quotes (de-obfuscated for detection), `=`, `#`, `,`, `.`,
+  // `:`, `/`, `-`, `+`, `%`, `@`, `_`, alphanumerics, whitespace.
+  return !/[$`\\;|&><(){}[\]*?!~^]/.test(text);
+}
+
+const SECRET_BASENAMES: ReadonlySet<string> = new Set([
+  'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk',
+]);
+const SECRET_EXTENSIONS = ['.pem', '.key', '.p12', '.pfx'];
+
+/**
+ * Secret reads never auto-approve (even inside the worktree, even when the
+ * path is relative): private keys, `.ssh/`, `.gnupg/`, `.aws/`, `.env`
+ * files. Precise basenames/segments only — a name merely containing
+ * "secret" (e.g. `probe-secret.txt`) is NOT a secret.
+ */
+export function referencesSecretMaterial(commandText: string): boolean {
+  for (const rawToken of splitShellWords(commandText)) {
+    const candidates = [rawToken];
+    const eq = rawToken.indexOf('=');
+    if (eq >= 0) candidates.push(rawToken.slice(eq + 1));
+    for (let token of candidates) {
+      token = deobfuscateShellToken(token).toLowerCase();
+      token = token.replace(/^[()"']+|[()"']+$/g, '');
+      if (!token) continue;
+      const segments = token.split('/');
+      const base = segments[segments.length - 1];
+      if (SECRET_BASENAMES.has(base)) return true;
+      if (SECRET_EXTENSIONS.some((ext) => base.endsWith(ext))) return true;
+      if (segments.some((seg) => seg === '.ssh' || seg === '.gnupg' || seg === '.aws')) return true;
+      if (base === '.env' || (/^\.env\./.test(base) && base !== '.env.example' && base !== '.env.sample' && base !== '.env.template')) {
+        return true;
+      }
+      if (base === 'credentials.json' || base === '.netrc' || base === '_netrc') return true;
+    }
+  }
+  return false;
+}
+
+function firstCommandWord(tokens: string[]): string | null {
+  for (const raw of tokens) {
+    const token = deobfuscateShellToken(raw);
+    // `KEY=value` env prefixes are not the binary (`FOO=1 npm test`).
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+    if (!token) continue;
+    return token;
+  }
+  return null;
+}
+
+/**
+ * Null = provably simple/safe/inside: may auto-approve. String = human-
+ * readable refusal reason: must ask-user. Single-token inputs that are
+ * already known-inside paths (plain worktree directories, the R1 `path: wt`
+ * shape) skip the binary check — there is no binary to check.
+ */
+function shellAutoApproveRefusal(commandText: string, worktreePath: string): string | null {
+  const trimmed = commandText.trim();
+  if (!trimmed) return 'empty shell command text';
+  const tokens = splitShellWords(trimmed);
+  const hasWhitespace = tokens.length > 1;
+  if (!hasWhitespace) {
+    // Single token + already verified inside (caller checked): path context,
+    // not command text. Secrets still never auto-approve.
+    if (referencesSecretMaterial(trimmed)) {
+      return 'shell target references secret material (keys/.env) and requires human review';
+    }
+    return null;
+  }
+  if (!isSimpleAuditableShellText(trimmed)) {
+    return 'shell command is not simple/auditable (expansion, chaining, redirection, glob or quoting trick) and requires human review';
+  }
+  const argv0 = firstCommandWord(tokens);
+  if (!argv0 || argv0.includes('/')) {
+    return 'shell command has no auditable binary name and requires human review';
+  }
+  if (!SHELL_AUTO_APPROVE_BINARIES.has(argv0.toLowerCase())) {
+    return `shell binary "${argv0}" is not in the auto-approve allowlist and requires human review`;
+  }
+  if (referencesSecretMaterial(trimmed)) {
+    return 'shell command references secret material (keys/.env) and requires human review';
+  }
+  for (const raw of tokens.slice(1)) {
+    const token = deobfuscateShellToken(raw);
+    if (!token || token === '-' || token === '.' || token === '..') continue;
+    if (token.startsWith('-') && !token.includes('=')) continue; // flags
+    const candidates = [token];
+    const eq = token.indexOf('=');
+    // `KEY=value` env prefixes: the KEY is not a path, the value may be.
+    if (eq >= 0 && /^[A-Za-z_][A-Za-z0-9_]*=$/.test(token.slice(0, eq + 1))) {
+      candidates.length = 0;
+      candidates.push(token.slice(eq + 1));
+    } else if (eq >= 0 && token.startsWith('-')) {
+      candidates.length = 0;
+      candidates.push(token.slice(eq + 1));
+    }
+    for (let candidate of candidates) {
+      candidate = candidate.replace(/^[()"']+|[()"']+$/g, '');
+      if (!candidate || candidate === '.' || candidate === '-') continue;
+      // Bare words that cannot name a path (branch names, subcommand
+      // verbs, `origin`, `main`, counts) trivially resolve inside via
+      // their nearest existing ancestor — the containment check below
+      // passes them; symlink escapes and outside paths fail it.
+      if (!isPathContainedIn(candidate, worktreePath)) {
+        return `shell operand "${candidate}" escapes the worktree and requires human review`;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -413,16 +604,29 @@ export class PermissionPolicy {
         // path. The server runs shell in the session cwd (the worktree),
         // so bare commands are worktree-scoped — but the whole command
         // string always joins inside the worktree lexically, so explicit
-        // escapes (absolute outside paths, `..`, `~`, remote targets) must
-        // veto FIRST. Publishing already forced ask-user above.
+        // escapes (absolute outside paths, `..`, `~`, remote targets,
+        // expansion/substitution, chaining, redirection) veto FIRST.
+        // Publishing already forced ask-user above.
         const inWorktree = !referencesOutsideWorktree(rawPath, jobContext.worktreePath)
           && isInsideWorktree(rawPath, jobContext.worktreePath);
-        policyDecision = inWorktree
-          ? this.policy.permissions.shellCommand.insideWorktree
-          : this.policy.permissions.shellCommand.outsideWorktree;
-        reason = inWorktree
-          ? 'Shell command target is inside worktree'
-          : 'Shell command target is outside worktree';
+        if (!inWorktree) {
+          policyDecision = this.policy.permissions.shellCommand.outsideWorktree;
+          reason = 'Shell command target is outside worktree';
+          break;
+        }
+        // Inside-looking text auto-approves ONLY when provably simple,
+        // allowlisted, secret-free and operand-contained (see
+        // `shellAutoApproveRefusal`). Everything else — obfuscated push
+        // spellings, `$HOME` expansions, globs, unknown binaries, secret
+        // reads, symlink-escaping operands — fails closed to ask-user.
+        const refusal = shellAutoApproveRefusal(rawPath, jobContext.worktreePath);
+        if (refusal) {
+          policyDecision = 'ask-user';
+          reason = refusal;
+          break;
+        }
+        policyDecision = this.policy.permissions.shellCommand.insideWorktree;
+        reason = 'Shell command target is inside worktree';
         break;
       }
 

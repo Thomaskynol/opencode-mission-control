@@ -561,7 +561,7 @@ async function setupRepo() {
   await mustExec(['git', 'init'], repoDir);
   await mustExec(['git', 'config', 'user.email', 'test@test.com'], repoDir);
   await mustExec(['git', 'config', 'user.name', 'Test'], repoDir);
-  writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ scripts: { test: 'true' } }, null, 2));
+  writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ scripts: { test: 'test -f package.json' } }, null, 2));
   writeFileSync(join(repoDir, 'base.txt'), 'base\n');
   await mustExec(['git', 'add', '.'], repoDir);
   await mustExec(['git', 'commit', '-m', 'initial'], repoDir);

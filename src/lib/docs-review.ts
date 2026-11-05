@@ -76,12 +76,52 @@ const DOCS_STOPWORDS = new Set([
   'when', 'what', 'which', 'will', 'would', 'there', 'their', 'they', 'them',
   'como', 'para', 'com', 'uma', 'este', 'esta', 'isto', 'isso', 'aquele',
   'seja', 'sejam', 'deve', 'devem', 'cada', 'sobre', 'entre', 'pela', 'pelo',
+  // F2: doc-meta vocabulary is never evidence. A requirement demanding a
+  // *relative link* is satisfied by a real markdown link to the named file;
+  // a *verbatim* demand by the literal itself; a *describes* demand by
+  // explanatory substance — never by these words appearing in the doc.
+  // (Never code symbols: a `link()` function criterion belongs to the
+  // functional gate, not here.)
+  'relative', 'link', 'links', 'linked', 'linking',
+  'verbatim',
+  'describe', 'describes', 'described', 'describing',
+  'sentence', 'sentences', 'frase', 'frases',
 ]);
 
 /** Minimum non-whitespace chars for a changed docs file to count as content. */
 export const MIN_DOCS_CHARS = 40;
 
-/** Extract checkable literals: backtick spans, "quoted" spans, numbers, file-like tokens. */
+/** M7: meta-form vocabulary about the criterion's own shape
+ * (body/stamp/literal/path/upward — like the stopworded verbatim/relative/
+ * link). Satisfied by the verified artifacts themselves (a present stamp,
+ * a resolved link), never by the doc repeating those words. Kept separate
+ * from DOCS_STOPWORDS on purpose: the drop below applies only once artifact
+ * demands exist and verified, so pure-prose criteria keep the old behavior
+ * and instruction detection (extras/artifacts) is untouched. */
+const META_FORM_WORDS = new Set([
+  'body', 'bodies', 'stamp', 'stamps', 'literal', 'literals', 'path', 'paths', 'upward',
+]);
+
+/** True when the docs carry at least one repo-relative markdown link
+ * (external/anchor links ignored; resolved against the tree when given).
+ * M7: a link demand naming no file ("a relative link upward to the test
+ * file") still requires a real link — words alone never satisfy it. */
+function docHasAnyRelativeLink(docsContents: Record<string, string>, existingPaths?: Set<string>): boolean {
+  for (const [p, content] of Object.entries(docsContents)) {
+    LINK_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = LINK_RE.exec(content ?? '')) !== null) {
+      const raw = (m[1] ?? '').split('#')[0]!.split('?')[0]!.trim();
+      if (!raw || /^(https?:\/\/|mailto:|data:|ftp:)/i.test(raw)) continue;
+      if (!existingPaths) return true;
+      const resolved = resolveLinkTarget(p, m[1]!);
+      if (resolved !== null && existingPaths.has(resolved)) return true;
+    }
+  }
+  return false;
+}
+
+/** Extract checkable literals: backtick spans, "quoted" spans, numbers, file-like tokens, bare stamps. */
 function extractLiterals(text: string): string[] {
   const out: string[] = [];
   const push = (s: string) => {
@@ -95,6 +135,10 @@ function extractLiterals(text: string): string[] {
     // shortcut: file-like token heuristic — upgrade to a structured parser if it misfires.
     if (!/^(https?|ftp)$/i.test(m[0]!)) push(m[0]!);
   }
+  // F2: bare verbatim stamps (`BK-5M1` demanded without backticks in the
+  // acceptance) are checkable artifacts: the stamp must appear verbatim.
+  // shortcut: uppercase alnum-hyphen token heuristic — upgrade if it misfires.
+  for (const m of text.matchAll(/\b[A-Z0-9]{2,}(?:-[A-Z0-9]+)+\b/g)) push(m[0]!);
   return out.slice(0, 20);
 }
 
@@ -190,20 +234,27 @@ const DENIAL_MARKER_RE = new RegExp(
 );
 
 function splitSentences(text: string): string[] {
-  // Backtick-aware: dots inside `code spans` (commands, paths, versions)
-  // are not sentence boundaries — splitting there shatters one instruction
-  // into fragments that prove nothing (or hide a contradiction).
+  // Backtick-aware AND paren-aware: dots inside `code spans` (commands,
+  // paths, versions) and inside `(...)` groups (link targets like
+  // `../slug.test.mjs`, calls like `mean([1,2])`) are not sentence
+  // boundaries — splitting there shatters one instruction into fragments
+  // that prove nothing (or hide a contradiction). Paren depth resets on
+  // newline (sentences never span lines here); unbalanced closers clamp.
   const out: string[] = [];
   let cur = '';
   let inCode = false;
+  let parenDepth = 0;
   const flush = () => {
     const s = cur.trim().replace(/^#+\s*/, '');
     if (s.length > 0) out.push(s);
     cur = '';
+    parenDepth = 0;
   };
   for (const ch of text) {
     if (ch === '`') inCode = !inCode;
-    if (!inCode && (ch === '.' || ch === '!' || ch === '?' || ch === '\n' || ch === ';')) {
+    if (!inCode && ch === '(') parenDepth++;
+    if (!inCode && ch === ')' && parenDepth > 0) parenDepth--;
+    if (!inCode && parenDepth === 0 && (ch === '.' || ch === '!' || ch === '?' || ch === '\n' || ch === ';')) {
       flush();
     } else {
       cur += ch;
@@ -244,7 +295,7 @@ function extrasOf(sentence: string, kwLower: string[], litLower: string[]): Set<
   return extras;
 }
 
-function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: string[], criterionVerbs: string[] = []): boolean {
+function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: string[], criterionVerbs: string[] = [], minExtras = 2): boolean {
   // A verb that merely restates a criterion keyword (same word family:
   // "restore" for required "restoration") adds no instruction of its own —
   // only a verb OUTSIDE the criterion's vocabulary counts. An exact
@@ -252,7 +303,24 @@ function sentenceHasInstruction(sentence: string, kwLower: string[], litLower: s
   // even when short (run/use/set) — it carries no new instruction.
   const verbs = sentence.match(new RegExp(PROCEDURAL_VERB_RE.source, 'gi')) ?? [];
   const addsInstruction = verbs.some((v) => !isKeywordCopyVerb(v, kwLower, criterionVerbs));
-  return addsInstruction && extrasOf(sentence, kwLower, litLower).size >= 2;
+  return addsInstruction && extrasOf(sentence, kwLower, litLower).size >= minExtras;
+}
+
+/** True when the sentence carries a markdown link to a demanded file
+ * literal (`[text](../slug.test.mjs)`). F2: the link structure is itself
+ * checkable detail — the target words are the criterion's own vocabulary
+ * (excluded from extras by design), so a bare "See [..](file)" would
+ * otherwise never count as instruction despite verb + artifact. */
+function sentenceHasDemandLink(sentence: string, litLower: string[]): boolean {
+  const files = litLower.filter((l) => l.length >= 4 && /\.[a-z]{1,5}$/.test(l));
+  if (files.length === 0) return false;
+  LINK_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = LINK_RE.exec(sentence)) !== null) {
+    const target = (m[1] ?? '').toLowerCase();
+    if (files.some((f) => target.includes(f))) return true;
+  }
+  return false;
 }
 
 function commonPrefixLen(a: string, b: string): number {
@@ -290,6 +358,52 @@ const STEP_MARKER_RE = new RegExp(
   `(?:^|[\\s(])(?:\\d+[.)]|step\\s*\\d+|etapa\\s*\\d+|passo\\s*\\d+)\\b`,
   'i',
 );
+
+/** File-like literal (has a source/doc extension). */
+function isFileLikeToken(lit: string): boolean {
+  return /\.[a-z]{1,5}$/i.test(lit.trim());
+}
+
+/** True when a required literal names the examined doc itself
+ * (`docs/stats.md` demanded of `docs/stats.md`). F2: self-mention is not
+ * evidence — the file being among the examined docs IS the evidence. */
+function isSelfPathLiteral(lit: string, paths: string[]): boolean {
+  const norm = lit.trim().replace(/^\.\//, '');
+  return paths.some((p) => {
+    const pn = p.trim().replace(/^\.\//, '');
+    if (pn === norm || pn.toLowerCase() === norm.toLowerCase()) return true;
+    const base = pn.split('/').pop() ?? '';
+    if (!norm.includes('/') && base.toLowerCase() === norm.toLowerCase()) return true;
+    return false;
+  });
+}
+
+/** True when the docs carry a real markdown link to `file`
+ * (`[text](../stats.test.mjs)`), resolved against the reviewed tree when
+ * the tree is provided. F2: the link artifact — never the words
+ * "relative"/"link" — satisfies a link demand. */
+function docHasLinkTo(
+  docsContents: Record<string, string>,
+  file: string,
+  existingPaths?: Set<string>,
+): boolean {
+  const want = file.trim().toLowerCase();
+  for (const [p, content] of Object.entries(docsContents)) {
+    LINK_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = LINK_RE.exec(content ?? '')) !== null) {
+      const raw = (m[1] ?? '').split('#')[0]!.split('?')[0]!.trim();
+      if (!raw) continue;
+      if (/^(https?:\/\/|mailto:|data:|ftp:)/i.test(raw)) continue;
+      const norm = raw.replace(/^\.\//, '').toLowerCase();
+      if (!norm.includes(want) && !want.includes(norm)) continue;
+      if (!existingPaths) return true;
+      const resolved = resolveLinkTarget(p, m[1]!);
+      if (resolved !== null && existingPaths.has(resolved)) return true;
+    }
+  }
+  return false;
+}
 
 function sentenceHasConcreteDetail(sentence: string): boolean {
   if (/`[^`]+`/.test(sentence)) return true;
@@ -384,7 +498,11 @@ function qualifyingInstructionSentences(combined: string, keywords: string[], li
     if (DENIAL_MARKER_RE.test(s) && sentenceMentionsCriterion(s.toLowerCase(), keywords, literals)) continue;
     const words3 = s.toLowerCase().match(/[a-zà-ú0-9]{3,}/g) ?? [];
     if (words3.length < 5) continue;
-    if (sentenceHasInstruction(s, kwLower, litLower, criterionVerbs)) found.push(s);
+    // F2: a sentence linking a demanded file carries the artifact as its
+    // detail — one fresh word beside the link suffices (the target words
+    // are the criterion's own vocabulary, excluded from extras by design).
+    const minExtras = sentenceHasDemandLink(s, litLower) ? 1 : 2;
+    if (sentenceHasInstruction(s, kwLower, litLower, criterionVerbs, minExtras)) found.push(s);
   }
   return found;
 }
@@ -406,7 +524,7 @@ function qualifyingInstructionSentences(combined: string, keywords: string[], li
 export function assessDocsCoverage(
   requirement: DocsRequirement,
   docsContents: Record<string, string>,
-  opts?: { existingPaths?: string[] | Set<string> },
+  opts?: { existingPaths?: string[] | Set<string>; auxContents?: Record<string, string> },
 ): DocsAssessment {
   const paths = Object.keys(docsContents);
   const failNotCovered = (reason: string): DocsAssessment => ({
@@ -436,6 +554,40 @@ export function assessDocsCoverage(
     (k) => !literals.some((l) => l.toLowerCase().includes(k)),
   );
   const criterionVerbs = extractCriterionVerbs(requirement.description);
+  const existingSet = opts?.existingPaths
+    ? new Set(Array.isArray(opts.existingPaths) ? opts.existingPaths : [...opts.existingPaths])
+    : undefined;
+  // F2: existence-only claims ("docs/stats.md exists") are satisfied by the
+  // file being among the examined docs (or the reviewed tree) — never by
+  // the doc naming itself.
+  {
+    const withoutExist = keywords.filter((k) => k !== 'exists' && k !== 'exist' && k !== 'existence');
+    if (
+      /\bexists?\b/i.test(requirement.description) &&
+      withoutExist.length === 0 &&
+      literals.length > 0 &&
+      literals.every(isFileLikeToken)
+    ) {
+      for (const lit of literals) {
+        const present =
+          isSelfPathLiteral(lit, paths) ||
+          (existingSet !== undefined &&
+            [...existingSet].some(
+              (p) => p === lit || p.endsWith(`/${lit}`) || p.toLowerCase() === lit.toLowerCase(),
+            ));
+        if (!present) {
+          return failNotCovered(
+            `required file "${lit}" is not among the examined docs or the reviewed tree — create it or fix the criterion`,
+          );
+        }
+      }
+      return {
+        covered: true,
+        status: 'covered',
+        reason: `requirement "${requirement.id}" covered by docs: ${paths.join(', ')}`,
+      };
+    }
+  }
   // Global disclaimers void the whole doc (general patterns, EN+PT).
   for (const raw of splitSentences(combined)) {
     if (isGlobalDisclaimerSentence(raw)) {
@@ -466,21 +618,56 @@ export function assessDocsCoverage(
       }
     }
   }
-  // Required literals (commands, file names, numbers, quoted spans) must appear verbatim.
-  // Auxiliary only: presence never proves coverage, absence rejects.
+  // Required literals (commands, file names, numbers, quoted spans, stamps)
+  // must appear verbatim. Auxiliary only: presence never proves coverage,
+  // absence rejects. F2: a literal naming the examined doc itself is
+  // satisfied by the file's presence (self-mention proves nothing).
   for (const lit of literals) {
+    if (isSelfPathLiteral(lit, paths)) continue;
     if (!lowered.includes(lit.toLowerCase())) {
       return failNotCovered(`required literal "${lit}" not found in the examined docs — document it verbatim`);
     }
   }
+  // F2: link demands ("relative link ... containing F") are satisfied by a
+  // real markdown link to F — never by the words "relative"/"link".
+  // M7: a link demand naming no file ("a relative link upward to the test
+  // file") still requires a real relative link — words alone never do.
+  if (/\blink(s|ed|ing)?\b/i.test(requirement.description)) {
+    const demanded = literals.filter(isFileLikeToken).filter((f) => !isSelfPathLiteral(f, paths));
+    for (const f of demanded) {
+      if (!docHasLinkTo(docsContents, f, existingSet)) {
+        return failNotCovered(
+          `no relative link to "${f}" found in the examined docs — add a markdown link such as [text](../${f}) resolving inside the reviewed tree`,
+        );
+      }
+    }
+    if (demanded.length === 0 && !docHasAnyRelativeLink(docsContents, existingSet)) {
+      return failNotCovered(
+        'no relative link found in the examined docs — add a markdown link to the test file resolving inside the reviewed tree',
+      );
+    }
+  }
+  // M7: meta-form words (body/stamp/literal/path/upward) describe the
+  // criterion's own shape — the artifacts above already verified them, so
+  // the doc never needs to repeat them. Drop them from the majority once
+  // artifact demands exist and verified; the majority then still vetoes
+  // genuinely off-topic content via the remaining topic words, and
+  // mention-without-artifact still fails at the gates above. Pure-prose
+  // criteria (no artifact demands) keep the old behavior.
+  const hasArtifactDemands =
+    literals.length > 0 || /\blink(s|ed|ing)?\b/i.test(requirement.description);
+  const topicKeywords =
+    hasArtifactDemands && keywords.some((k) => META_FORM_WORDS.has(k))
+      ? keywords.filter((k) => !META_FORM_WORDS.has(k))
+      : keywords;
   // Keyword majority: the prose must be about the requirement, not another topic.
   // Auxiliary only: mention without explanation never passes (see substance below).
-  if (keywords.length > 0) {
-    const hits = keywords.filter((k) => lowered.includes(k));
-    const need = Math.max(1, Math.ceil(keywords.length / 2));
+  if (topicKeywords.length > 0) {
+    const hits = topicKeywords.filter((k) => lowered.includes(k));
+    const need = Math.max(1, Math.ceil(topicKeywords.length / 2));
     if (hits.length < need) {
       return failNotCovered(
-        `docs mention ${hits.length}/${keywords.length} required topic(s) (need ${need}: ${keywords.join('/')}) — the content is about something else`,
+        `docs mention ${hits.length}/${topicKeywords.length} required topic(s) (need ${need}: ${topicKeywords.join('/')}) — the content is about something else`,
       );
     }
   } else if (literals.length === 0) {
@@ -501,10 +688,43 @@ export function assessDocsCoverage(
       }
     }
   }
+  // F2: consistency demands ("consistent(ly) with code/test") are settled
+  // against real sibling artifacts — never by vocabulary. When read-only
+  // sibling contents are provided, the doc's checkable decision literals
+  // (backtick spans, numbers) in topic sentences must share at least one
+  // literal with the siblings; a doc claiming a decision the code never
+  // shows is rejected. Without siblings the check abstains (unknown) and
+  // the gates below decide — an unverifiable consistency stays
+  // inconclusive fail-closed, never covered on prose alone.
+  // shortcut: shared-literal heuristic — upgrade to a semantic verdict if it misfires.
+  if (/consisten/i.test(requirement.description) && opts?.auxContents) {
+    const auxCombined = Object.values(opts.auxContents).join('\n').toLowerCase();
+    if (auxCombined.trim().length > 0) {
+      const topicLits: string[] = [];
+      for (const raw of splitSentences(combined)) {
+        if (!sentenceMentionsCriterion(raw.toLowerCase(), topicKeywords, literals)) continue;
+        for (const m of raw.matchAll(/`([^`]+)`/g)) {
+          const t = (m[1] ?? '').trim();
+          if (t.length >= 2 && !topicLits.some((e) => e.toLowerCase() === t.toLowerCase())) topicLits.push(t);
+        }
+        for (const m of raw.matchAll(/\b\d+(?:\.\d+)?\b/g)) {
+          if (!topicLits.some((e) => e.toLowerCase() === m[0]!.toLowerCase())) topicLits.push(m[0]!);
+        }
+      }
+      if (topicLits.length > 0) {
+        const shared = topicLits.filter((l) => auxCombined.includes(l.toLowerCase()));
+        if (shared.length === 0) {
+          return failNotCovered(
+            `docs state a decision (${topicLits.slice(0, 3).join('/')} ) the sibling artifacts never show — fix the docs to match the code/tests or accept explicitly`,
+          );
+        }
+      }
+    }
+  }
   // Internal contradiction voids coverage (at minimum inconclusive, fail-closed).
   const contradiction = findContradiction(
     splitSentences(combined).map((s) => s.trim()).filter((s) => s.length > 0),
-    keywords,
+    topicKeywords,
     literals,
     criterionVerbs,
   );
@@ -517,12 +737,12 @@ export function assessDocsCoverage(
   // criterion carrying concrete checkable detail counts — a single vague
   // sentence, or plausible-but-unverifiable prose, is inconclusive
   // fail-closed (never auto-pass, never "covered" on shape alone).
-  const instructions = qualifyingInstructionSentences(combined, keywords, literals, criterionVerbs);
+  const instructions = qualifyingInstructionSentences(combined, topicKeywords, literals, criterionVerbs);
   const verified =
     literals.length > 0
       ? instructions.length > 0
       : instructions.some(
-          (s) => sentenceMentionsCriterion(s.toLowerCase(), keywords, literals) && sentenceHasConcreteDetail(s),
+          (s) => sentenceMentionsCriterion(s.toLowerCase(), topicKeywords, literals) && sentenceHasConcreteDetail(s),
         );
   if (!verified) {
     return failInconclusive(
@@ -573,7 +793,7 @@ export function assessDocsCoverageWithSemantics(
   requirement: DocsRequirement,
   docsContents: Record<string, string>,
   semantic: DocsSemanticInput | null | undefined,
-  opts?: { existingPaths?: string[] | Set<string> },
+  opts?: { existingPaths?: string[] | Set<string>; auxContents?: Record<string, string> },
 ): DocsAssessment {
   const heuristic = assessDocsCoverage(requirement, docsContents, opts);
   const failNotCovered = (reason: string): DocsAssessment => ({

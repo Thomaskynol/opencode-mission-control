@@ -974,6 +974,21 @@ export class Orchestrator {
     const existingPaths = tree.exitCode === 0
       ? tree.stdout.split('\n').map((l) => l.trim()).filter((l) => l !== '')
       : Object.keys(contents);
+    // F2c: consistency demands ("consistent with code/test") need real
+    // sibling artifacts in scope — the changed docs alone cannot prove or
+    // disprove them. Load the job's other touchSet files READ-ONLY (never
+    // counted as changed, capped) as auxiliary evidence for the
+    // consistency check only. Absent siblings → abstain (fail-closed).
+    const auxContents: Record<string, string> = {};
+    for (const entry of (job.touchSet ?? []).slice(0, 8)) {
+      const safe = String(entry).replace(/^\/+/, '').replace(/^\.\//, '');
+      if (safe === '' || safe.includes('..') || safe in contents || safe in auxContents) continue;
+      if (!existingPaths.includes(safe)) continue;
+      const shown = await gitCommand(['show', `${pins.jobHead}:${safe}`], { cwd: repoRoot });
+      if (shown.exitCode !== 0) continue;
+      auxContents[safe] = shown.stdout.slice(0, 20000);
+    }
+    const auxOpts = Object.keys(auxContents).length > 0 ? { auxContents } : {};
     const reasons: string[] = [];
     // R2 verified path (same model-pin pattern as reviewFunctionallyViaOpenCode
     // above): heuristic auxiliary + OpenCode semantic verdict, fail-closed.
@@ -1000,8 +1015,8 @@ export class Orchestrator {
     }
     for (const req of requirements) {
       const assessment = requireExternal
-        ? assessDocsCoverageWithSemantics(req, contents, semanticById.get(req.id), { existingPaths })
-        : assessDocsCoverage(req, contents, { existingPaths });
+        ? assessDocsCoverageWithSemantics(req, contents, semanticById.get(req.id), { existingPaths, ...auxOpts })
+        : assessDocsCoverage(req, contents, { existingPaths, ...auxOpts });
       // Lane docs3: dedicated inconclusive state is fail-closed — never auto-pass,
       // never testStatus passed; requires external reviewer or explicit human accept.
       if (assessment.status === 'inconclusive' || !assessment.covered) reasons.push(assessment.reason);
@@ -3183,8 +3198,13 @@ export class Orchestrator {
     // Coerência pré-despacho: bloqueia ANTES do claim/worktree/prompt, sem
     // despachar. Diagnóstico pede ampliar touchSet ou mover o teste p/ job
     // dependente. Claim atômico continua primeiro entre recursos.
+    // F3: siblings do plano ativo permitem propriedade de job ligado
+    // (regra canônica); sem plano em disco, cai no estrito fail-closed.
+    // O load fica FORA do try: falha de leitura nunca vira diagnóstico de
+    // coerência (fail-closed estrito via siblings undefined).
+    const siblingsPlan = await loadPlan(this.effectiveRepoRoot()).catch(() => null);
     try {
-      this.assertJobCoherent(job);
+      this.assertJobCoherent(job, siblingsPlan?.jobs);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await updatePlanJob(planId, job.name, {
@@ -3582,8 +3602,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     // Coerência no relaunch: nunca reinjeta prompt contraditório em loop.
     // Se o plano continua incoerente (aceite exige arquivo fora do touchSet),
     // exige aceite revisado/replanejo com diagnóstico — NÃO relaunch cego.
+    // F3: siblings do plano carregado (regra canônica, propriedade ligada vale).
     try {
-      this.assertJobCoherent(job);
+      this.assertJobCoherent(job, plan.jobs);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -4209,6 +4230,20 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     const effective = this.ensureEffectiveModel();
     const effectiveStr = modelRefToCliString(effective);
     return await withRepoRoot(repoRoot, async () => {
+      // F4: a failed start must never clobber the running intake. Refuse a
+      // second start while a non-terminal plan is active BEFORE persisting
+      // anything — the pre-generate record and the awaiting-plan fallback
+      // below both overwrite the single autoIntake slot (that is how a
+      // ceiling of 4 became 1 in lane M5: a doomed second start in the same
+      // scope replaced the running intake before failing "Active plan
+      // already exists"). Effective config (config.json) was never wrong;
+      // the persisted record was.
+      const running = await loadPlan(repoRoot).catch(() => null);
+      if (running && !isTerminalPlanStatus(running.status)) {
+        throw new Error(
+          `Active plan already exists (plan "${running.id}" [${running.status}] — refusing new intake; resume it or finish/cancel the plan first; previous autoIntake preserved)`,
+        );
+      }
       this.repoRoot = repoRoot;
       this.applyCeiling(validCeiling);
       // R04: stable identity + full entry BEFORE long ops — the pre-generate
@@ -5236,10 +5271,24 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
     return [...new Set(lines)];
   }
 
-  private assertJobCoherent(job: JobSpec): void {
+  private assertJobCoherent(job: JobSpec, siblings?: JobSpec[]): void {
     const acceptance = this.jobAcceptanceCriteria(job);
     if (acceptance.length === 0) return;
-    validateTaskCoherence({ name: job.name, acceptance, touchSet: job.touchSet, dependsOn: job.dependsOn });
+    validateTaskCoherence(
+      { name: job.name, acceptance, touchSet: job.touchSet, dependsOn: job.dependsOn },
+      siblings !== undefined
+        ? {
+            siblings: siblings
+              .filter((s) => s.name !== job.name)
+              .map((s) => ({
+                name: s.name,
+                acceptance: this.jobAcceptanceCriteria(s),
+                touchSet: s.touchSet,
+                dependsOn: s.dependsOn,
+              })),
+          }
+        : undefined,
+    );
   }
 
   /**
@@ -5335,9 +5384,9 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
     // Coerência pré-despacho: aceite fora do touchSet bloqueia o plano aqui,
     // antes do primeiro launch (diagnóstico pede ampliar touchSet ou mover
-    // o teste p/ job dependente).
+    // o teste p/ job dependente). F3: regra canônica com siblings do spec.
     for (const job of spec.jobs) {
-      this.assertJobCoherent(job);
+      this.assertJobCoherent(job, spec.jobs);
     }
   }
 

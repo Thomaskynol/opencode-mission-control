@@ -503,6 +503,20 @@ export async function startAutonomous(args: string[], deps?: AutoCommandDeps): P
       `bun ${cliPath()} close   # view only; never cancels the run`,
     ].join('\n');
   } catch (error) {
+    // F4: an active-plan refusal must not clobber the running intake — the
+    // awaiting-plan fallback below overwrites the single autoIntake slot
+    // (that is how a ceiling of 4 became 1 in lane M5). Re-report with the
+    // preserved intake id; nothing is overwritten here.
+    if (/active plan already exists/i.test(error instanceof Error ? error.message : String(error))) {
+      let kept = '';
+      try {
+        const snap = await withRepoRoot(repo, async () => loadRuntimeSnapshot());
+        if (snap?.autoIntake?.id) kept = ` (intake ${snap.autoIntake.id} preserved)`;
+      } catch {}
+      throw new Error(
+        `Active plan already exists${kept} — resume it instead of starting a new one; nothing was overwritten.`,
+      );
+    }
     // Preserve state for a public resume: keep the NL request as an
     // awaiting-plan intake so `resume --intake <id>` retries the model
     // without new JSON. No tasks, branches or workers are created here.
@@ -1654,7 +1668,8 @@ export async function touchsetIntake(args: string[]): Promise<string> {
     }
     // Coherence: acceptance file refs must stay writable by this job —
     // narrowing below them would make the plan incoherent (planning rejects
-    // the same shape via validateTaskCoherence).
+    // the same shape via validateTaskCoherence; F3 canonical rule: siblings
+    // allow linked-job ownership).
     const acceptanceLines = (job.prompt ?? '')
       .split('\n')
       .map((l) => l.trim())
@@ -1662,7 +1677,14 @@ export async function touchsetIntake(args: string[]): Promise<string> {
       .map((l) => l.replace(/^-\s*\[\s*\]\s+/, '').trim())
       .filter((l) => l.length > 0);
     try {
-      validateTaskCoherence({ name: jobName, acceptance: acceptanceLines, touchSet: patterns });
+      validateTaskCoherence(
+        { name: jobName, acceptance: acceptanceLines, touchSet: patterns, dependsOn: job.dependsOn },
+        {
+          siblings: plan.jobs
+            .filter((j) => j.name !== jobName)
+            .map((j) => ({ name: j.name, acceptance: [], touchSet: j.touchSet, dependsOn: j.dependsOn })),
+        },
+      );
     } catch (error) {
       throw new Error(`Incoherent touchSet: ${error instanceof Error ? error.message : String(error)}`);
     }
