@@ -12,13 +12,11 @@ import { detectOMO } from '../../src/lib/omo';
 // - Handoff legibility runs the real CLI in a CHILD process (fresh registry)
 //   with MC_XDG_DATA_DIR isolation, asserting on its stdout.
 describe('OMO JSONC detection (exp-8 false-negative)', () => {
-  const testDir = '/tmp/omo-jsonc-test';
+  let testDir = '';
 
   beforeEach(() => {
-    try {
-      (require('fs') as typeof import('fs')).rmSync(testDir, { recursive: true, force: true });
-    } catch {}
-    (require('fs') as typeof import('fs')).mkdirSync(testDir, { recursive: true });
+    const fs = require('fs') as typeof import('fs');
+    testDir = fs.mkdtempSync(join(tmpdir(), 'omo-jsonc-'));
   });
 
   afterEach(() => {

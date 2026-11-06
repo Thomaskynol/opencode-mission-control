@@ -4,7 +4,10 @@ export function createJobClient(
   port: number,
   password?: string,
 ): OpencodeClient {
-  const baseUrl = `http://127.0.0.1:${port}`;
+  // M12 (live vs opencode 2.2.5): the 2.x server only serves the API under
+  // `/api` — unprefixed paths return the SPA shell (200 text/html), so the
+  // legacy SDK silently returned garbage (list) / empty errors (create).
+  const baseUrl = `http://127.0.0.1:${port}/api`;
   const headers: Record<string, string> = {};
 
   if (password) {
@@ -61,6 +64,13 @@ export async function waitForServer(
 /**
  * Send a prompt to a session via the SDK.
  * Uses promptAsync to return immediately without waiting for completion.
+ *
+ * M12 LIMITATION (live vs 2.2.5, no LLM needed to prove): the
+ * POST /api/session/:id/prompt_async route is GONE (404 empty even for a
+ * valid session; sibling /prompt answers JSON). Prefix alone cannot fix
+ * this — full migration means POST /api/session/:id/prompt {text}
+ * (= v2Prompt), which needs a paid-model prompt to verify end to end.
+ * Left as-is (dead path: no src callers, launch uses v2Prompt); pending.
  */
 export async function sendPrompt(
   client: OpencodeClient,
@@ -85,21 +95,35 @@ export async function sendPrompt(
   }
 }
 
+/**
+ * M12 (live vs 2.2.5): SDK 1.1.53 does not unwrap the 2.x `{data}` envelope,
+ * so create/fork resolve as `{data: {data: {...session}}}` — `result.data.id`
+ * is undefined. Accept both shapes, fail closed when no id is present.
+ */
+function unwrapSessionRef(result: { data?: unknown; error?: unknown }, what: string): { id: string } {
+  const envelope = result.data as { data?: { id?: string }; id?: string } | undefined;
+  const session = envelope?.data ?? envelope;
+  if (!session || typeof session.id !== 'string' || session.id.length === 0) {
+    throw new Error(
+      `Failed to ${what}: ${result.error ? JSON.stringify(result.error) : 'unknown error'}`,
+    );
+  }
+  return session as { id: string };
+}
+
 export async function createSessionAndPrompt(
   client: OpencodeClient,
   prompt: string,
   agent?: string,
   model?: { providerID: string; modelID: string },
 ): Promise<string> {
-  const result = await client.session.create();
+  // 2.x rejects a bodiless POST (InvalidRequestError "Expected object").
+  const result = await client.session.create({ body: {} });
 
-  if (!result.data) {
-    throw new Error(
-      `Failed to create session: ${result.error ? JSON.stringify(result.error) : 'unknown error'}`,
-    );
-  }
-
-  const sessionId = result.data.id;
+  const sessionId = unwrapSessionRef(
+    result as { data?: unknown; error?: unknown },
+    'create session',
+  ).id;
   await sendPrompt(client, sessionId, prompt, agent, model);
   return sessionId;
 }
@@ -122,13 +146,10 @@ export async function forkJobSession(
     body: {},
   });
 
-  if (!forkResult.data) {
-    throw new Error(
-      `Failed to fork session: ${forkResult.error ? JSON.stringify(forkResult.error) : 'unknown error'}`,
-    );
-  }
-
-  const newSessionId = forkResult.data.id;
+  const newSessionId = unwrapSessionRef(
+    forkResult as { data?: unknown; error?: unknown },
+    'fork session',
+  ).id;
 
   if (options.additionalPrompt) {
     const contextPrompt = `Forked from job "${options.sourceJobName}" as "${options.newJobName}".\n\nAdditional context: ${options.additionalPrompt}`;

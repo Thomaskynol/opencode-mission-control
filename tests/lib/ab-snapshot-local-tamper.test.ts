@@ -49,8 +49,7 @@ afterEach(() => {
   rootDir = '';
 });
 async function initRepo(files: Record<string, string>): Promise<string> {
-  mkdirSync('/tmp/opencode', { recursive: true });
-  rootDir = mkdtempSync('/tmp/opencode/ab-a-');
+  rootDir = mkdtempSync(join(tmpdir(), 'ab-a-'));
   const dir = join(rootDir, 'repo');
   mkdirSync(dir, { recursive: true });
   await mustExec(['git', 'init'], dir);

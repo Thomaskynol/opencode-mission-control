@@ -1,23 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { detectOMO, describeOmoAvailability, OMO_RUNTIME_LIMITATION } from '../../src/lib/omo';
-import { mkdirSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 describe('OMO Detector', () => {
-  const originalCwd = process.cwd();
-  const testDir = '/tmp/omo-test';
+  let testDir: string;
 
   beforeEach(() => {
-    try {
-      rmSync(testDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
-    mkdirSync(testDir, { recursive: true });
-    process.chdir(testDir);
+    testDir = mkdtempSync(join(tmpdir(), 'omo-test-'));
   });
 
   afterEach(() => {
-    process.chdir(originalCwd);
     try {
       rmSync(testDir, { recursive: true, force: true });
     } catch {
@@ -29,9 +23,10 @@ describe('OMO Detector', () => {
     const config = {
       plugin: ['oh-my-opencode', 'opencode-mission-control'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
@@ -41,16 +36,17 @@ describe('OMO Detector', () => {
     const config = {
       plugin: ['opencode-mission-control'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
     expect(status.configSource).toBeNull();
   });
 
   it('should not detect OMO when opencode.json does not exist', async () => {
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(join(testDir, 'opencode.json'), '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
     expect(status.configSource).toBeNull();
@@ -60,18 +56,20 @@ describe('OMO Detector', () => {
     const config = {
       name: 'test',
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
     expect(status.configSource).toBeNull();
   });
 
   it('should not detect OMO when opencode.json is invalid JSON', async () => {
-    await Bun.write('./opencode.json', 'invalid json {');
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, 'invalid json {');
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
     expect(status.configSource).toBeNull();
@@ -81,9 +79,10 @@ describe('OMO Detector', () => {
     const config = {
       plugin: ['oh-my-opencode'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.sisyphusPath).toBeNull();
   });
@@ -92,21 +91,23 @@ describe('OMO Detector', () => {
     const config = {
       plugin: ['oh-my-opencode'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
-    mkdirSync('./.sisyphus', { recursive: true });
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
+    mkdirSync(join(testDir, '.sisyphus'), { recursive: true });
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
-    expect(status.sisyphusPath).toBe('.sisyphus');
+    expect(status.sisyphusPath).toBe(join(testDir, '.sisyphus'));
   });
 
   it('should prefer local config over global config', async () => {
     const config = {
       plugin: ['oh-my-opencode'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.configSource).toBe('local');
   });
@@ -115,9 +116,10 @@ describe('OMO Detector', () => {
     const config = {
       plugin: [],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
   });
@@ -126,9 +128,10 @@ describe('OMO Detector', () => {
     const config = {
       plugin: ['plugin-a', 'oh-my-opencode', 'plugin-b'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
@@ -138,9 +141,10 @@ describe('OMO Detector', () => {
     const config = {
       plugins: ['oh-my-opencode-slim@3.0.4', 'opencode-mission-control'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
@@ -150,31 +154,34 @@ describe('OMO Detector', () => {
     const config = {
       plugins: ['oh-my-openagent', 'opencode-mission-control'],
     };
-    await Bun.write('./opencode.json', JSON.stringify(config));
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify(config));
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
   });
 
   it('should resolve sisyphusPath from localPath directory', async () => {
-    mkdirSync('./sub', { recursive: true });
-    mkdirSync('./sub/.sisyphus', { recursive: true });
-    await Bun.write('./sub/opencode.json', JSON.stringify({ plugins: ['oh-my-openagent'] }));
+    mkdirSync(join(testDir, 'sub'), { recursive: true });
+    mkdirSync(join(testDir, 'sub', '.sisyphus'), { recursive: true });
+    const localPath = join(testDir, 'sub', 'opencode.json');
+    await Bun.write(localPath, JSON.stringify({ plugins: ['oh-my-openagent'] }));
 
-    const status = await detectOMO('./sub/opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
-    expect(status.sisyphusPath).toBe('sub/.sisyphus');
+    expect(status.sisyphusPath).toBe(join(testDir, 'sub', '.sisyphus'));
   });
 
   it('should detect real global config shape (plugins plural + slim@version + default_agent + JSONC + http URL)', async () => {
     // Replica fiel de ~/.config/opencode/opencode.json (somente leitura):
     // chave "plugins" no plural, pin "@3.0.4", sufixo -slim, default_agent
     // orchestrator, comentários JSONC e baseURL com http:// (não é comentário).
+    const localPath = join(testDir, 'opencode.json');
     await Bun.write(
-      './opencode.json',
+      localPath,
       `{
   "$schema": "https://opencode.ai/config.json",
   // Local plugins are auto-discovered from ./plugins/
@@ -189,7 +196,7 @@ describe('OMO Detector', () => {
 }`,
     );
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(true);
     expect(status.configSource).toBe('local');
@@ -198,15 +205,16 @@ describe('OMO Detector', () => {
   });
 
   it('should reject real absence (plugins plural sem OMO)', async () => {
+    const localPath = join(testDir, 'opencode.json');
     await Bun.write(
-      './opencode.json',
+      localPath,
       JSON.stringify({
         plugins: ['@tarquinen/opencode-dcp@3.2.0', 'opencode-mission-control'],
         default_agent: 'orchestrator',
       }),
     );
 
-    const status = await detectOMO('./opencode.json', '/nonexistent/global.json');
+    const status = await detectOMO(localPath, '/nonexistent/global.json');
 
     expect(status.detected).toBe(false);
     expect(status.configSource).toBeNull();
@@ -215,9 +223,10 @@ describe('OMO Detector', () => {
   });
 
   it('should describe disponível/carregado/utilizado without claiming load or use', async () => {
-    await Bun.write('./opencode.json', JSON.stringify({ plugins: ['oh-my-opencode-slim@3.0.4'] }));
-    const found = await detectOMO('./opencode.json', '/nonexistent/global.json');
-    const missing = await detectOMO('./missing.json', '/nonexistent/global.json');
+    const localPath = join(testDir, 'opencode.json');
+    await Bun.write(localPath, JSON.stringify({ plugins: ['oh-my-opencode-slim@3.0.4'] }));
+    const found = await detectOMO(localPath, '/nonexistent/global.json');
+    const missing = await detectOMO(join(testDir, 'missing.json'), '/nonexistent/global.json');
 
     const foundLine = describeOmoAvailability(found);
     expect(foundLine).toContain('disponível: detectado');

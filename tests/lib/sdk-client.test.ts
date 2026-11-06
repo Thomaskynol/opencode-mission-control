@@ -37,7 +37,7 @@ describe('sdk-client', () => {
 
       expect(sdk.createOpencodeClient).toHaveBeenCalledWith(
         expect.objectContaining({
-          baseUrl: 'http://127.0.0.1:14100',
+          baseUrl: 'http://127.0.0.1:14100/api',
         }),
       );
     });
@@ -181,6 +181,44 @@ describe('sdk-client', () => {
         data: undefined,
         error: { message: 'server error' },
       });
+
+      await expect(
+        createSessionAndPrompt(mockClient as any, 'Hello'),
+      ).rejects.toThrow('Failed to create session');
+    });
+
+    it('should call create with empty body', async () => {
+      mockSessionCreate.mockResolvedValue({
+        data: { id: 'new-session-id', title: 'test' },
+      });
+      mockSessionPromptAsync.mockResolvedValue({ data: {} });
+
+      await createSessionAndPrompt(mockClient as any, 'Hello');
+
+      expect(mockSessionCreate).toHaveBeenCalledWith({ body: {} });
+    });
+
+    it('should unwrap nested data envelope', async () => {
+      mockSessionCreate.mockResolvedValue({
+        data: { data: { id: 'nested-session-id' } },
+      });
+      mockSessionPromptAsync.mockResolvedValue({ data: {} });
+
+      const sessionId = await createSessionAndPrompt(mockClient as any, 'Hello');
+
+      expect(sessionId).toBe('nested-session-id');
+    });
+
+    it('should throw when session id is missing (fail-closed)', async () => {
+      mockSessionCreate.mockResolvedValue({ data: {} });
+
+      await expect(
+        createSessionAndPrompt(mockClient as any, 'Hello'),
+      ).rejects.toThrow('Failed to create session');
+    });
+
+    it('should throw when session id is empty (fail-closed)', async () => {
+      mockSessionCreate.mockResolvedValue({ data: { id: '' } });
 
       await expect(
         createSessionAndPrompt(mockClient as any, 'Hello'),

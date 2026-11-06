@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 
 function git(cwd: string, args: string[]): void {
@@ -22,8 +23,7 @@ describe('B: heal containment requires task scope + real file proof', () => {
   let repo = '';
   let intWt = '';
   beforeEach(() => {
-    mkdirSync('/tmp/opencode', { recursive: true });
-    root = mkdtempSync('/tmp/opencode/ab-b-');
+    root = mkdtempSync(join(tmpdir(), 'ab-b-'));
     repo = join(root, 'repo');
     intWt = join(root, 'int');
     mkdirSync(repo, { recursive: true });

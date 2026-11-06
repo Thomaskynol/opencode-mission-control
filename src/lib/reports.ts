@@ -48,7 +48,10 @@ export async function readReport(jobId: string): Promise<AgentReport | null> {
   try {
     const content = await file.text();
     return JSON.parse(content) as AgentReport;
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error; // IO/read errors propagate — only malformed JSON is "corrupt"
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`[MC] Skipping corrupt report ${filePath} (job: ${jobId}): ${reason}`);
     return null;
   }
 }
@@ -65,6 +68,7 @@ export async function readAllReports(): Promise<AgentReport[]> {
   }
 
   const reports: AgentReport[] = [];
+  let skipped = 0;
   for (const entry of entries) {
     if (!entry.endsWith('.json') || entry.endsWith('.tmp')) {
       continue;
@@ -76,9 +80,20 @@ export async function readAllReports(): Promise<AgentReport[]> {
       const content = await file.text();
       const report = JSON.parse(content) as AgentReport;
       reports.push(report);
-    } catch {
-      // Skip malformed report files
+    } catch (error) {
+      // Bulk listing stays resilient: corrupt JSON and IO failures both skip, with distinct warns (single readReport propagates IO)
+      skipped += 1;
+      const jobId = entry.slice(0, -'.json'.length);
+      const reason = error instanceof Error ? error.message : String(error);
+      const kind = error instanceof SyntaxError ? 'corrupt' : 'unreadable (IO)';
+      console.warn(
+        `[MC] Skipping ${kind} report ${filePath} (job: ${jobId}): ${reason}`,
+      );
     }
+  }
+
+  if (skipped > 0) {
+    console.warn(`[MC] Skipped ${skipped} corrupt report(s) in ${reportsDir}`);
   }
 
   return reports;
