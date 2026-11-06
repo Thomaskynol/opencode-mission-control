@@ -247,15 +247,27 @@ export async function refreshIntegrationFromMain(
 ): Promise<{ success: boolean; conflicts?: string[] }> {
   const { worktreePath, repo } = await integrationPaths(planId, repoRoot);
 
-  // Fetch latest main from origin
-  const fetchResult = await gitCommand(['-C', worktreePath, 'fetch', 'origin']);
-  if (fetchResult.exitCode !== 0) {
-    return { success: false, conflicts: ['Failed to fetch from origin'] };
+  // Contrato: base canônica getDefaultBranch; sem remote usa base local em vez de falhar no fetch.
+  const defaultBranch = await getDefaultBranch(repo);
+  const remotesResult = await gitCommand(['remote'], { cwd: repo });
+  const hasOrigin =
+    remotesResult.exitCode === 0 &&
+    remotesResult.stdout.split('\n').map((r) => r.trim()).includes('origin');
+  let targetBranch = defaultBranch;
+  if (hasOrigin) {
+    // Attempt to fetch latest from origin (remote-sync path).
+    const fetchResult = await gitCommand(['-C', worktreePath, 'fetch', 'origin']);
+    if (fetchResult.exitCode !== 0) {
+      return { success: false, conflicts: ['Failed to fetch from origin'] };
+    }
+    targetBranch = `origin/${defaultBranch}`;
   }
 
-  // Attempt to rebase onto the default branch (repo-scoped, never bare cwd).
-  const defaultBranch = await getDefaultBranch(repo);
-  const rebaseResult = await gitCommand(['-C', worktreePath, 'rebase', `origin/${defaultBranch}`]);
+  const verifyResult = await gitCommand(['-C', worktreePath, 'rev-parse', '--verify', targetBranch]);
+  if (verifyResult.exitCode !== 0) {
+    return { success: false, conflicts: [`Base branch "${targetBranch}" not found`] };
+  }
+  const rebaseResult = await gitCommand(['-C', worktreePath, 'rebase', targetBranch]);
 
   if (rebaseResult.exitCode !== 0) {
     // Extract conflicts from stderr

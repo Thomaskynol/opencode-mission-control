@@ -1,6 +1,6 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { getJobByName } from '../lib/job-state';
-import { gitCommand } from '../lib/git';
+import { gitCommand, getDefaultBranch } from '../lib/git';
 
 async function executeGitDiff(
   worktreePath: string,
@@ -8,28 +8,23 @@ async function executeGitDiff(
   stat: boolean = false,
   baseBranch?: string,
 ): Promise<string> {
-  let base: string;
-  if (baseBranch) {
-    base = baseBranch;
-  } else {
-    const baseResult = await gitCommand(
-      ['rev-parse', '--abbrev-ref', 'origin/HEAD'],
-      { cwd: worktreePath },
+  // Contrato: base é do plano/tarefa, nunca origin/main fixo — unificada em getDefaultBranch.
+  const base = baseBranch ?? (await getDefaultBranch(worktreePath));
+  const baseCheck = await gitCommand(['rev-parse', '--verify', base], {
+    cwd: worktreePath,
+  });
+  if (baseCheck.exitCode !== 0) {
+    throw new Error(
+      `Cannot diff: base branch "${base}" not found in ${worktreePath} ` +
+        `(no remote default, main, or master matched — set an explicit baseBranch instead of guessing)`,
     );
-    base = 'main';
-    if (baseResult.exitCode === 0) {
-      const match = baseResult.stdout.match(/origin\/(.+)/);
-      if (match) {
-        base = match[1];
-      }
-    }
   }
 
   const args = ['diff'];
   if (stat) {
     args.push('--stat');
   }
-  args.push(`origin/${base}..${branch}`);
+  args.push(`${base}..${branch}`);
 
   const diffResult = await gitCommand(args, { cwd: worktreePath });
 

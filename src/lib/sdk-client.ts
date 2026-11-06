@@ -44,8 +44,22 @@ export async function waitForServer(
 
   while (Date.now() - startTime < timeoutMs) {
     try {
-      await client.session.list();
-      return client;
+      const result = (await client.session.list()) as {
+        data?: unknown;
+        error?: unknown;
+      };
+      // Só JSON sem erro prova a API: o SDK não lança em !ok (401/404
+      // voltam como {error}) e 200 text/html (SPA sem o prefixo /api)
+      // volta como {data: string}. Ambos nunca contam como ready.
+      if (
+        result !== null &&
+        typeof result === 'object' &&
+        !result.error &&
+        result.data !== undefined &&
+        typeof result.data !== 'string'
+      ) {
+        return client;
+      }
     } catch {
       const remaining = timeoutMs - (Date.now() - startTime);
       const waitTime = Math.min(delay, remaining, maxDelay);
@@ -62,37 +76,127 @@ export async function waitForServer(
 }
 
 /**
- * Send a prompt to a session via the SDK.
- * Uses promptAsync to return immediately without waiting for completion.
+ * Send a prompt to a session via fetch direto no 2.x.
  *
- * M12 LIMITATION (live vs 2.2.5, no LLM needed to prove): the
- * POST /api/session/:id/prompt_async route is GONE (404 empty even for a
- * valid session; sibling /prompt answers JSON). Prefix alone cannot fix
- * this — full migration means POST /api/session/:id/prompt {text}
- * (= v2Prompt), which needs a paid-model prompt to verify end to end.
- * Left as-is (dead path: no src callers, launch uses v2Prompt); pending.
+ * L1/A (verificado live no 2.2.5): POST /api/session/{id}/prompt {text}
+ * responde 200 {data:{id:msg_...}}; prompt_async e POST message NÃO existem
+ * (404 vazios) e o SDK 1.1.53 só conhece as rotas extintas — por isso o
+ * transporte aqui é fetch direto, nunca client.session.promptAsync.
+ * Preserva sessão (path), diretório e auth (headers do cliente, sem logar
+ * segredo). Retorna o id da mensagem; erro é sempre explícito (rede,
+ * status, não-JSON, schema).
+ *
+ * agent/model por mensagem não existem no 2.2.5 (extras no /prompt são
+ * ignorados pelo servidor): passam a falhar fechado — o pin é propriedade
+ * da criação da sessão (ver createSessionAndPrompt / launchWorkerViaServe).
  */
 export async function sendPrompt(
-  client: OpencodeClient,
+  client: OpencodeClient | V2Client,
   sessionId: string,
   prompt: string,
   agent?: string,
   model?: { providerID: string; modelID: string },
-): Promise<void> {
+): Promise<string> {
+  if (agent !== undefined || model !== undefined) {
+    throw new Error(
+      `Failed to send prompt to session ${sessionId}: per-prompt agent/model is not supported by POST /session/${sessionId}/prompt ` +
+        `(agent/model are session-creation properties) — pin them at session creation instead`,
+    );
+  }
+  const { baseUrl, headers } = resolvePromptTransport(client, sessionId);
+  // O config do SDK já traz Content-Type padrão (duplicar dá 415 no
+  // serve): remove qualquer content-type herdado e fixa um só.
+  const fetchHeaders: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== 'content-type') fetchHeaders[key] = value;
+  }
+  fetchHeaders['Content-Type'] = 'application/json';
+  let response: Response;
   try {
-    await client.session.promptAsync({
-      path: { id: sessionId },
-      body: {
-        parts: [{ type: 'text', text: prompt }],
-        ...(agent ? { agent } : {}),
-        ...(model ? { model } : {}),
+    response = await fetch(
+      `${baseUrl}/session/${encodeURIComponent(sessionId)}/prompt`,
+      {
+        method: 'POST',
+        // Nunca logar/ecoar headers (podem conter Authorization).
+        headers: fetchHeaders,
+        body: JSON.stringify({ text: prompt }),
       },
-    });
+    );
   } catch (error) {
     throw new Error(
       `Failed to send prompt to session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(
+      `Failed to send prompt to session ${sessionId}: POST /session/${sessionId}/prompt failed (${response.status}): ${detail}`,
+    );
+  }
+  const text = await response.text();
+  let payload: unknown;
+  try {
+    payload = text ? JSON.parse(text) : undefined;
+  } catch {
+    throw new Error(
+      `Failed to send prompt to session ${sessionId}: POST /session/${sessionId}/prompt returned non-JSON output`,
+    );
+  }
+  const id = (payload as { data?: { id?: unknown } } | null | undefined)?.data?.id;
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new Error(
+      `Failed to send prompt to session ${sessionId}: POST /session/${sessionId}/prompt response is missing the data envelope`,
+    );
+  }
+  return id;
+}
+
+/** Base + headers para o POST /prompt, de V2Client ou do OpencodeClient. */
+function resolvePromptTransport(
+  client: OpencodeClient | V2Client,
+  sessionId: string,
+): { baseUrl: string; headers: Record<string, string> } {
+  const maybeV2 = client as Partial<V2Client>;
+  if (
+    maybeV2 !== null &&
+    typeof maybeV2 === 'object' &&
+    typeof maybeV2.baseUrl === 'string' &&
+    maybeV2.baseUrl.length > 0 &&
+    maybeV2.headers !== undefined
+  ) {
+    return {
+      baseUrl: maybeV2.baseUrl.replace(/\/+$/, ''),
+      headers: normalizeHeaderMap(maybeV2.headers),
+    };
+  }
+  const inner = (
+    client as unknown as {
+      _client?: { getConfig?: () => { baseUrl?: string; headers?: unknown } };
+    }
+  )._client;
+  const config = inner?.getConfig?.();
+  if (config && typeof config.baseUrl === 'string' && config.baseUrl.length > 0) {
+    return {
+      baseUrl: config.baseUrl.replace(/\/+$/, ''),
+      headers: normalizeHeaderMap(config.headers),
+    };
+  }
+  throw new Error(
+    `Failed to send prompt to session ${sessionId}: cannot resolve server baseUrl from client (use createV2Client or createJobClient)`,
+  );
+}
+
+function normalizeHeaderMap(headers: unknown): Record<string, string> {
+  if (!headers) return {};
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+    const out: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }
+  if (typeof headers === 'object') return { ...(headers as Record<string, string>) };
+  return {};
 }
 
 /**
@@ -117,14 +221,22 @@ export async function createSessionAndPrompt(
   agent?: string,
   model?: { providerID: string; modelID: string },
 ): Promise<string> {
+  // agent/model são propriedades da sessão no 2.x (o /prompt por mensagem
+  // os ignora): fixados na criação. modelID (legado) -> id (2.x, verificado
+  // live: {providerID,id} ecoa, {providerID,modelID} dá 400).
+  const body: Record<string, unknown> = {};
+  if (agent !== undefined) body.agent = agent;
+  if (model !== undefined) {
+    body.model = { providerID: model.providerID, id: model.modelID };
+  }
   // 2.x rejects a bodiless POST (InvalidRequestError "Expected object").
-  const result = await client.session.create({ body: {} });
+  const result = await client.session.create({ body });
 
   const sessionId = unwrapSessionRef(
     result as { data?: unknown; error?: unknown },
     'create session',
   ).id;
-  await sendPrompt(client, sessionId, prompt, agent, model);
+  await sendPrompt(client, sessionId, prompt);
   return sessionId;
 }
 

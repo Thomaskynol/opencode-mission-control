@@ -154,13 +154,19 @@ function hashOutput(output: string): string {
 
 /**
  * Scope a v2 envelope to one worker session. Durable events carry the
- * session in `durable.aggregateID`; live ones in `data.sessionID`.
+ * session in `durable.aggregateID`; live ones in `data.sessionID`. Some
+ * 2.2.5 events nest the pointer one level deeper (form.created carries
+ * `data.form.sessionID`, message.part.updated `data.part.sessionID`) —
+ * without unwrapping, those events are dropped as foreign and a worker
+ * blocked on a form stays invisible while `received` never grows.
  * Envelopes without any session pointer (heartbeats, server.connected)
  * never belong to a job.
  */
 export function eventBelongsToSession(event: any, sessionID: string | undefined): boolean {
   if (!sessionID) return false;
   if (typeof event?.data?.sessionID === 'string') return event.data.sessionID === sessionID;
+  if (typeof event?.data?.form?.sessionID === 'string') return event.data.form.sessionID === sessionID;
+  if (typeof event?.data?.part?.sessionID === 'string') return event.data.part.sessionID === sessionID;
   if (typeof event?.durable?.aggregateID === 'string') {
     return event.durable.aggregateID === sessionID;
   }
@@ -575,7 +581,12 @@ export class JobMonitor extends EventEmitter {
           if (!payload) continue;
           try {
             const event = JSON.parse(payload);
-            if (eventBelongsToSession(event, job.remoteSessionID)) {
+            if (event?.type === 'server.connected') {
+              // Serve-alive proof: a healthy but quiet stream delivers only
+              // this + heartbeats. Counting it productive keeps the F5 bound
+              // from giving up on a live serve that simply has nothing to say.
+              received++;
+            } else if (eventBelongsToSession(event, job.remoteSessionID)) {
               received++;
               await this.handleSSEEvent(job, event);
             }
@@ -634,6 +645,58 @@ export class JobMonitor extends EventEmitter {
     }
   }
 
+  /**
+   * Confirm a non-authoritative idle/error hint against the authoritative
+   * session outcome before transitioning. Rationale (verified live on
+   * 2.2.5): `session.status` idle and `session.idle` fire on turn
+   * boundaries, waits and retries — never a terminal verdict by
+   * themselves. Blind completion false-completes a job that is merely
+   * between turns or blocked on a question/permission; blind failure on
+   * `session.error` false-fails a retryable blip. Only a terminal outcome
+   * (`succeeded`/`failed` on GET /session/:id) transitions, routed through
+   * the stale-guard in handleSSEEvent so a concurrent SSE/poll delivery
+   * never duplicates. Anything else (active session, interrupted, fetch
+   * failure) is a fail-closed no-op — the per-poll outcome reconciliation
+   * below retries the confirmation later.
+   *
+   * Callers without a session pointer (no remoteSessionID or no live SSE
+   * subscription — today only unit fakes and synthetic events) keep the
+   * legacy trust-the-event behavior: there is nothing to confirm against.
+   */
+  private async confirmServeTerminal(job: Job, legacyStatus: 'completed' | 'failed'): Promise<void> {
+    const subscription = this.sseSubscriptions.get(job.id);
+    if (job.remoteSessionID && subscription) {
+      let outcome: string | undefined;
+      try {
+        const session = await v2GetSession(subscription.client, job.remoteSessionID);
+        outcome = (session as unknown as { outcome?: string }).outcome;
+      } catch {
+        return;
+      }
+      if (outcome === 'succeeded') {
+        await this.handleSSEEvent(job, {
+          type: 'session.execution.succeeded',
+          data: { sessionID: job.remoteSessionID },
+        });
+      } else if (outcome === 'failed') {
+        await this.handleSSEEvent(job, {
+          type: 'session.execution.failed',
+          data: { sessionID: job.remoteSessionID },
+        });
+      }
+      return;
+    }
+    const now = new Date().toISOString();
+    this.cleanupSSEForJob(job.id);
+    if (legacyStatus === 'failed') {
+      await updateJob(job.id, { status: 'failed', completedAt: now });
+      this.emit('failed', { ...job, status: 'failed', completedAt: now });
+    } else {
+      await updateJob(job.id, { status: 'completed', completedAt: now });
+      this.emit('complete', { ...job, status: 'completed', completedAt: now });
+    }
+  }
+
   private async handleSSEEvent(job: Job, event: any): Promise<void> {
     const eventType = event.type || event.event;
 
@@ -688,7 +751,12 @@ export class JobMonitor extends EventEmitter {
       }
 
       case 'form.created': {
-        const formID = event.data?.id;
+        // Real 2.2.5 wire (captured live): the id lives under data.form
+        // ({data:{form:{id, sessionID, ...}}}); the flat data.id shape
+        // stays accepted for older emitters. Reading only data.id drops
+        // the question and the worker waits on the form forever.
+        const formID =
+          event.data?.form?.id ?? event.data?.id ?? event.properties?.form?.id ?? event.properties?.id;
         if (typeof formID === 'string') {
           await this.registerFormQuestion(job, formID);
         }
@@ -697,7 +765,8 @@ export class JobMonitor extends EventEmitter {
 
       case 'form.replied':
       case 'form.cancelled': {
-        const formID = event.data?.id;
+        const formID =
+          event.data?.form?.id ?? event.data?.id ?? event.properties?.form?.id ?? event.properties?.id;
         if (typeof formID === 'string') {
           removePendingQuestion(job.id, formID);
           await dropPersistedQuestion(job.id, formID).catch(() => {});
@@ -712,7 +781,16 @@ export class JobMonitor extends EventEmitter {
 
       case 'permission.replied':
       case 'permission.rejected': {
-        const requestID = event.data?.id ?? event.data?.requestID;
+        // 2.2.5 carries the pointer as data.requestID; older emitters used
+        // data.id. Accept both (plus the properties mirror) — this only
+        // clears already-known pending questions, never transitions state.
+        const requestID =
+          event.data?.requestID ??
+          event.data?.id ??
+          event.data?.permissionID ??
+          event.data?.permissionId ??
+          event.properties?.requestID ??
+          event.properties?.id;
         if (typeof requestID === 'string') {
           this.questionRelay.clearPermissionTimeout(job.id, requestID);
           removePendingQuestion(job.id, `perm:${requestID}`);
@@ -723,34 +801,39 @@ export class JobMonitor extends EventEmitter {
         break;
       }
       case 'session.status': {
-        const statusPayload = event.properties?.status;
+        // Wire-first read (2.2.5 nests under data; properties is the
+        // SDK-decoded mirror). An idle loop is NOT a terminal verdict —
+        // it fires on turn boundaries, waits and retries too — so idle
+        // only transitions after the authoritative outcome confirms it.
+        // Busy/retry is proof of life: activity tick, never terminal.
+        const statusPayload = event.data?.status ?? event.properties?.status;
         if (statusPayload?.type === 'idle') {
-          const now = new Date().toISOString();
-          this.cleanupSSEForJob(job.id);
-          await updateJob(job.id, { status: 'completed', completedAt: now });
-          this.emit('complete', { ...job, status: 'completed', completedAt: now });
+          await this.confirmServeTerminal(job, 'completed');
+        } else if (statusPayload?.type === 'busy' || statusPayload?.type === 'retry') {
+          this.updateEventAccumulator(job.id, {});
         }
         break;
       }
 
       case 'session.idle': {
-        const now = new Date().toISOString();
-        this.cleanupSSEForJob(job.id);
-        await updateJob(job.id, { status: 'completed', completedAt: now });
-        this.emit('complete', { ...job, status: 'completed', completedAt: now });
+        // Same confirmation as session.status idle: a bare idle event
+        // never completes the job by itself (false-complete on every
+        // turn boundary / wait otherwise).
+        await this.confirmServeTerminal(job, 'completed');
         break;
       }
 
       case 'session.error': {
-        const now = new Date().toISOString();
-        this.cleanupSSEForJob(job.id);
-        await updateJob(job.id, { status: 'failed', completedAt: now });
-        this.emit('failed', { ...job, status: 'failed', completedAt: now });
+        // Not in the 2.2.5 catalog and retryable errors exist
+        // (session.retry.scheduled), so never fail blindly: complete/fail
+        // only on a confirmed terminal outcome, else stay running.
+        await this.confirmServeTerminal(job, 'failed');
         break;
       }
 
       case 'message.part.updated': {
-        const part = event.properties?.part;
+        // Wire-first read: 2.2.5 nests the part under data.
+        const part = event.data?.part ?? event.properties?.part;
         if (part?.type === 'tool' && part.tool === 'question') {
           void this.handleQuestionToolUpdate(job, part);
         }
@@ -759,7 +842,10 @@ export class JobMonitor extends EventEmitter {
       }
 
       case 'file.edited': {
-        const filePath = event.properties?.path || event.path;
+        // 2.2.5 carries the path as data.file (SDK v2 shape); the flat
+        // path/property variants stay accepted for older emitters.
+        const filePath =
+          event.data?.file ?? event.properties?.file ?? event.properties?.path ?? event.path;
         if (filePath) {
           this.updateEventAccumulator(job.id, {
             filesEdited: [filePath],
@@ -826,14 +912,20 @@ export class JobMonitor extends EventEmitter {
    */
   private async handlePermissionAsked(job: Job, event: any): Promise<void> {
     try {
-      const data = event.data ?? {};
+      const data = event.data ?? event.properties ?? {};
       const adapted = {
         properties: {
           id: data.id ?? data.requestID,
-          type: data.action,
-          path: Array.isArray(data.resources) ? data.resources[0] : undefined,
-          description: data.message ?? data.action,
-          title: data.action,
+          // 2.2.5 Permission.Request uses action/resources; accept the
+          // SDK-v2 permission/patterns mirror for older emitters.
+          type: data.action ?? data.permission,
+          path: Array.isArray(data.resources)
+            ? data.resources[0]
+            : Array.isArray(data.patterns)
+              ? data.patterns[0]
+              : undefined,
+          description: data.message ?? data.action ?? data.permission,
+          title: data.action ?? data.permission,
         },
       };
       await this.handlePermissionUpdate(job, adapted);
@@ -1076,6 +1168,36 @@ export class JobMonitor extends EventEmitter {
     }
   }
 
+  /**
+   * Per-poll SSE-loss recovery for serve-mode jobs. The event stream is
+   * volatile by contract (slow consumers overflow, disconnects miss
+   * events, a late subscribe starts after the terminal event) and the F5
+   * bound can retire the subscription entirely — in all those cases the
+   * job would stay `running` forever with no new event to fix it. The
+   * session outcome (GET /session/:id, verified live on 2.2.5) is
+   * authoritative: reconcile through it every poll so a missed terminal
+   * event still completes/fails exactly once (stale-guard dedups against
+   * a concurrent SSE delivery). Non-terminal or unreachable sessions are
+   * a fail-closed no-op — SSE stays authoritative for this cycle.
+   */
+  private async reconcileServeOutcome(job: Job): Promise<void> {
+    if (!job.remoteSessionID) return;
+    try {
+      let client = this.sseSubscriptions.get(job.id)?.client;
+      if (!client) {
+        if (!job.port) return;
+        const config = await loadConfig().catch(() => undefined);
+        const password = resolveJobPassword(job, config?.serverPassword);
+        if (!password) return;
+        client = createV2Client(job.port, password);
+      }
+      await this.syncSessionOutcome(job, client);
+    } catch {
+      // Fail-closed no-op: a dead serve keeps the job running and the next
+      // poll retries. Never invent a terminal verdict from a fetch failure.
+    }
+  }
+
   private async poll(): Promise<void> {
     const jobs = await getRunningJobs();
     const activeJobIds = new Set(jobs.map(j => j.id));
@@ -1106,6 +1228,26 @@ export class JobMonitor extends EventEmitter {
           // inventar evidência (gap explícito no final).
           const outcome = await this.checkAgentReport(job);
           if (outcome === 'completed') {
+            continue;
+          }
+          // SSE-loss recovery: reconcile the authoritative session
+          // outcome before (re)subscribing, so a terminal event the
+          // stream dropped (or a retired subscription) still lands
+          // exactly once. A fresh non-running verdict skips the
+          // subscribe — no SSE watch for a finished job.
+          await this.reconcileServeOutcome(job);
+          let stillRunning = true;
+          try {
+            const fresh = await getJob(job.id);
+            // Read anomaly (job vanished mid-cycle) is fail-open: the
+            // stale-guard in handleSSEEvent still drops terminal events
+            // for non-running jobs. Only a positive non-running verdict
+            // skips the subscribe.
+            stillRunning = !fresh || fresh.status === 'running';
+          } catch {
+            stillRunning = true;
+          }
+          if (!stillRunning) {
             continue;
           }
           await this.subscribeToSSE(job);

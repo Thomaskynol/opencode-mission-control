@@ -271,6 +271,15 @@ export async function validateTouchSet(
   touchSet: string[],
   opts?: { cwd?: string },
 ): Promise<{ valid: boolean; violations?: string[]; changedFiles?: string[] }> {
+  // Contrato: base do plano/tarefa — vazia nunca é adivinhada (nunca escolha silenciosa).
+  if (!baseBranch?.trim() || !jobBranch?.trim()) {
+    return {
+      valid: false,
+      violations: [
+        `Cannot validate touchSet: explicit baseBranch and jobBranch are required (got base="${baseBranch}" job="${jobBranch}")`,
+      ],
+    };
+  }
   const diffResult = await gitCommand(['diff', '--name-only', `${baseBranch}...${jobBranch}`], opts);
   if (diffResult.exitCode !== 0) {
     return { valid: false, violations: [`Failed to diff: ${diffResult.stderr}`] };

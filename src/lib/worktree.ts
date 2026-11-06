@@ -224,21 +224,21 @@ export async function syncWorktree(
   baseBranch?: string,
   source?: 'local' | 'origin',
 ): Promise<SyncResult> {
-  let targetBranch: string;
-  if (baseBranch) {
-    const useOrigin = source === 'origin' || (!source);
-    targetBranch = useOrigin ? `origin/${baseBranch}` : baseBranch;
-  } else {
-    const defaultBranch = await getDefaultBranch();
-    const useOrigin = source === 'origin';
-    targetBranch = useOrigin ? `origin/${defaultBranch}` : defaultBranch;
-  }
+  // Contrato: base do plano/tarefa via getDefaultBranch; origem padrão é local — origin só com source explícito + fetch.
+  const base = baseBranch ?? (await getDefaultBranch(path));
+  const useOrigin = source === 'origin';
+  const targetBranch = useOrigin ? `origin/${base}` : base;
 
-  if (source === 'origin' || (baseBranch && !source)) {
+  if (useOrigin) {
     const fetchResult = await gitCommand(['-C', path, 'fetch', 'origin']);
     if (fetchResult.exitCode !== 0) {
       return { success: false, conflicts: ['Failed to fetch from origin'] };
     }
+  }
+
+  const verifyResult = await gitCommand(['-C', path, 'rev-parse', '--verify', targetBranch]);
+  if (verifyResult.exitCode !== 0) {
+    return { success: false, conflicts: [`Base branch "${targetBranch}" not found`] };
   }
 
   const syncResult = await gitCommand(['-C', path, strategy, targetBranch]);
