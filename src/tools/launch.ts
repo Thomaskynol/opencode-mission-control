@@ -13,9 +13,8 @@ import {
   isInsideTmux,
   isTmuxAvailable,
 } from '../lib/tmux';
-import { loadConfig } from '../lib/config';
+import { loadConfig, assertPluginDistReady, assertOmoModeAvailable } from '../lib/config';
 import { buildWorktreePermissions, assertPolicyFloorCompliant } from '../lib/permission-policy';
-import { detectOMO } from '../lib/omo';
 import { copyPlansToWorktree } from '../lib/plan-copier';
 import { resolvePostCreateHook, assertNoPermissiveOpencodeConfig } from '../lib/worktree-setup';
 import { getMainWorktree } from '../lib/worktree';
@@ -178,6 +177,12 @@ export const mc_launch: ToolDefinition = tool({
     const branch = args.branch ?? `mc/${args.name}`;
     const placement = args.placement ?? config.defaultPlacement;
     const mode = args.mode ?? config.omo.defaultMode;
+
+    // 3b. Dispatch pre-flight (fail-fast BEFORE any worktree exists):
+    // dist/ must be built and non-vanilla modes require a detected OMO.
+    assertPluginDistReady();
+    await assertOmoModeAvailable(mode);
+
     const sanitizedName = args.name.replace(/[^a-zA-Z0-9_-]/g, '-');
 
     // tmux target naming
@@ -218,28 +223,18 @@ export const mc_launch: ToolDefinition = tool({
       );
     }
 
-    // 5. Handle OMO modes (copy plans if needed)
-    if (mode !== 'vanilla') {
-      const omoStatus = await detectOMO();
-      if (!omoStatus.detected) {
-        try {
-          await removeWorktree(worktreePath, true);
-        } catch {
-          // Best-effort cleanup
-        }
-        throw new Error(
-          `OMO mode "${mode}" requires Oh-My-OpenCode to be installed and detected`,
+    // 5. Handle OMO modes (copy plans if needed).
+    // OMO presence already validated in pre-flight (3b) — never create-then-remove.
+    if (mode === 'plan' || mode === 'ralph' || mode === 'ulw') {
+      try {
+        const sourcePlansPath = './.sisyphus/plans';
+        const targetPlansPath = `${worktreePath}/.sisyphus/plans`;
+        await copyPlansToWorktree(sourcePlansPath, targetPlansPath);
+      } catch (error) {
+        // Best-effort but visible: plans might not exist — warn, never silent.
+        console.warn(
+          `[MC] copyPlansToWorktree best-effort failed for "${args.name}": ${error instanceof Error ? error.message : String(error)}`,
         );
-      }
-
-      if (mode === 'plan' || mode === 'ralph' || mode === 'ulw') {
-        try {
-          const sourcePlansPath = './.sisyphus/plans';
-          const targetPlansPath = `${worktreePath}/.sisyphus/plans`;
-          await copyPlansToWorktree(sourcePlansPath, targetPlansPath);
-        } catch {
-          // Non-fatal: plans might not exist
-        }
       }
     }
 
@@ -498,8 +493,11 @@ export const mc_launch: ToolDefinition = tool({
               await sendKeys(tmuxTarget, 'Enter');
               break;
           }
-        } catch {
-          // Non-fatal: OMO command delivery is best-effort
+        } catch (error) {
+          // Best-effort but visible: OMO command delivery failure is not silent.
+          console.warn(
+            `[MC] OMO sendKeys best-effort failed for "${args.name}" (mode ${mode}): ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
       }
     }

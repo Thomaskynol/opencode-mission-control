@@ -99,6 +99,20 @@ Add this plugin entry:
 
 If you are developing this repository itself, use the local dev flow in [Development](#development).
 
+### Preparação
+
+Run from the plugin repo root before first use (and after every change under `src/`):
+
+```bash
+cd <repo> && bun install && bun run build && ls dist/index.js && restart OpenCode
+```
+
+Fail-fast guards refuse dispatch when `dist/index.js` is missing or older than `src/` — rebuild instead of debugging a silent mission.
+
+- OMO modes (`plan`, `ralph`, `ulw`): pass `mode: "vanilla"` explicitly, or set `omo.defaultMode: "vanilla"` in the project config `~/.local/share/opencode-mission-control/<project>/config.json` (project-scoped; never touches the global `~/.config/opencode` profile). Non-vanilla modes require a detected Oh-My-OpenCode install, checked BEFORE any worktree is created.
+- Model: the already-configured effective model is respected as-is (serve mode pins it); preparation never changes the global profile.
+- Check status anytime: `mc_overview`.
+
 ### Your First Job
 
 ```

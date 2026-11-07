@@ -9,7 +9,7 @@ import { isTmuxAvailable } from './lib/tmux';
 import { assertHardenedRealEntry } from './lib/monitor';
 import { loadPlan } from './lib/plan-state';
 import { Orchestrator } from './lib/orchestrator';
-import { loadConfig } from './lib/config';
+import { loadConfig, assertPluginDistReady } from './lib/config';
 import { setCurrentModel, setConfigFallbackModel } from './lib/model-tracker';
 import { isInManagedWorktree } from './lib/worktree';
 import { mc_launch } from './tools/launch';
@@ -156,6 +156,9 @@ function withHardenedTestEnvGate<T extends { execute: (...a: never[]) => Promise
 }
 
 export const MissionControl: Plugin = async ({ client }) => {
+  // Fail-fast: dist ausente ou desatualizado → erro com instrução
+  // reproduzível, nunca missão que termina sem o recurso.
+  assertPluginDistReady();
   const cwd = process.cwd();
   const worktreeInfo = await isInManagedWorktree(cwd);
   const isJobAgent = worktreeInfo.isManaged;

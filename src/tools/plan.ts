@@ -4,7 +4,7 @@ import type { PlanSpec, JobSpec } from '../lib/plan-types';
 import { loadPlan, savePlan, validateGhAuth } from '../lib/plan-state';
 import { Orchestrator, hasCircularDependency } from '../lib/orchestrator';
 import { getSharedMonitor, getSharedNotifyCallback, setSharedOrchestrator } from '../lib/orchestrator-singleton';
-import { loadConfig } from '../lib/config';
+import { loadConfig, assertPluginDistReady, assertOmoModeAvailable } from '../lib/config';
 import { assertPolicyFloorCompliant } from '../lib/permission-policy';
 import { assertNoPermissiveOpencodeConfig } from '../lib/worktree-setup';
 import { getMainWorktree } from '../lib/worktree';
@@ -79,6 +79,13 @@ export const mc_plan: ToolDefinition = tool({
       assertNoPermissiveOpencodeConfig(mainPath);
     } catch (error) {
       if (error instanceof Error && error.message.includes('permissive opencode permission')) throw error;
+    }
+
+    // 0b. Dispatch pre-flight (fail-fast BEFORE any worktree/dispatch):
+    // dist/ must be built; any non-vanilla job mode requires a detected OMO.
+    assertPluginDistReady();
+    for (const j of args.jobs) {
+      await assertOmoModeAvailable(j.mode ?? planConfig.omo.defaultMode);
     }
 
     // 1. Validate jobs: unique names

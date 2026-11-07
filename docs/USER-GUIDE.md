@@ -315,8 +315,14 @@ Branch: per job via `mc_launch(branch, baseBranch)` (default
 (disposable `/tmp/opencode/first-use-demo-*`, all exits observed).
 
 ```bash
-# 1. Iniciar o produto
-bun run build  # exit 0
+# 1. Iniciar o produto (preparação: dist pronto + OMO/modo resolvido)
+bun install && bun run build && ls dist/index.js  # exit 0
+# Guardas fail-fast recusam despacho com dist ausente/stale (rebuild acima)
+# ou modo OMO sem Oh-My-OpenCode — antes de qualquer worktree. Correção OMO:
+# mode:"vanilla" explícito, ou omo.defaultMode:"vanilla" no config do projeto
+# ~/.local/share/opencode-mission-control/<project>/config.json (escopo do
+# projeto; nunca toca o perfil global ~/.config/opencode). Modelo efetivo já
+# configurado é respeitado como está.
 bun src/orchestrator-cli/index.ts help     # exit 0
 # 2. Enviar pedido NL com repo + branch destino
 bun src/orchestrator-cli/index.ts send "Add CSV export to the billing view — repo: . base branch: main"  # exit 0

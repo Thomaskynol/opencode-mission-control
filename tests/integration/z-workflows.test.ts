@@ -144,6 +144,11 @@ mock.module('../../src/lib/config', () => ({
     portRangeEnd: 14199,
     omo: { enabled: false, defaultMode: 'vanilla' },
   })),
+  // Dispatch pre-flight guards live here (covered by
+  // tests/tools/dispatch-preflight.test.ts); this suite mocks all
+  // externals, so they pass through as no-ops.
+  assertPluginDistReady: vi.fn(() => {}),
+  assertOmoModeAvailable: vi.fn(async () => {}),
 }));
 
 // Serve-path seams: launch.ts allocates a port, waits for the v2 surface,
@@ -302,6 +307,8 @@ const mockRemoveWorktree = worktree.removeWorktree as Mock;
 const mockCopyPlans = planCopier.copyPlansToWorktree as Mock;
 const mockDetectOMO = omoMod.detectOMO as Mock;
 const mockLoadConfig = configMod.loadConfig as Mock;
+const mockAssertPluginDistReady = configMod.assertPluginDistReady as Mock;
+const mockAssertOmoModeAvailable = configMod.assertOmoModeAvailable as Mock;
 const mockLaunchWorkerViaServe = sdkMod.launchWorkerViaServe as Mock;
 const mockGetSharedMonitor = orchSingleton.getSharedMonitor as Mock;
 
@@ -574,8 +581,9 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     expect(result).toContain('Job "plan-job" launched successfully');
     expect(result).toContain('Mode:      plan');
 
-    // Verify OMO detection was called
-    expect(mockDetectOMO).toHaveBeenCalled();
+    // OMO validation is the pre-flight guard (detectOMO lives inside it) —
+    // guarda chamada com o modo, antes de qualquer worktree.
+    expect(mockAssertOmoModeAvailable).toHaveBeenCalledWith('plan');
 
     // Verify plans were copied to worktree
     expect(mockCopyPlans).toHaveBeenCalledWith(
@@ -605,7 +613,7 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     );
 
     expect(result).toContain('Job "ralph-job" launched successfully');
-    expect(mockDetectOMO).toHaveBeenCalled();
+    expect(mockAssertOmoModeAvailable).toHaveBeenCalledWith('ralph');
     expect(mockCopyPlans).toHaveBeenCalled();
 
     // Serve mode delivers the loop command inside the prompt text.
@@ -628,7 +636,7 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     );
 
     expect(result).toContain('Job "ulw-job" launched successfully');
-    expect(mockDetectOMO).toHaveBeenCalled();
+    expect(mockAssertOmoModeAvailable).toHaveBeenCalledWith('ulw');
     expect(mockCopyPlans).toHaveBeenCalled();
 
     expect(mockSendKeys).not.toHaveBeenCalled();
@@ -643,23 +651,33 @@ describe('Workflow 2: OMO mode launch with plans', () => {
     expect(jobs[0].mode).toBe('ulw');
   });
 
-  it('should fail when OMO not detected for non-vanilla mode', async () => {
+  it('should fail when OMO not detected for non-vanilla mode (pre-flight: no worktree)', async () => {
     mockDetectOMO.mockResolvedValue({
       detected: false,
       configSource: null,
       sisyphusPath: null,
     });
+    // Guarda real rejeita no pre-flight; aqui o mock reproduz o contrato:
+    // erro com instrução ANTES de qualquer worktree (nada criado, nada a remover).
+    mockAssertOmoModeAvailable.mockRejectedValueOnce(
+      new Error(
+        '[MC] OMO mode "plan" requires Oh-My-OpenCode to be installed and detected, and no worktree was created. Fix with one of: (1) pass mode:"vanilla" explicitly.',
+      ),
+    );
 
     await expect(
       mc_launch.execute(
         { name: 'fail-omo', prompt: 'Should fail', mode: 'plan' },
         mockContext,
       ),
-    ).rejects.toThrow('OMO mode "plan" requires Oh-My-OpenCode');
+    ).rejects.toThrow(/no worktree was created/);
 
-    // Verify cleanup happened
+    // Contrato novo: pre-flight chamado com o modo, worktree nunca criada nem removida.
+    expect(mockAssertPluginDistReady).toHaveBeenCalled();
+    expect(mockAssertOmoModeAvailable).toHaveBeenCalledWith('plan');
+    expect(mockCreateWorktree).not.toHaveBeenCalled();
+    expect(mockRemoveWorktree).not.toHaveBeenCalled();
     expect(mockKillSession).not.toHaveBeenCalled();
-    expect(mockRemoveWorktree).toHaveBeenCalled();
   });
 
   it('should not copy plans for vanilla mode', async () => {
@@ -668,6 +686,8 @@ describe('Workflow 2: OMO mode launch with plans', () => {
       mockContext,
     );
 
+    // Bypass vanilla passa pela guarda (sem OMO) — guarda chamada, detectOMO não.
+    expect(mockAssertOmoModeAvailable).toHaveBeenCalledWith('vanilla');
     expect(mockDetectOMO).not.toHaveBeenCalled();
     expect(mockCopyPlans).not.toHaveBeenCalled();
   });

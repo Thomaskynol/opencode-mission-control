@@ -95,10 +95,14 @@ describe('r3401131 TUI blockade (pinned:false, serve is the only pin path)', () 
   });
 });
 
-describe('r3401131 launch serve wiring (static: detectOMO read, requested/observed persisted)', () => {
-  it('launch.ts reads detectOMO on the worker path and keeps requested/observed separate', () => {
+describe('r3401131 launch serve wiring (static: OMO pre-flight, requested/observed persisted)', () => {
+  it('launch.ts validates OMO in pre-flight (no create-then-remove) and keeps requested/observed separate', () => {
     const src = readFileSync(new URL('../../src/tools/launch.ts', import.meta.url), 'utf-8');
-    expect(src).toContain('detectOMO');
+    // OMO validation moved to pre-flight via the shared guard (detectOMO
+    // lives inside assertOmoModeAvailable in config.ts) — launch.ts must
+    // not consult OMO itself nor create-then-remove a worktree.
+    expect(src).toContain('assertOmoModeAvailable');
+    expect(src).not.toContain("from '../lib/omo'");
     expect(src).toContain('modelRequested');
     expect(src).toContain('modelObserved');
     expect(src).toContain('requires a pinned model');
