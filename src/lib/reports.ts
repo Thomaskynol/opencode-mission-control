@@ -815,3 +815,267 @@ export async function readFinalReport(planId: string): Promise<string | null> {
   }
   return file.text();
 }
+
+// ---------------------------------------------------------------------------
+// Report stage: disponível vs carregado vs efetivamente utilizado.
+// O prompt (MC_REPORT_SUFFIX) prepara a instrução; a tool só carrega sob
+// .opencode + worktree gerenciada; o monitor só utiliza report válido
+// (terminal conclui, não-terminal sinaliza). Ausência nunca é sucesso e
+// configuração declarada nunca é uso (sem fingir skill/plugin utilizado).
+// ---------------------------------------------------------------------------
+
+export type ReportStageKind =
+  | 'loaded-terminal'
+  | 'loaded-signal'
+  | 'missing-serve-no-plugin'
+  | 'missing-serve-noack'
+  | 'missing-tui-running'
+  | 'missing-finalized'
+  | 'invalid-serve-noack'
+  | 'invalid-tui'
+  | 'stale-name-only';
+
+export interface ReportStageInfo {
+  kind: ReportStageKind;
+  label: string;
+  detail: string;
+}
+
+export function isServeModeJobRef(job: { port?: number; remoteSessionID?: string }): boolean {
+  return job.port !== undefined && job.port > 0 && !!job.remoteSessionID;
+}
+
+function isRunningStatus(status?: string): boolean {
+  return status === 'running';
+}
+
+/**
+ * Estágio consultável do mc_report para um job. Puro (sem IO): o chamador
+ * informa o que observou (hasReport/terminal/fileExists/stale/plugin).
+ * - staleNameOnly sem report por id nunca associa o nome como atual.
+ * - pluginPrepared=false em serve-mode distingue .opencode ausente do
+ *   sem-ACK (arquivo preparado, carga nunca confirmada pelo runtime).
+ */
+export function resolveReportStage(
+  job: { port?: number; remoteSessionID?: string; status?: string },
+  opts: {
+    hasReport: boolean;
+    terminal?: boolean;
+    fileExists?: boolean;
+    staleNameOnly?: boolean;
+    pluginPrepared?: boolean;
+  },
+): ReportStageInfo {
+  const serve = isServeModeJobRef(job);
+  const running = isRunningStatus(job.status);
+  if (opts.hasReport) {
+    if (opts.terminal) {
+      return {
+        kind: 'loaded-terminal',
+        label: 'report loaded (terminal)',
+        detail: 'report carregado e efetivamente utilizado (terminal: completed/needs_review concluiu via report)',
+      };
+    }
+    return {
+      kind: 'loaded-signal',
+      label: 'report loaded (signal)',
+      detail: 'report carregado e sinalizado (working/blocked/progress/paused); utilizacao terminal pendente',
+    };
+  }
+  if (opts.staleNameOnly) {
+    return {
+      kind: 'stale-name-only',
+      label: 'report ausente (stale-name)',
+      detail: 'sem report para este jobId; existe report com mesmo nome de jobId anterior (relaunch?) — nao associado ao job atual',
+    };
+  }
+  if (opts.fileExists) {
+    if (serve) {
+      return {
+        kind: 'invalid-serve-noack',
+        label: 'report invalido (serve-mode)',
+        detail: `arquivo existe mas ilegivel/malformado — ignorado, nunca Verified; ${SERVE_PLUGIN_RUNTIME_LIMITATION}`,
+      };
+    }
+    return {
+      kind: 'invalid-tui',
+      label: 'report invalido (TUI)',
+      detail: 'arquivo existe mas ilegivel/malformado — ignorado, nunca Verified (distinto de ausente)',
+    };
+  }
+  if (!running) {
+    return {
+      kind: 'missing-finalized',
+      label: 'report ausente (job finalizado)',
+      detail: 'job nao-running sem report — ausencia esperada, nao gap operacional (nunca verificar por report ausente)',
+    };
+  }
+  if (serve) {
+    if (opts.pluginPrepared === false) {
+      return {
+        kind: 'missing-serve-no-plugin',
+        label: 'report ausente (serve-mode, .opencode)',
+        detail: `plugin .opencode ausente no worktree — tool mc_report pode nunca ter sido carregada; ${SERVE_PLUGIN_RUNTIME_LIMITATION}`,
+      };
+    }
+    return {
+      kind: 'missing-serve-noack',
+      label: 'report ausente (serve-mode)',
+      detail: `sem report para este jobId (worker ainda nao reportou ou ignorou a instrucao); ${SERVE_PLUGIN_RUNTIME_LIMITATION}`,
+    };
+  }
+  return {
+    kind: 'missing-tui-running',
+    label: 'report ausente (TUI running)',
+    detail: 'sem report para este jobId (worker ainda nao reportou ou ignorou a instrucao no prompt; instrucao nao garante chamada)',
+  };
+}
+
+/** Linha curta de estágio (stage nunca finge skill/plugin utilizado). */
+export function formatReportStageLine(info: ReportStageInfo): string {
+  return `report stage: ${info.kind} — ${info.detail}`;
+}
+
+/** Nota canônica do que o runtime não permite observar (serve vs TUI). */
+export function unobservableRuntimeNote(): string {
+  return 'effective config, OMO ativo e motivo do agente ignorar a instrução não são observáveis pelo runtime (sem ACK do serve; preparado nunca prova carregado/utilizado)';
+}
+
+// ---------------------------------------------------------------------------
+// Resolução sem misassociação: id primeiro; nome igual de outro jobId é
+// stale (relaunch gera novo jobId) — nunca associado como atual.
+// ---------------------------------------------------------------------------
+
+export interface ResolvedJobReport {
+  report: AgentReport | null;
+  staleNameReport: AgentReport | null;
+}
+
+export function resolveJobReport(
+  job: { id: string; name: string },
+  all: AgentReport[],
+): ResolvedJobReport {
+  const byId = all.find((r) => r.jobId === job.id) ?? null;
+  if (byId) return { report: byId, staleNameReport: null };
+  const stale = all.find((r) => r.jobName === job.name && r.jobId !== job.id) ?? null;
+  return { report: null, staleNameReport: stale };
+}
+
+/** Remoção auditável (log útil, sem silêncio): true removeu, false ausente. */
+export async function removeReportAudited(jobId: string, reason?: string): Promise<boolean> {
+  const reportsDir = await getReportsDir();
+  const filePath = getReportFilePath(reportsDir, jobId);
+  const fs = await import('fs');
+  try {
+    fs.unlinkSync(filePath);
+    console.warn(`[MC] report removido (job: ${jobId})${reason ? ` — motivo: ${reason}` : ''}`);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.warn(`[MC] report ausente na remocao (job: ${jobId})${reason ? ` — motivo: ${reason}` : ''} — nada a remover`);
+      return false;
+    }
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Veredito de revisão vinculado a job+versões (jobId, commit/branch,
+// transporte serve/TUI, model). Evidência consultável — nunca verifica
+// sozinho (fail-closed: verificação exige gate task-scoped).
+// ---------------------------------------------------------------------------
+
+export type ReviewVerdictValue = 'pass' | 'fail' | 'unknown';
+export type ReviewVerdictTransport = 'serve' | 'tui' | 'unknown';
+
+export interface ReviewVerdictRecord {
+  jobId: string;
+  jobName: string;
+  verdict: ReviewVerdictValue;
+  commit?: string;
+  baseCommit?: string;
+  branch?: string;
+  transport: ReviewVerdictTransport;
+  modelRequested?: string;
+  modelObserved?: string;
+  reason?: string;
+  timestamp: string;
+}
+
+function getVerdictFilePath(reportsDir: string, jobId: string): string {
+  return join(reportsDir, `verdict-${jobId}.json`);
+}
+
+export async function writeReviewVerdict(
+  record: Omit<ReviewVerdictRecord, 'timestamp'> & { timestamp?: string },
+): Promise<void> {
+  const reportsDir = await getReportsDir();
+  const filePath = getVerdictFilePath(reportsDir, record.jobId);
+  const payload: ReviewVerdictRecord = {
+    ...record,
+    timestamp: record.timestamp ?? new Date().toISOString(),
+  };
+  const tempPath = `${filePath}.tmp`;
+  await Bun.write(tempPath, JSON.stringify(payload, null, 2));
+  const fs = await import('fs');
+  fs.renameSync(tempPath, filePath);
+}
+
+export async function readReviewVerdict(jobId: string): Promise<ReviewVerdictRecord | null> {
+  const reportsDir = await getReportsDir();
+  const file = Bun.file(getVerdictFilePath(reportsDir, jobId));
+  if (!(await file.exists())) return null;
+  try {
+    return JSON.parse(await file.text()) as ReviewVerdictRecord;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      console.warn(`[MC] Skipping corrupt verdict verdict-${jobId}.json: ${error.message}`);
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function readAllReviewVerdicts(): Promise<ReviewVerdictRecord[]> {
+  const reportsDir = await getReportsDir();
+  const fs = await import('fs');
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(reportsDir);
+  } catch {
+    return [];
+  }
+  const out: ReviewVerdictRecord[] = [];
+  for (const entry of entries) {
+    if (!entry.startsWith('verdict-') || !entry.endsWith('.json') || entry.endsWith('.tmp')) continue;
+    try {
+      const content = await Bun.file(join(reportsDir, entry)).text();
+      out.push(JSON.parse(content) as ReviewVerdictRecord);
+    } catch {
+      console.warn(`[MC] Skipping corrupt verdict ${entry}`);
+    }
+  }
+  return out;
+}
+
+/** Remoção auditável do veredito (cleanup): true removeu, false ausente. */
+export async function removeReviewVerdictAudited(jobId: string, reason?: string): Promise<boolean> {
+  const reportsDir = await getReportsDir();
+  const fs = await import('fs');
+  try {
+    fs.unlinkSync(getVerdictFilePath(reportsDir, jobId));
+    console.warn(`[MC] verdict removido (job: ${jobId})${reason ? ` — motivo: ${reason}` : ''}`);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/** Linha consultável do veredito (job+versões, sem selo Verified). */
+export function formatReviewVerdictLine(v: ReviewVerdictRecord): string {
+  const where = [v.commit?.slice(0, 8), v.branch, v.transport].filter(Boolean).join(' ');
+  return `verdict "${v.jobName}" [${v.verdict}]${where ? ` @ ${where}` : ''}${v.reason ? ` — ${v.reason}` : ''} (jobId ${v.jobId}; veredito nao verifica sozinho)`;
+}

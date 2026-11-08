@@ -52,10 +52,11 @@ export const mc_kill: ToolDefinition = tool({
       );
     }
 
-    // 4. Release port if allocated
+    // 4. Release port if allocated (the session above just died with its
+    // server, so forced audited release is legitimate even cross-process).
     if (job.port) {
       try {
-        await releasePort(job.port);
+        await releasePort(job.port, { force: true });
       } catch {
         // Non-fatal: port will be reclaimed on next allocation scan
       }

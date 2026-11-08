@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { MCConfig } from './config';
 import type { PlanSpec, JobSpec, PlanStatus, CheckpointType, CheckpointContext, AuditLogEntry } from './plan-types';
+import { planHasOpenCheckpoint } from './plan-types';
 import { loadPlan, savePlan, updatePlanJob, updatePlanFields, clearPlan, validateGhAuth, claimJobForDispatch, claimConductorLease, recordHeartbeat, recordProgress, verifyConductorLease, DEFAULT_CONDUCTOR_MAX_HEARTBEAT_MS, DEFAULT_CONDUCTOR_MAX_PROGRESS_MS, withPlanLock, loadReviewAttempt, saveReviewAttempt, clearReviewAttempt, type PlanFencing } from './plan-state';
 import { getDefaultBranch, gitCommand } from './git';
 import { createIntegrationBranch, deleteIntegrationBranch, requireHumanAuth, type PublishAuthOptions } from './integration';
@@ -982,7 +983,53 @@ export class Orchestrator {
    * generic test env at the CLI boundary, so real missions always require
    * the semantic verdict).
    */
+  /**
+   * Blocker 4: verdict persistence choke point. Every functional/docs review
+   * verdict is persisted linked to job+versions (jobId, reviewed commit and
+   * base, branch, transport, model) via the verdict store — consultable in
+   * plan-status/overview, never log-only. Best-effort: a store failure never
+   * fails the gate. Verdicts never verify alone (fail-closed gates still
+   * require task-scoped evidence).
+   */
+  private async persistReviewVerdict(job: JobSpec, verdict: ReviewVerdict): Promise<void> {
+    // Unit scope (bun test) never touches the real verdict store: writes
+    // here would leak synthetic jobIds into the operator-visible overview.
+    // Real entries refuse generic test env at the CLI boundary, so this
+    // only skips fakes — production always persists.
+    if (isTestScope()) return;
+    try {
+      const { writeReviewVerdict } = await import('./reports');
+      const planId = this.activePlanId ?? 'plan';
+      const jobId = job.id ?? `${planId}:${job.name}`;
+      const value = verdict.verdict === 'pass' ? 'pass' : verdict.verdict === 'fail' ? 'fail' : 'unknown';
+      const transport = shouldUseServeMode(this.config as { useServeMode?: boolean }) ? 'serve' as const : 'tui' as const;
+      const snap = this.planModelSnapshot;
+      const model = snap ? `${snap.providerID}/${snap.id}${snap.variant ? `#${snap.variant}` : ''}` : undefined;
+      await writeReviewVerdict({
+        jobId,
+        jobName: job.name,
+        verdict: value,
+        ...(verdict.reviewedCommit ? { commit: verdict.reviewedCommit } : {}),
+        ...(verdict.reviewedBase ? { baseCommit: verdict.reviewedBase } : {}),
+        ...(job.branch ? { branch: job.branch } : {}),
+        transport,
+        ...(model ? { modelRequested: model, modelObserved: model } : {}),
+        ...(verdict.reasons?.[0] ? { reason: verdict.reasons[0].slice(0, 300) } : {}),
+      }).catch(() => {});
+    } catch {}
+  }
+
   private async reviewDocsOnly(
+    job: JobSpec,
+    plan: PlanSpec,
+    pins: { baseHead: string; jobHead: string; changedFiles: string[] },
+  ): Promise<ReviewVerdict> {
+    const verdict = await this.reviewDocsOnlyInner(job, plan, pins);
+    await this.persistReviewVerdict(job, verdict);
+    return verdict;
+  }
+
+  private async reviewDocsOnlyInner(
     job: JobSpec,
     plan: PlanSpec,
     pins: { baseHead: string; jobHead: string; changedFiles: string[] },
@@ -1183,6 +1230,12 @@ export class Orchestrator {
    * user only on reserved decisions or grounded impediments.
    */
   private async reviewJobWithFixLoop(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
+    const verdict = await this.reviewJobWithFixLoopInner(job, plan);
+    await this.persistReviewVerdict(job, verdict);
+    return verdict;
+  }
+
+  private async reviewJobWithFixLoopInner(job: JobSpec, plan: PlanSpec): Promise<ReviewVerdict> {
     this.lastReviewAutoFix = null;
     const pins = await this.buildStructuralPins(job, plan);
     // B3: `merged` is terminal — never re-review the same commit. A retry
@@ -2550,7 +2603,15 @@ export class Orchestrator {
     plan.integrationWorktree = integration.worktreePath;
 
     if (spec.mode === 'copilot') {
-      await savePlan(plan, repoRoot);
+      try {
+        await savePlan(plan, repoRoot);
+      } catch (error) {
+        // Blocker 1: a plan that never persisted must not leave the owned
+        // integration branch/worktree behind (mc/integration-<id> is
+        // possession-safe by name). Best-effort, then rethrow.
+        await deleteIntegrationBranch(spec.id, repoRoot).catch(() => {});
+        throw error;
+      }
       this.showToast(
         'Mission Control',
         `Plan "${plan.name}" created in copilot mode. Awaiting approval.`,
@@ -2562,7 +2623,12 @@ export class Orchestrator {
       };
     }
 
-    await savePlan(plan, repoRoot);
+    try {
+      await savePlan(plan, repoRoot);
+    } catch (error) {
+      await deleteIntegrationBranch(spec.id, repoRoot).catch(() => {});
+      throw error;
+    }
 
     this.activePlanId = plan.id;
     this.coordinatedJobs.clear();
@@ -2685,7 +2751,10 @@ export class Orchestrator {
         return;
       }
 
-      if (plan.status === 'paused' || this.checkpoint) {
+      // Blocker 2: gate on the PERSISTED checkpoint, never the in-memory
+      // flag alone — a restart (or in-flight fire-and-forget failure) can
+      // leave plan running+on_error with this.checkpoint unset.
+      if (plan.status === 'paused' || planHasOpenCheckpoint(plan) || this.checkpoint) {
         return;
       }
 
@@ -3359,6 +3428,16 @@ export class Orchestrator {
     // without creating/killing anything (no tmux, no worktree, no prompt).
     const repoRoot = this.effectiveRepoRoot();
     const owner = this.planLaunchSessionID ?? `orchestrator-${process.pid}`;
+    // Blocker 1: ownership probe BEFORE any resource exists. A pre-existing
+    // branch is reused, never owned — on failure only a branch THIS launch
+    // created may be deleted (fail-closed default: unknown → never delete).
+    let branchPreExisted = true;
+    try {
+      const pre = await gitCommand(['branch', '--list', branch], { cwd: repoRoot });
+      branchPreExisted = pre.exitCode === 0 && pre.stdout.includes(branch);
+    } catch {
+      branchPreExisted = true;
+    }
     try {
       const claim = await claimJobForDispatch(planId, job.name, owner, repoRoot, this.fencing());
       if (!claim.ok) {
@@ -3673,6 +3752,17 @@ If your work needs human review before it can proceed: mc_report(status: "needs_
 
       if (worktreePath) {
         await this.removeJobWorktree(worktreePath, true).catch(() => {});
+      }
+      // Blocker 1 compensation (auditable, possession-safe): delete the
+      // branch only when this launch created it. deleteBranchIfUnused
+      // re-verifies mc/ prefix + no worktree use — a foreign branch (or a
+      // branch another worktree still uses) is never removed.
+      if (!branchPreExisted) {
+        try {
+          const { deleteBranchIfUnused } = await import('./worktree');
+          const res = await deleteBranchIfUnused(branch, { cwd: repoRoot });
+          console.warn(`[MC] launch rollback for job "${job.name}": ${res.reason}`);
+        } catch {}
       }
       if (registered) {
         await removeJob(jobId).catch(() => {});

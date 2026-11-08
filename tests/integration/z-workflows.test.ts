@@ -100,6 +100,8 @@ mock.module('../../src/lib/worktree', () => ({
     return `/tmp/mc-worktrees/${sanitized}`;
   }),
   removeWorktree: vi.fn(async () => {}),
+  // launch.ts rollback (blocker 1): owned-branch compensation probe.
+  deleteBranchIfUnused: vi.fn(async () => ({ deleted: false, reason: 'mock: no branch created' })),
   // launch.ts pre-flight resolves the main worktree to vet inherited
   // `.opencode` configs — point it at a stable fake (no blanket allow).
   getMainWorktree: vi.fn(async () => '/tmp/mc-main'),

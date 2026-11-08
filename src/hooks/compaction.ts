@@ -1,7 +1,9 @@
 import { loadJobState } from '../lib/job-state';
 import type { Job } from '../lib/job-state';
-import { readAllReports } from '../lib/reports';
+import { readAllReports, isServeModeJobRef } from '../lib/reports';
 import type { AgentReport } from '../lib/reports';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { getWorktreeContext } from './awareness';
 
 function formatDuration(ms: number): string {
@@ -33,7 +35,7 @@ function isStale(job: Job, report: AgentReport | undefined, now: number): boolea
   return false;
 }
 
-function buildJobCard(job: Job, report: AgentReport | undefined, now: number): string {
+function buildJobCard(job: Job, report: AgentReport | undefined, staleNameReport: AgentReport | undefined, now: number): string {
   const runningMs = now - new Date(job.createdAt).getTime();
   const duration = formatDuration(runningMs);
   const stale = isStale(job, report, now);
@@ -41,6 +43,24 @@ function buildJobCard(job: Job, report: AgentReport | undefined, now: number): s
   let reportStr = 'report: none';
   if (report) {
     reportStr = `report: ${report.status} - ${report.message}`;
+  } else if (staleNameReport) {
+    // Relaunch (novo jobId, mesmo nome): o report antigo nunca é associado
+    // como atual — só o hint auditável.
+    reportStr = `report: none (stale: existe report de jobId anterior ${staleNameReport.jobId} — nao associado)`;
+  } else if (isServeModeJobRef(job)) {
+    // Serve conclui por outcome de sessão, não por report: ausência aqui é
+    // falta de chamada do worker sob plugin sem-ACK — nunca sucesso.
+    let prepared: boolean | undefined;
+    try {
+      prepared = existsSync(join(job.worktreePath, '.opencode/plugins/mc-mission-control/index.js'));
+    } catch {
+      prepared = undefined;
+    }
+    reportStr = prepared === false
+      ? 'report: none (serve-mode, .opencode ausente; plugin preparado mas carga nao comprovada; sem ACK do serve)'
+      : 'report: none (serve-mode, plugin preparado mas carga nao comprovada; sem ACK do serve)';
+  } else {
+    reportStr = 'report: none (TUI running, worker ainda nao reportou ou ignorou a instrucao; instrucao no prompt nao garante chamada)';
   }
 
   const staleMarker = stale ? ' [stale]' : '';
@@ -70,8 +90,14 @@ export async function getCompactionContext(): Promise<string> {
 
   const reports = await readAllReports();
   const reportsByJobId = new Map<string, AgentReport>();
+  const staleByName = new Map<string, AgentReport>();
   for (const report of reports) {
     reportsByJobId.set(report.jobId, report);
+    // Mesmo nome, outro jobId (relaunch): registra como stale, nunca como atual.
+    const cur = staleByName.get(report.jobName);
+    if (!cur || new Date(report.timestamp).getTime() > new Date(cur.timestamp).getTime()) {
+      staleByName.set(report.jobName, report);
+    }
   }
 
   const now = Date.now();
@@ -81,7 +107,16 @@ export async function getCompactionContext(): Promise<string> {
   if (failedCount > 0) summaryParts.push(`${failedCount} failed`);
 
   const header = `Mission Control (${summaryParts.join(', ')}):`;
-  const cards = runningJobs.map((job) => buildJobCard(job, reportsByJobId.get(job.id), now));
+  const cards = runningJobs.map((job) => {
+    const byId = reportsByJobId.get(job.id);
+    const staleName = !byId
+      ? (() => {
+          const cand = staleByName.get(job.name);
+          return cand && cand.jobId !== job.id ? cand : undefined;
+        })()
+      : undefined;
+    return buildJobCard(job, byId, staleName, now);
+  });
 
   const lines = [header, ...cards, 'Commands: mc_overview, mc_capture(name), mc_diff(name), mc_merge(name)'];
 

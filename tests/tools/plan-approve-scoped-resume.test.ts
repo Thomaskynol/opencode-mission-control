@@ -45,7 +45,8 @@ describe('R2 scoped resume: retry ready_to_merge bloqueado por pausa de outro jo
       createdAt: new Date().toISOString(),
     } as any);
 
-    const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+    const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+    const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
     const mockResumePlan = mock().mockResolvedValue(undefined);
     spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
     spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
@@ -56,15 +57,9 @@ describe('R2 scoped resume: retry ready_to_merge bloqueado por pausa de outro jo
     expect(result).toContain('dancedocs');
     expect(result).toContain('stays failed');
     // Falho preservado como failed (sem aceite), ready mantido.
-    expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'running',
-      checkpoint: null,
-      checkpointContext: null,
-      jobs: expect.arrayContaining([
-        expect.objectContaining({ name: 'twin', status: 'ready_to_merge' }),
-        expect.objectContaining({ name: 'dancedocs', status: 'failed' }),
-      ]),
-    }));
+    // Targeted updates: só campos do plano mudam (job ready re-driven).
+    expect(mockUpdatePlanJob).not.toHaveBeenCalled();
+    expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-r2', { status: 'running', checkpoint: null, checkpointContext: null });
     expect(mockResumePlan).toHaveBeenCalled();
   });
 
@@ -129,7 +124,8 @@ describe('R2 scoped resume: retry ready_to_merge bloqueado por pausa de outro jo
       createdAt: new Date().toISOString(),
     } as any);
 
-    const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+    const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+    const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
     const mockResumePlan = mock().mockResolvedValue(undefined);
     spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
     spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
@@ -137,12 +133,7 @@ describe('R2 scoped resume: retry ready_to_merge bloqueado por pausa de outro jo
     const result = await mc_plan_approve.execute({ retry: 'dancedocs' }, mockContext);
 
     expect(result).toContain('running scoped retry');
-    expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'running',
-      jobs: expect.arrayContaining([
-        expect.objectContaining({ name: 'dancedocs', status: 'ready_to_merge' }),
-      ]),
-    }));
+    expect(mockUpdatePlanJob).toHaveBeenCalledWith('plan-r2', 'dancedocs', { status: 'ready_to_merge', error: undefined });
     expect(mockResumePlan).toHaveBeenCalled();
   });
 

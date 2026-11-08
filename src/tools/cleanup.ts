@@ -3,10 +3,15 @@ import { getJobByName, removeJob, getRunningJobs, loadJobState } from '../lib/jo
 import { removeWorktree } from '../lib/worktree';
 import { killSession, sessionExists, killTaggedWindows } from '../lib/tmux';
 import { gitCommand } from '../lib/git';
-import { removeReport } from '../lib/reports';
+import { removeReport, removeReviewVerdictAudited } from '../lib/reports';
 import { releasePort } from '../lib/port-allocator';
 
 async function deleteBranch(branchName: string): Promise<void> {
+  // Possession proof for this rm: the branch name comes from the jobs.json
+  // record (written at launch), the job is non-running (checked in
+  // determineJobsToClean), and the operator passed the explicit delete flag.
+  // git itself refuses a branch checked out in any live worktree, so an
+  // in-use branch can never be removed here.
   const result = await gitCommand(['branch', '-D', branchName]);
   if (result.exitCode !== 0) {
     throw new Error(`Failed to delete branch "${branchName}": ${result.stderr}`);
@@ -62,7 +67,9 @@ async function cleanupJobs(
       try { await killTaggedWindows(job.id); } catch {}
 
       if (job.port) {
-        try { await releasePort(job.port); } catch {}
+        // Operator cleanup of a completed/stopped job: the server is gone,
+        // so forced (audited) release is legitimate even cross-process.
+        try { await releasePort(job.port, { force: true }); } catch {}
       }
 
       await removeWorktreeWithFallback(job.worktreePath);
@@ -70,6 +77,10 @@ async function cleanupJobs(
         await deleteBranchWithFallback(job.branch);
       }
       await removeReport(job.id).catch(() => {});
+      // Blocker 4 matrix (cleanup após completed): the verdict is bound to
+      // the jobId being removed — drop it audited so no orphaned verdict
+      // poses as a live job's (relaunch mints a new id anyway).
+      await removeReviewVerdictAudited(job.id, 'cleanup').catch(() => {});
       await removeJob(job.id);
 
       results.push(

@@ -1,5 +1,6 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
-import { loadPlan, savePlan } from '../lib/plan-state';
+import { loadPlan, savePlan, updatePlanJob, updatePlanFields } from '../lib/plan-state';
+import { canClearCheckpoint } from '../lib/plan-types';
 import { Orchestrator } from '../lib/orchestrator';
 import { getSharedMonitor, getSharedNotifyCallback, setSharedOrchestrator } from '../lib/orchestrator-singleton';
 import type { CheckpointType } from '../lib/plan-types';
@@ -51,8 +52,7 @@ export const mc_plan_approve: ToolDefinition = tool({
           !!args.retry &&
           !args.relaunch &&
           job.status === 'ready_to_merge' &&
-          plan.status === 'paused' &&
-          plan.checkpoint === 'on_error' &&
+          canClearCheckpoint(plan) &&
           !!plan.checkpointContext?.jobName &&
           plan.checkpointContext.jobName !== targetJobName;
         if (!isScopedResume) {
@@ -61,7 +61,7 @@ export const mc_plan_approve: ToolDefinition = tool({
       }
     }
 
-    if (plan.status === 'paused' && plan.checkpoint) {
+    if (canClearCheckpoint(plan)) {
       const checkpoint = (args.checkpoint ?? plan.checkpoint) as CheckpointType;
       const config = await loadConfig();
 
@@ -74,10 +74,9 @@ export const mc_plan_approve: ToolDefinition = tool({
           throw new Error(`Checkpoint was set for job "${ctx.jobName}", not "${args.relaunch}".`);
         }
 
-        plan.status = 'running';
-        plan.checkpoint = null;
-        plan.checkpointContext = null;
-        await savePlan(plan);
+        // Targeted field updates (never whole-snapshot savePlan): a monitor
+        // event landing between loadPlan and here must not be clobbered.
+        await updatePlanFields(plan.id, { status: 'running', checkpoint: null, checkpointContext: null });
 
         const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });
         setSharedOrchestrator(orchestrator);
@@ -113,10 +112,7 @@ export const mc_plan_approve: ToolDefinition = tool({
           job.status === 'ready_to_merge' && !!ctx?.jobName && ctx.jobName !== args.retry;
         if (isScopedResume) {
           const failingJob = ctx.jobName;
-          plan.status = 'running';
-          plan.checkpoint = null;
-          plan.checkpointContext = null;
-          await savePlan(plan);
+          await updatePlanFields(plan.id, { status: 'running', checkpoint: null, checkpointContext: null });
 
           const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });
           setSharedOrchestrator(orchestrator);
@@ -149,13 +145,10 @@ export const mc_plan_approve: ToolDefinition = tool({
         const retryJob = plan.jobs.find(j => j.name === args.retry)!;
         // M9: retry resets status/checkpoint only — review attempts persist via
         // plan-state (durable budget), so the counter is never reset here.
-        retryJob.status = 'ready_to_merge';
-        retryJob.error = undefined;
-
-        plan.status = 'running';
-        plan.checkpoint = null;
-        plan.checkpointContext = null;
-        await savePlan(plan);
+        // Targeted updates (never whole-snapshot savePlan) to avoid clobbering
+        // concurrent monitor writes.
+        await updatePlanJob(plan.id, retryJob.name, { status: 'ready_to_merge', error: undefined });
+        await updatePlanFields(plan.id, { status: 'running', checkpoint: null, checkpointContext: null });
 
         const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });
         setSharedOrchestrator(orchestrator);
@@ -176,15 +169,11 @@ export const mc_plan_approve: ToolDefinition = tool({
       if (ctx?.failureKind === 'touchset') {
         const job = plan.jobs.find(j => j.name === ctx.jobName);
         if (job && job.status === 'failed') {
-          job.status = 'ready_to_merge';
-          job.error = undefined;
+          await updatePlanJob(plan.id, job.name, { status: 'ready_to_merge', error: undefined });
         }
       }
 
-      plan.status = 'running';
-      plan.checkpoint = null;
-      plan.checkpointContext = null;
-      await savePlan(plan);
+      await updatePlanFields(plan.id, { status: 'running', checkpoint: null, checkpointContext: null });
 
       const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });
       setSharedOrchestrator(orchestrator);
@@ -234,10 +223,10 @@ export const mc_plan_approve: ToolDefinition = tool({
               );
             }
           }
-          job.status = 'ready_to_merge';
-          // M9: scoped retry also preserves persisted review attempts (budget).
-          job.error = undefined;
-          await savePlan(plan);
+          // Targeted update (never whole-snapshot savePlan): only the job
+            // row changes, the plan keeps running without a checkpoint.
+            // M9: scoped retry also preserves persisted review attempts (budget).
+            await updatePlanJob(plan.id, job.name, { status: 'ready_to_merge', error: undefined });
           const orchestrator = new Orchestrator(getSharedMonitor(), config, { notify: getSharedNotifyCallback() ?? undefined });
           setSharedOrchestrator(orchestrator);
           orchestrator.setPlanModelSnapshot(getCurrentModel());

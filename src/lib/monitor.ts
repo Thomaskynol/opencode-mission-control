@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { getRunningJobs, getJob, updateJob, resolveJobPassword, type Job } from './job-state.js';
 import { isPaneRunning, capturePane, captureExitStatus } from './tmux.js';
 import { loadConfig } from './config.js';
-import { readReport } from './reports.js';
+import { readReport, unobservableRuntimeNote } from './reports.js';
 import { SERVE_PLUGIN_RUNTIME_LIMITATION } from './worktree-setup.js';
 import {
   QuestionRelay,
@@ -688,6 +688,16 @@ export class JobMonitor extends EventEmitter {
     }
     const now = new Date().toISOString();
     this.cleanupSSEForJob(job.id);
+    // Legado sem ponteiro de sessão (só fakes/sintéticos): sem o que
+    // confirmar — registra a lacuna em vez de sucesso silencioso.
+    try {
+      const report = await readReport(job.id);
+      if (!report) {
+        console.warn(
+          `[Monitor] Job "${job.name}" (${job.id}) concluiu via evento legado sem mc_report válido para este jobId; ${unobservableRuntimeNote()} — conclusao por evento, nunca por report.`,
+        );
+      }
+    } catch {}
     if (legacyStatus === 'failed') {
       await updateJob(job.id, { status: 'failed', completedAt: now });
       this.emit('failed', { ...job, status: 'failed', completedAt: now });
@@ -731,6 +741,17 @@ export class JobMonitor extends EventEmitter {
       case 'session.execution.succeeded': {
         const now = new Date().toISOString();
         this.cleanupSSEForJob(job.id);
+        // Divergência serve vs TUI: o outcome de sessão conclui, mas sem
+        // report não há prova de entrega do worker — registra a lacuna
+        // (o que o runtime não permite observar) em vez de sucesso falso.
+        try {
+          const report = await readReport(job.id);
+          if (!report) {
+            console.warn(
+              `[Monitor] Job "${job.name}" (${job.id}) completou por session outcome sem mc_report válido para este jobId; ${unobservableRuntimeNote()} — conclusao por outcome de sessao, nunca por report.`,
+            );
+          }
+        } catch {}
         await updateJob(job.id, { status: 'completed', completedAt: now });
         this.emit('complete', { ...job, status: 'completed', completedAt: now });
         break;
@@ -739,6 +760,14 @@ export class JobMonitor extends EventEmitter {
       case 'session.execution.failed': {
         const now = new Date().toISOString();
         this.cleanupSSEForJob(job.id);
+        try {
+          const report = await readReport(job.id);
+          if (!report) {
+            console.warn(
+              `[Monitor] Job "${job.name}" (${job.id}) falhou por session outcome sem mc_report válido para este jobId; ${unobservableRuntimeNote()} — falha por outcome de sessao, nunca por report.`,
+            );
+          }
+        } catch {}
         await updateJob(job.id, { status: 'failed', completedAt: now });
         this.emit('failed', { ...job, status: 'failed', completedAt: now });
         break;
@@ -1313,6 +1342,14 @@ export class JobMonitor extends EventEmitter {
           this.idleTrackers.delete(job.id);
           this.awaitingInputNotified.delete(job.id);
           const completedAt = new Date().toISOString();
+          // TUI completa por pane idle, não por report — sem report válido,
+          // registra a lacuna (motivo do agente ignorar a instrução não é
+          // observável pelo runtime) em vez de sucesso falso.
+          if (outcome === 'missing' || outcome === 'invalid') {
+            console.warn(
+              `[Monitor] Job "${job.name}" (${job.id}) completou por TUI idle sem mc_report válido para este jobId (report ${outcome}); ${unobservableRuntimeNote()} — conclusao por pane idle, nunca por report.`,
+            );
+          }
           await updateJob(job.id, { status: 'completed', completedAt });
           this.emit('complete', { ...job, status: 'completed', completedAt });
         }

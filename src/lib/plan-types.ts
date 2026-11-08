@@ -168,3 +168,31 @@ export function isValidPlanTransition(from: PlanStatus, to: PlanStatus): boolean
 export function isValidJobTransition(from: JobStatus, to: JobStatus): boolean {
   return VALID_JOB_TRANSITIONS[from].includes(to);
 }
+
+/**
+ * Persisted checkpoint authority (blocker 2): the reconciler and approve
+ * must gate on `plan.checkpoint` from disk, never on an in-memory flag that
+ * a restart (or a fire-and-forget handleJobFailed still in flight) has not
+ * set yet. A truthy persisted checkpoint means "paused for a decision".
+ */
+export function planHasOpenCheckpoint(
+  plan: Pick<PlanSpec, 'checkpoint'> | null | undefined,
+): boolean {
+  return !!plan?.checkpoint;
+}
+
+/**
+ * Approve authority (blocker 2): `paused` + checkpoint is the normal case,
+ * but `running` + persisted `on_error` checkpoint must also be clearable —
+ * otherwise a plan that persisted the checkpoint without pausing (crashed
+ * pauser, restart, in-flight fire-and-forget) deadlocks: reconcile stalls
+ * on the checkpoint while approve rejects the non-paused status.
+ */
+export function canClearCheckpoint(
+  plan: Pick<PlanSpec, 'status' | 'checkpoint'> | null | undefined,
+): boolean {
+  if (!plan?.checkpoint) return false;
+  if (plan.status === 'paused') return true;
+  if (plan.status === 'running' && plan.checkpoint === 'on_error') return true;
+  return false;
+}

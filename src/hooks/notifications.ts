@@ -195,6 +195,17 @@ export function setupNotifications(options: SetupNotificationsOptions): void {
 
   const notify = async (event: NotificationEvent, job: Job, extra?: unknown): Promise<void> => {
     const report = event === 'blocked' || event === 'needs_review' ? await readReport(job.id) : null;
+    // Conclusão sem report: outcome de sessão/pane conclui, mas sem prova de
+    // entrega do worker — mensagem útil (o que o runtime não observa), nunca
+    // sucesso falso. Best-effort: IO nunca bloqueia a notificação.
+    let completionWithoutReport = false;
+    if (event === 'complete' || event === 'failed') {
+      try {
+        completionWithoutReport = (await readReport(job.id)) === null;
+      } catch {
+        completionWithoutReport = false;
+      }
+    }
     const questionData = event === 'question' ? extra as PendingQuestion | undefined : undefined;
     const dedupKey = event === 'question' && questionData
       ? `question:${job.id}:${questionData.partId}`
@@ -222,8 +233,14 @@ export function setupNotifications(options: SetupNotificationsOptions): void {
       message = buildQuestionRelayMessage(questionData);
     } else if (event === 'complete') {
       message = `🟢 Job '${job.name}' completed in ${duration}. Branch: ${job.branch}. Next: run mc_diff(name: '${job.name}') to review changes, then mc_pr or mc_merge.`;
+      if (completionWithoutReport) {
+        message += ` Sem mc_report válido para este jobId; effective config, OMO ativo e motivo do agente ignorar a instrução não são observáveis pelo runtime — conclusão por outcome de sessão/pane, nunca por report.`;
+      }
     } else if (event === 'failed') {
       message = `🔴 Job '${job.name}' failed after ${duration}. Branch: ${job.branch}. Next: run mc_capture(name: '${job.name}') for logs, then mc_attach(name: '${job.name}') to investigate.`;
+      if (completionWithoutReport) {
+        message += ` Sem mc_report válido para este jobId; effective config, OMO ativo e motivo do agente ignorar a instrução não são observáveis pelo runtime — falha por outcome de sessão/pane, nunca por report.`;
+      }
     } else if (event === 'blocked') {
       const detail = report?.message ? ` Agent says: ${report.message}` : '';
       message = `⚠️ Job '${job.name}' is blocked (${duration} elapsed). Branch: ${job.branch}.${detail} Next: run mc_status(name: '${job.name}') and unblock, then continue or relaunch.`;

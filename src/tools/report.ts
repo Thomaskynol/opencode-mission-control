@@ -4,6 +4,8 @@ import { getJobByName, loadJobState } from '../lib/job-state';
 import { loadPlan } from '../lib/plan-state';
 import {
   readAllReports,
+  readAllReviewVerdicts,
+  formatReviewVerdictLine,
   buildFinalReportMarkdown,
   writeFinalReport,
   describeOmoLimitation,
@@ -47,6 +49,7 @@ export async function listInvalidReportJobIds(): Promise<string[]> {
     for (const entry of entries) {
       if (!entry.endsWith('.json') || entry.endsWith('.tmp')) continue;
       if (entry.startsWith('final-')) continue;
+      if (entry.startsWith('verdict-')) continue;
       const jobId = entry.slice(0, -'.json'.length);
       try {
         const text = fs.readFileSync(join(reportsDir, entry), 'utf-8');
@@ -161,11 +164,12 @@ export const mc_report_final: ToolDefinition = tool({
     // F09: never throw on missing sidecar — an absent intake/evidence file
     // means "no conserved evidence yet", not a report failure. Real data is
     // used when present; empties below only reflect genuinely missing input.
-    const [state, reports, snap, mergeEvidence] = await Promise.all([
+    const [state, reports, snap, mergeEvidence, verdicts] = await Promise.all([
       loadJobState(),
       readAllReports(),
       import('../lib/durable-state').then((m) => m.loadRuntimeSnapshot().catch(() => null)),
       import('../lib/durable-state').then((m) => m.loadMergeEvidence().catch(() => ({}))),
+      readAllReviewVerdicts().catch(() => []),
     ]);
     const intake = (snap as { autoIntake?: { request?: string; requirements?: Array<{ id: string; text: string }>; decisions?: string[]; questions?: string[] } | null } | null)?.autoIntake ?? null;
     const withAttachments = args.includeAttachments ?? true;
@@ -314,27 +318,39 @@ export const mc_report_final: ToolDefinition = tool({
     // evita duplicar na seção Gaps, então header e Gaps mostram o mesmo total.
     // (Só contagem aqui: `unverified` passado ao markdown fica inalterado
     // para não duplicar Problems derivados.)
-    const haveReports = new Set(reports.map((report) => report.jobName));
+    // Vínculo por jobId: report com mesmo nome de jobId anterior (relaunch)
+    // é stale e nunca conta como report do job atual — sem exibir como atual.
+    const reportJobIds = new Set(reports.map((report) => report.jobId));
+    const mergedPlanJobs = plan.jobs.filter((job) => job.status === 'merged');
+    const serveModeIds = new Set(
+      state.jobs
+        .filter((j) => (j.port ?? 0) > 0 && j.remoteSessionID)
+        .map((j) => j.id),
+    );
     // Serve sem report válido (ausente ou inválido): o gap que nomear o job
     // leva a ressalva sem-ACK (carga nunca confirmada). 1 job, 1 gap.
-    const serveNoReport = (name: string) =>
-      serveModeNames.has(name) && (!haveReports.has(name) || invalidNames.includes(name));
+    const serveNoReportJob = (job: { id: string; name: string }) =>
+      serveModeIds.has(job.id) && (!reportJobIds.has(job.id) || invalidNames.includes(job.name));
     const unverified = unverifiedBase.map((entry) => {
-      const hit = merged.find((name) => serveNoReport(name) && entry.includes(name) && !entry.includes('sem ACK'));
+      const hit = mergedPlanJobs.find((job) => serveNoReportJob(job) && entry.includes(job.name) && !entry.includes('sem ACK'));
       return hit ? `${entry}; ${SERVE_PLUGIN_RUNTIME_LIMITATION}` : entry;
     });
-    const missingReportNames = merged
-      .filter((name) => !haveReports.has(name))
-      .filter((name) => !unverified.some((entry) => entry.includes(name)));
+    const missingReportJobs = mergedPlanJobs
+      .filter((job) => !reportJobIds.has(job.id))
+      .filter((job) => !unverified.some((entry) => entry.includes(job.name)));
+    const missingReportNames = missingReportJobs.map((job) => job.name);
     const unverifiedForCount = [
       ...unverified,
-      ...missingReportNames.map((name) => formatMissingReportGap(name, { pluginNoAck: serveModeNames.has(name) })),
+      ...missingReportJobs.map((job) => formatMissingReportGap(job.name, { pluginNoAck: serveModeIds.has(job.id) })),
     ];
     const unverifiedTotal = unverifiedForCount.length;
     const gapDetail = describeGapCategories(unverifiedForCount);
     // Operator notes are labeled as such under Real Evidence — they are
     // human claims, never automatic product evidence.
     const notes = args.notes?.trim() ? [`Operator note: ${args.notes.trim()}`] : [];
+    // Vereditos de revisão vinculados a job+versões (consultáveis aqui e em
+    // mc_status/mc_overview). Evidência rotulada, nunca verificação sozinha.
+    const verdictLines = verdicts.map((v) => formatReviewVerdictLine(v));
     const files = [...new Set(evidenceRecs.flatMap((r) => (r as { changedFiles?: string[] }).changedFiles ?? []))];
     const installUsage = [...new Set(evidenceRecs.flatMap((r) => {
       const rec = r as { setupCommands?: string[]; testCommand?: string };
@@ -487,6 +503,7 @@ export const mc_report_final: ToolDefinition = tool({
             return `accept "${job.name}" por ${formatActorLabel(appr.actor)} @ ${appr.reviewedCommit?.slice(0, 8) ?? '?'} — COM RESSALVA (permanece Unverified, sem selo verified; aceite nunca Verified)`;
           }),
         ...notes,
+        ...verdictLines,
         `Plan status: ${plan.status}${plan.prUrl ? ` — PR: ${plan.prUrl}` : ''}`,
       ],
       problems: (() => {
@@ -528,7 +545,7 @@ export const mc_report_final: ToolDefinition = tool({
       unverified,
       // Serve sem report válido (ausente ou inválido): o gap missing do
       // markdown leva a ressalva sem-ACK (carga nunca confirmada).
-      pluginNoAckJobs: merged.filter((name) => serveNoReport(name)),
+      pluginNoAckJobs: mergedPlanJobs.filter(serveNoReportJob).map((job) => job.name),
       environment,
       limitations: ['Local completion only; no push/PR without explicit humanAuth', omoLine, autoFixLine, fixRollbackLine, permissionLogLine, '--actor human é auto-declaração não verificada (origem não comprovada; humano necessário nunca simulado pelo agente — --actor human não comprova humano)'],
       nextSteps: unverified.length > 0 || unmet.length > 0

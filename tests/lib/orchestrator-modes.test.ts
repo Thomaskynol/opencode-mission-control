@@ -205,6 +205,10 @@ describe('orchestrator modes', () => {
     it('sends toast on first job completion', async () => {
       const orchestrator = new Orchestrator(monitor as any, DEFAULT_CONFIG as any, toastCallback);
       spyOn(orchestrator as any, 'startReconciler').mockImplementation(() => {});
+      // Scoped: this test covers the completion toast, not the launcher.
+      // A real launchJob would leak a serve-wait + fire-and-forget reconcile
+      // into later tests sharing plan id 'plan-1' (flaky cross-test writes).
+      spyOn(orchestrator as any, 'launchJob').mockResolvedValue(true);
 
       await orchestrator.startPlan(
         makePlan({ mode: 'autopilot', jobs: [makeJob('fast-job')] }),

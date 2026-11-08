@@ -88,19 +88,16 @@ describe('mc_plan_approve', () => {
         createdAt: new Date().toISOString(),
       });
 
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
       spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
 
       const result = await mc_plan_approve.execute({ checkpoint: 'on_error', retry: 'bad-job' }, mockContext);
 
-      expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'running',
-        jobs: expect.arrayContaining([
-          expect.objectContaining({ name: 'bad-job', status: 'ready_to_merge' }),
-        ]),
-      }));
+      expect(mockUpdatePlanJob).toHaveBeenCalledWith('plan-1', 'bad-job', { status: 'ready_to_merge', error: undefined });
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(result).toContain('bad-job');
       expect(result).toContain('ready_to_merge');
       expect(mockResumePlan).toHaveBeenCalled();
@@ -127,21 +124,16 @@ describe('mc_plan_approve', () => {
         createdAt: new Date().toISOString(),
       });
 
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
       spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
 
       const result = await mc_plan_approve.execute({ checkpoint: 'on_error' }, mockContext);
 
-      expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'running',
-        checkpoint: null,
-        checkpointContext: null,
-        jobs: expect.arrayContaining([
-          expect.objectContaining({ name: 'touch-job', status: 'ready_to_merge' }),
-        ]),
-      }));
+      expect(mockUpdatePlanJob).toHaveBeenCalledWith('plan-1', 'touch-job', { status: 'ready_to_merge', error: undefined });
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(mockResumePlan).toHaveBeenCalled();
       expect(result).toContain('TouchSet violations for job "touch-job" accepted');
     });
@@ -174,7 +166,8 @@ describe('mc_plan_approve', () => {
         createdAt: new Date().toISOString(),
       });
 
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       const relaunchSpy = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
@@ -183,11 +176,7 @@ describe('mc_plan_approve', () => {
 
       const result = await mc_plan_approve.execute({ checkpoint: 'on_error', relaunch: 'touch-job' }, mockContext);
 
-      expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'running',
-        checkpoint: null,
-        checkpointContext: null,
-      }));
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(relaunchSpy).toHaveBeenCalledWith('touch-job', ['README.md'], ['src/**']);
       expect(mockResumePlan).toHaveBeenCalled();
       expect(result).toContain('relaunched with correction prompt');
@@ -225,7 +214,8 @@ describe('mc_plan_approve', () => {
         valid: true,
         changedFiles: ['src/main.ts'],
       });
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
       spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
@@ -233,12 +223,8 @@ describe('mc_plan_approve', () => {
       const result = await mc_plan_approve.execute({ checkpoint: 'on_error', retry: 'touch-job' }, mockContext);
 
       expect(validateSpy).toHaveBeenCalledWith('mc/plan/plan-1/touch-job', 'mc/integration/plan-1', ['src/**']);
-      expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'running',
-        jobs: expect.arrayContaining([
-          expect.objectContaining({ name: 'touch-job', status: 'ready_to_merge' }),
-        ]),
-      }));
+      expect(mockUpdatePlanJob).toHaveBeenCalledWith('plan-1', 'touch-job', { status: 'ready_to_merge', error: undefined });
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(mockResumePlan).toHaveBeenCalled();
       expect(result).toContain('touch-job');
       expect(result).toContain('ready_to_merge');
@@ -322,19 +308,16 @@ describe('mc_plan_approve', () => {
         createdAt: new Date().toISOString(),
       });
 
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
       spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
 
       const result = await mc_plan_approve.execute({ checkpoint: 'on_error', retry: 'conflicting-job' }, mockContext);
 
-      expect(mockSavePlan).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'running',
-        jobs: expect.arrayContaining([
-          expect.objectContaining({ name: 'conflicting-job', status: 'ready_to_merge' }),
-        ]),
-      }));
+      expect(mockUpdatePlanJob).toHaveBeenCalledWith('plan-1', 'conflicting-job', { status: 'ready_to_merge', error: undefined });
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(result).toContain('Checkpoint');
       expect(result).toContain('ready_to_merge');
       expect(mockResumePlan).toHaveBeenCalled();
@@ -389,7 +372,8 @@ describe('mc_plan_approve', () => {
         createdAt: new Date().toISOString(),
       });
 
-      const mockSavePlan = spyOn(planState, 'savePlan').mockResolvedValue(undefined);
+      const mockUpdatePlanJob = spyOn(planState, 'updatePlanJob').mockResolvedValue(undefined);
+      const mockUpdatePlanFields = spyOn(planState, 'updatePlanFields').mockResolvedValue(undefined);
       const mockResumePlan = mock().mockResolvedValue(undefined);
       spyOn(orchestrator.Orchestrator.prototype, 'resumePlan').mockImplementation(mockResumePlan);
       spyOn(orchestrator.Orchestrator.prototype, 'setPlanModelSnapshot').mockImplementation(() => {});
@@ -399,7 +383,7 @@ describe('mc_plan_approve', () => {
       expect(result).toContain('Checkpoint "pre_merge" cleared');
       expect(result).toContain('resuming');
       expect(result).not.toContain('ready_to_merge');
-      expect(mockSavePlan).toHaveBeenCalled();
+      expect(mockUpdatePlanFields).toHaveBeenCalledWith('plan-1', { status: 'running', checkpoint: null, checkpointContext: null });
       expect(mockResumePlan).toHaveBeenCalled();
     });
   });

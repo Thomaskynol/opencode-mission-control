@@ -1,7 +1,7 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { randomUUID } from 'crypto';
 import { getJobByName, addJob, getRunningJobs, type Job } from '../lib/job-state';
-import { createWorktree, removeWorktree } from '../lib/worktree';
+import { createWorktree, removeWorktree, deleteBranchIfUnused } from '../lib/worktree';
 import {
   createSession,
   createWindow,
@@ -32,6 +32,22 @@ import {
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Ownership probe: does `refs/heads/<branch>` exist? Exact ref lookup —
+ * never substring (`mc/job` must not match `mc/job-2`). Fail-closed: any
+ * git error counts as pre-existing so rollback never deletes a branch we
+ * did not verify as ours.
+ */
+export async function checkBranchPreExisted(branch: string, opts?: { cwd?: string }): Promise<boolean> {
+  try {
+    const { gitCommand } = await import('../lib/git');
+    const pre = await gitCommand(['rev-parse', '--verify', `refs/heads/${branch}`], opts?.cwd ? { cwd: opts.cwd } : undefined);
+    return pre.exitCode === 0;
+  } catch {
+    return true;
+  }
 }
 
 const AUTO_COMMIT_SUFFIX = `
@@ -211,6 +227,23 @@ export const mc_launch: ToolDefinition = tool({
     );
 
     let worktreePath: string;
+    // Blocker 1: ownership probe BEFORE creation. A pre-existing branch is
+    // reused, never owned — rollback deletes only what this launch created.
+    // Exact ref lookup (never substring): `mc/job` must not collide with
+    // an existing `mc/job-2`.
+    const branchPreExisted = await checkBranchPreExisted(branch);
+    // Best-effort compensation: remove the worktree AND the owned branch.
+    // deleteBranchIfUnused re-verifies mc/ prefix + worktree use, so a
+    // foreign branch is never removed.
+    const rollbackBranch = async (): Promise<void> => {
+      if (branchPreExisted) return;
+      try {
+        const res = await deleteBranchIfUnused(branch);
+        console.warn(`[MC] launch rollback for job "${args.name}": ${res.reason}`);
+      } catch {
+        // Best-effort cleanup
+      }
+    };
     try {
       worktreePath = await createWorktree({
         branch,
@@ -260,6 +293,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to allocate port: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -282,6 +316,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to write serve launcher: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -313,6 +348,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to create tmux ${placement}: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -396,6 +432,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to start serve session: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -431,6 +468,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to write launch files: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -461,6 +499,7 @@ export const mc_launch: ToolDefinition = tool({
         } catch {
           // Best-effort cleanup
         }
+        await rollbackBranch();
         throw new Error(
           `Failed to create tmux ${placement}: ${error instanceof Error ? error.message : String(error)}`,
         );

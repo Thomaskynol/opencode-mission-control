@@ -218,6 +218,55 @@ export async function getWorktreeForBranch(
   return worktrees.find((wt) => wt.branch === branch);
 }
 
+export interface BranchCleanupResult {
+  deleted: boolean;
+  reason: string;
+}
+
+/**
+ * Compensation for a failed launch (blocker 1): delete a branch ONLY when it
+ * is provably ours — `mc/`-prefixed, not the default branch, and not checked
+ * out in any worktree. Anything else (main/master, foreign prefixes, an in
+ * use worktree branch, a pre-existing branch the launch reused) is left
+ * untouched: refusing is always safer than removing someone else's resource.
+ * Best-effort by design — callers `.catch(() => {})` and audit the result.
+ */
+export async function deleteBranchIfUnused(
+  branch: string,
+  opts?: { cwd?: string },
+): Promise<BranchCleanupResult> {
+  const name = branch.trim();
+  if (!name) return { deleted: false, reason: 'empty branch name' };
+  if (!name.startsWith('mc/')) return { deleted: false, reason: `foreign branch prefix (refuses ${name})` };
+  const cwd = opts?.cwd;
+  try {
+    const def = await getDefaultBranch(cwd);
+    if (name === def) return { deleted: false, reason: `default branch (${def})` };
+  } catch {
+    if (name === 'main' || name === 'master') return { deleted: false, reason: 'protected branch' };
+  }
+  if (name === 'main' || name === 'master') return { deleted: false, reason: 'protected branch' };
+  const list = await gitCommand(['worktree', 'list', '--porcelain'], cwd ? { cwd } : undefined);
+  if (list.exitCode === 0) {
+    for (const block of list.stdout.split('\n\n')) {
+      for (const line of block.split('\n')) {
+        if (line.startsWith('branch ') && line.slice('branch '.length).replace('refs/heads/', '') === name) {
+          return { deleted: false, reason: 'branch still checked out in a worktree' };
+        }
+      }
+    }
+  }
+  const exists = await gitCommand(['branch', '--list', name], cwd ? { cwd } : undefined);
+  if (exists.exitCode !== 0 || !exists.stdout.includes(name)) {
+    return { deleted: false, reason: 'branch does not exist (nothing to clean)' };
+  }
+  const del = await gitCommand(['branch', '-D', name], cwd ? { cwd } : undefined);
+  if (del.exitCode !== 0) {
+    return { deleted: false, reason: `git branch -D failed: ${(del.stderr || del.stdout).slice(0, 200)}` };
+  }
+  return { deleted: true, reason: `deleted owned branch ${name}` };
+}
+
 export async function syncWorktree(
   path: string,
   strategy: 'rebase' | 'merge',

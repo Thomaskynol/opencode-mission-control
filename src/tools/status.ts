@@ -3,7 +3,7 @@ import { getJobByName, type Job } from '../lib/job-state';
 import { capturePane } from '../lib/tmux';
 import { isInManagedWorktree } from '../lib/worktree';
 import { gitCommand } from '../lib/git';
-import { readReport } from '../lib/reports';
+import { readReport, readReviewVerdict, resolveReportStage } from '../lib/reports';
 import { formatDurationMs, formatTimeAgo } from '../lib/utils';
 import { getSharedMonitor } from '../lib/orchestrator-singleton';
 
@@ -116,7 +116,56 @@ export const mc_status: ToolDefinition = tool({
       }
     }
 
-    // 8. Format output
+    // 8. Report stage (disponível vs carregado vs efetivamente utilizado) +
+    // review verdict vinculado a este jobId. Best-effort, nunca throw.
+    const stage = await (async () => {
+      let fileExists = false;
+      try {
+        const { getDataDir } = await import('../lib/paths');
+        const { join } = await import('path');
+        const dataDir = await getDataDir();
+        fileExists = await Bun.file(join(dataDir, '..', 'reports', `${job.id}.json`)).exists();
+      } catch {}
+      let pluginPrepared: boolean | undefined;
+      if (isServeMode) {
+        try {
+          const { existsSync } = await import('fs');
+          const { join } = await import('path');
+          pluginPrepared = existsSync(join(job.worktreePath, '.opencode/plugins/mc-mission-control/index.js'));
+        } catch {}
+      }
+      const terminal = report?.status === 'completed' || report?.status === 'needs_review';
+      const base = resolveReportStage(job, {
+        hasReport: !!report, terminal, fileExists, pluginPrepared,
+      });
+      // Relaunch gera novo jobId: report com mesmo nome de jobId anterior é
+      // stale — nunca associado como atual, só_hint auditável.
+      if (!report) {
+        try {
+          const { readAllReports, resolveJobReport } = await import('../lib/reports');
+          const all = await readAllReports().catch(() => []);
+          const { staleNameReport } = resolveJobReport(job, all);
+          if (staleNameReport) {
+            return {
+              ...base,
+              kind: 'stale-name-only' as const,
+              detail: `${base.detail} (stale: existe report de jobId anterior ${staleNameReport.jobId} com mesmo nome — nao associado)`,
+            };
+          }
+        } catch {}
+      }
+      return base;
+    })();
+    let verdictLine = 'Review Verdict: none (sem veredito persistido para este jobId)';
+    try {
+      const verdict = await readReviewVerdict(job.id);
+      if (verdict) {
+        const short = [verdict.commit?.slice(0, 8), verdict.branch, verdict.transport].filter(Boolean).join(' ');
+        verdictLine = `Review Verdict: ${verdict.verdict}${short ? ` @ ${short}` : ''}${verdict.reason ? ` — ${verdict.reason}` : ''} (jobId ${verdict.jobId}; veredito nao verifica sozinho)`;
+      }
+    } catch {}
+
+    // 9. Format output
     const lines: string[] = [
       `Job: ${job.name}`,
       `Status: ${job.status}`,
@@ -146,6 +195,11 @@ export const mc_status: ToolDefinition = tool({
       `  Behind: ${gitStatus.behind}`,
       '',
       ...(serveModeTelemetry.length > 0 ? serveModeTelemetry : []),
+      'Report Stage:',
+      `  ${stage.kind} — ${stage.detail}`,
+      '',
+      verdictLine,
+      '',
       ...(report
         ? [
             'Agent Report:',

@@ -1,7 +1,9 @@
 import { tool, type ToolDefinition } from '@opencode-ai/plugin';
 import { loadJobState, getRunningJobs, type Job } from '../lib/job-state';
 import { loadPlan } from '../lib/plan-state';
-import { readAllReports, formatReportLine, type AgentReport } from '../lib/reports';
+import { readAllReports, readAllReviewVerdicts, formatReviewVerdictLine, formatReportLine, type AgentReport } from '../lib/reports';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { getPendingQuestionsForJob } from '../lib/question-relay';
 import { loadRuntimeSnapshot } from '../lib/durable-state';
 import { formatTimeAgo } from '../lib/utils';
@@ -40,7 +42,26 @@ function getReportForJob(
   job: Job,
   reportsByJob: Map<string, AgentReport>,
 ): AgentReport | undefined {
-  return reportsByJob.get(`id:${job.id}`) ?? reportsByJob.get(`name:${job.name}`);
+  // Id primeiro: relaunch gera novo jobId e o report antigo (mesmo nome,
+  // outro id) é stale — nunca associado como atual (ver getStaleNameReport).
+  return reportsByJob.get(`id:${job.id}`);
+}
+
+function getStaleNameReport(
+  job: Job,
+  reportsByJob: Map<string, AgentReport>,
+): AgentReport | undefined {
+  const byName = reportsByJob.get(`name:${job.name}`);
+  if (byName && byName.jobId !== job.id) return byName;
+  return undefined;
+}
+
+function pluginPreparedFor(job: Job): boolean | undefined {
+  try {
+    return existsSync(join(job.worktreePath, '.opencode/plugins/mc-mission-control/index.js'));
+  } catch {
+    return undefined;
+  }
 }
 
 function getJobActivityState(job: Job): { state: string; lastActivity: string } {
@@ -256,12 +277,13 @@ export const mc_overview: ToolDefinition = tool({
     'START HERE — Get a complete overview of all Mission Control activity, jobs, plans, and alerts',
   args: {},
   async execute() {
-    const [jobState, runningJobs, plan, reports, sidecar] = await Promise.all([
+    const [jobState, runningJobs, plan, reports, sidecar, verdicts] = await Promise.all([
       loadJobState(),
       getRunningJobs(),
       loadPlan(),
       readAllReports(),
       loadRuntimeSnapshot(),
+      readAllReviewVerdicts().catch(() => []),
     ]);
 
     const jobs = jobState.jobs;
@@ -304,17 +326,35 @@ export const mc_overview: ToolDefinition = tool({
         )
         .map((job) => {
           const lastReport = getReportForJob(job, reportsByJob);
+          const stale = !lastReport ? getStaleNameReport(job, reportsByJob) : undefined;
+          const verdict = verdicts.find((v) => v.jobId === job.id);
+          const verdictSuffix = verdict
+            ? ` | verdict: ${verdict.verdict}${verdict.commit ? ` @ ${verdict.commit.slice(0, 8)}` : ''} (${verdict.transport})`
+            : '';
           const activity = getJobActivityState(job);
           const isServeMode = job.port !== undefined && job.port > 0;
 
           if (isServeMode) {
-            return `- ${job.name} | ${activity.state} | ${activity.lastActivity} | ${job.branch}`;
+            // Serve ignora report na conclusão (completa por session.idle +
+            // outcome): a linha distingue ausente por serve-mode (sem ACK,
+            // preparado nunca prova carregado) — nunca finge uso.
+            const stage = lastReport
+              ? `report: ${lastReport.status} (loaded, utilizado como sinal; conclusao por outcome de sessao)`
+              : stale
+                ? `report: none (stale: existe report de jobId anterior ${stale.jobId} com mesmo nome — nao associado)`
+                : pluginPreparedFor(job) === false
+                  ? 'report: none (serve-mode, .opencode ausente; plugin preparado mas carga nao comprovada; sem ACK do serve)'
+                  : 'report: none (serve-mode, plugin preparado mas carga nao comprovada; sem ACK do serve)';
+            return `- ${job.name} | ${activity.state} | ${activity.lastActivity} | ${job.branch} | ${stage}${verdictSuffix}`;
           }
 
+          const staleSuffix = stale
+            ? ` (stale: existe report de jobId anterior ${stale.jobId} — nao associado)`
+            : '';
           const reportText = lastReport
-            ? `${lastReport.status}: ${truncate(lastReport.message, 60)}`
-            : 'none';
-          return `- ${job.name} | ${activity.lastActivity} | ${job.branch} | last report: ${reportText}`;
+            ? `${lastReport.status}: ${truncate(lastReport.message, 60)} (loaded)`
+            : `none (TUI running, worker ainda nao reportou ou ignorou a instrucao; instrucao no prompt nao garante chamada)${staleSuffix}`;
+          return `- ${job.name} | ${activity.lastActivity} | ${job.branch} | last report: ${reportText}${verdictSuffix}`;
         });
       lines.push(...runningLines);
     }
@@ -334,6 +374,15 @@ export const mc_overview: ToolDefinition = tool({
     const pending = formatPendingQuestions(jobs, sidecar?.pendingQuestions.length ?? 0);
     lines.push('', 'Questions', '---------');
     lines.push(...pending.lines);
+
+    lines.push('', 'Review Verdicts', '---------------');
+    if (verdicts.length === 0) {
+      lines.push('- None (sem veredito persistido)');
+    } else {
+      for (const v of verdicts.slice(0, 5)) {
+        lines.push(`- ${formatReviewVerdictLine(v)}`);
+      }
+    }
 
     lines.push('', 'Suggested Actions', '-----------------');
     lines.push(...getSuggestedActions(jobs, plan, reports, pending.count));

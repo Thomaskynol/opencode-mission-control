@@ -5,7 +5,7 @@
  */
 
 import { spawn } from 'bun';
-import mutex from './git-mutex';
+import mutex, { withGitLock } from './git-mutex';
 
 /**
  * Execute a git command with mutex protection.
@@ -19,7 +19,9 @@ export async function gitCommand(
   args: string[],
   opts?: { cwd?: string },
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return mutex.withLock(async () => {
+  // Blocker 3: cross-process serialization (conductor + CLI share the repo).
+  // In-process mutex alone let two processes interleave .git writers.
+  return withGitLock(async () => mutex.withLock(async () => {
     const proc = spawn(['git', ...args], {
       cwd: opts?.cwd,
       stdout: 'pipe',
@@ -37,7 +39,7 @@ export async function gitCommand(
       stderr: stderr.trim(),
       exitCode,
     };
-  });
+  }));
 }
 
 /**
